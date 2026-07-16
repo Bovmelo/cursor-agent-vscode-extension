@@ -8,5 +8,7 @@
   "command.generateCommitMessage": "Cursor: Generate Commit Message",
   "command.generateCode": "Cursor: Generate Code",
   "command.explainSelection": "Cursor: Explain Selection",
-  "view.agent": "Agent"
+  "command.addFileToChat": "Cursor: Add to Chat",
+  "view.agent": "Agent",
+  "config.notifyOnComplete.description": "Show a notification when an agent run finishes. Skipped while the chat view is visible and VS Code is focused."
 }

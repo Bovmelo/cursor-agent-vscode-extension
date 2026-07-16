@@ -8,5 +8,7 @@
   "command.generateCommitMessage": "Cursor: コミットメッセージを生成",
   "command.generateCode": "Cursor: コードを生成",
   "command.explainSelection": "Cursor: 選択範囲を説明",
-  "view.agent": "エージェント"
+  "command.addFileToChat": "Cursor: チャットに追加",
+  "view.agent": "エージェント",
+  "config.notifyOnComplete.description": "エージェントの実行が完了したときに通知を表示します。チャット表示中かつ VS Code にフォーカスがある場合はスキップします。"
 }

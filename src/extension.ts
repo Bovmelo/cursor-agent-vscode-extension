@@ -158,6 +158,19 @@ export function activate(context: vscode.ExtensionContext): void {
       (editor) => provider.explainSelection(editor),
     ),
     vscode.commands.registerCommand(
+      "cursorSubscription.addFileToChat",
+      (uri?: vscode.Uri, uris?: vscode.Uri[]) => {
+        const selected = Array.isArray(uris) && uris.length > 0
+          ? uris
+          : uri
+            ? [uri]
+            : vscode.window.activeTextEditor
+              ? [vscode.window.activeTextEditor.document.uri]
+              : [];
+        return provider.addFilesToChat(selected);
+      },
+    ),
+    vscode.commands.registerCommand(
       "cursorSubscription.generateCommitMessage",
       (arg?: unknown) =>
         generateCommitMessage(
@@ -190,6 +203,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private drainingQueue = false;
   private runningConversationId: string | undefined;
   private pendingCancelConversationId: string | undefined;
+  private webviewReady = false;
+  private readonly pendingChatFiles: string[] = [];
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -200,11 +215,18 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
   public async resolveWebviewView(view: vscode.WebviewView): Promise<void> {
     this.view = view;
+    this.webviewReady = false;
     view.webview.options = {
       enableScripts: true,
       localResourceRoots: [this.context.extensionUri],
     };
     view.webview.html = this.getHtml(view.webview);
+    view.onDidDispose(() => {
+      if (this.view === view) {
+        this.view = undefined;
+        this.webviewReady = false;
+      }
+    });
 
     view.webview.onDidReceiveMessage(
       async (message: {
@@ -225,6 +247,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }) => {
         switch (message.type) {
           case "ready":
+            this.webviewReady = true;
             this.post({ type: "modelSelected", id: this.selectedModel() });
             this.post({ type: "approvalModeSelected", mode: this.selectedApprovalMode() });
             this.post({ type: "workspace", name: vscode.workspace.workspaceFolders?.[0]?.name });
@@ -232,6 +255,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             await this.publishWorkspaceFileIndex();
             await this.publishIntegrationIndex();
             await this.publishAuthState();
+            await this.flushPendingChatFiles();
             break;
           case "send":
             if (typeof message.prompt === "string") {
@@ -687,6 +711,43 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     await this.cancel();
     this.activeId = undefined;
     this.post({ type: "newChat" });
+  }
+
+  public async addFilesToChat(uris: vscode.Uri[]): Promise<void> {
+    const references: string[] = [];
+    for (const uri of uris) {
+      if (uri.scheme !== "file") {
+        continue;
+      }
+      try {
+        const stat = await vscode.workspace.fs.stat(uri);
+        if ((stat.type & vscode.FileType.File) !== 0) {
+          references.push(uri.fsPath);
+        }
+      } catch {
+        // Skip missing or inaccessible paths.
+      }
+    }
+
+    if (references.length === 0) {
+      void vscode.window.showWarningMessage(localize(
+        "No files could be added to chat.",
+        "チャットに追加できるファイルがありませんでした。",
+      ));
+      return;
+    }
+
+    this.pendingChatFiles.push(...references);
+    await vscode.commands.executeCommand(`${VIEW_ID}.focus`);
+    await this.flushPendingChatFiles();
+  }
+
+  private async flushPendingChatFiles(): Promise<void> {
+    if (!this.webviewReady || this.pendingChatFiles.length === 0) {
+      return;
+    }
+    const references = this.pendingChatFiles.splice(0);
+    await this.resolveAttachmentReferences(references, Date.now());
   }
 
   private async openConversation(id: string): Promise<void> {
@@ -1195,7 +1256,55 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       if (!this.activeId) {
         this.postView();
       }
+      this.notifyRunComplete(conversation, progressState);
     }
+  }
+
+  private notifyRunComplete(
+    conversation: Conversation,
+    progressState: "completed" | "stopped" | "error",
+  ): void {
+    if (progressState === "stopped") {
+      return;
+    }
+
+    const enabled = vscode.workspace
+      .getConfiguration("cursorSubscription")
+      .get<boolean>("notifyOnComplete", true);
+    if (!enabled) {
+      return;
+    }
+
+    // Avoid noise when the user is already watching the chat.
+    if (this.view?.visible && vscode.window.state.focused) {
+      return;
+    }
+
+    const openLabel = localize("Open Chat", "チャットを開く");
+    const title = conversation.title || localize("Chat", "チャット");
+    const message =
+      progressState === "error"
+        ? localize(
+            `Cursor Agent failed: ${title}`,
+            `Cursor Agentが失敗しました: ${title}`,
+          )
+        : localize(
+            `Cursor Agent finished: ${title}`,
+            `Cursor Agentが完了しました: ${title}`,
+          );
+
+    const show =
+      progressState === "error"
+        ? vscode.window.showErrorMessage(message, openLabel)
+        : vscode.window.showInformationMessage(message, openLabel);
+
+    void show.then(async (answer) => {
+      if (answer !== openLabel) {
+        return;
+      }
+      await this.openConversation(conversation.id);
+      await vscode.commands.executeCommand(`${VIEW_ID}.focus`);
+    });
   }
 
   private currentContextLabel(): string | undefined {
@@ -3250,11 +3359,98 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
     .model-switch.on { background: var(--vscode-button-background); }
     .model-switch.on::after { transform: translateX(12px); }
+
+    /* Narrow sidebar (typical VS Code activity-bar width) */
     @media (max-width: 420px) {
+      .header { padding: 8px 10px 6px; gap: 2px; }
+      #scroller { padding: 4px 10px; }
+      #auth { margin: 4px 10px; padding: 10px; }
+      #auth .row { flex-wrap: wrap; }
+      .composer-wrap { padding: 6px 8px 2px; }
+      .card {
+        padding: 8px 8px 6px;
+        border-radius: 12px;
+      }
+      .user { max-width: 100%; }
+      .assistant { padding-right: 24px; }
+      .tasks-title { padding-left: 4px; }
+      .task-row { padding: 6px 4px; gap: 6px; }
+      .task-time { font-size: 10px; }
+
+      .card-row {
+        flex-wrap: wrap;
+        align-items: center;
+        row-gap: 6px;
+        column-gap: 6px;
+      }
+      .add-control,
+      #profileChip,
+      #authChip {
+        order: 0;
+      }
+      #runningActions:not([hidden]) {
+        order: 1;
+        flex: 1 0 100%;
+        display: flex;
+        gap: 4px;
+      }
+      #runningActions .run-action {
+        flex: 1;
+        min-width: 0;
+        height: 28px;
+      }
+      .card-row .spacer {
+        order: 2;
+        flex: 1 0 100%;
+        height: 0;
+        margin: 0;
+        overflow: hidden;
+        pointer-events: none;
+      }
+      #approvalSelect,
+      .model-control,
+      #sendButton {
+        order: 3;
+      }
+      .model-control { min-width: 0; }
+      #sendButton { margin-left: auto; }
+      #approvalSelect { max-width: min(96px, 28vw); }
+      #modelButton { max-width: min(110px, 34vw); }
+      #profileChip { max-width: 88px; }
+      #authChip {
+        max-width: 7.2em;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #addMenu {
+        width: min(250px, calc(100vw - 20px));
+        max-height: min(360px, calc(100vh - 110px));
+      }
+      .file-result-label { max-width: 100%; }
+      .file-result-path {
+        flex: 1 1 100%;
+        padding-left: 21px;
+      }
+      .model-row-description { display: none; }
+
+      .footer {
+        gap: 4px;
+        padding: 2px 10px 8px;
+        font-size: 11px;
+      }
+      #workspaceLabel {
+        min-width: 0;
+        max-width: 36%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
       #modelPicker {
         grid-template-columns: 1fr;
         grid-template-rows: minmax(150px, 1fr) minmax(120px, .75fr);
-        width: min(290px, calc(100vw - 24px));
+        width: min(290px, calc(100vw - 16px));
         height: min(520px, calc(100vh - 120px));
         max-height: min(520px, calc(100vh - 120px));
       }
@@ -3269,6 +3465,30 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         border-top: 1px solid var(--vscode-menu-separatorBackground, var(--vscode-panel-border));
         border-left: 0;
       }
+    }
+
+    @media (max-width: 300px) {
+      .brand {
+        font-size: 10px;
+        letter-spacing: .06em;
+      }
+      .ghost svg {
+        width: 48px;
+        height: 48px;
+      }
+      #auth .row {
+        flex-direction: column;
+      }
+      #auth .row button { width: 100%; }
+      .footer > svg:first-child,
+      #workspaceLabel,
+      .footer-sep {
+        display: none;
+      }
+      #runningIndicator { padding: 2px 5px; }
+      #runningIndicator > span:not(.running-spinner) { display: none; }
+      #approvalSelect { max-width: 72px; }
+      #modelButton { max-width: 84px; }
     }
     #sendButton {
       display: inline-flex;
@@ -3300,6 +3520,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
     .footer svg { width: 13px; height: 13px; flex: none; }
     #status {
+      min-width: 0;
+      flex: 1;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -3451,7 +3673,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       <path d="M5.5 13.5h5"/>
     </svg>
     <span id="workspaceLabel">${ui.localRun}</span>
-    <span>·</span>
+    <span class="footer-sep" aria-hidden="true">·</span>
     <span id="status">${ui.checkingConnection}</span>
     <span id="runningIndicator" hidden>
       <span class="running-spinner" aria-hidden="true"></span>
@@ -3880,12 +4102,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
     function positionModelPicker() {
       if (modelPicker.hidden) return;
-      const margin = 12;
+      const narrow = window.innerWidth <= 420;
+      const veryNarrow = window.innerWidth <= 300;
+      const margin = veryNarrow ? 8 : narrow ? 8 : 12;
       const gap = 6;
       const buttonRect = modelButton.getBoundingClientRect();
-      const narrow = window.innerWidth <= 420;
       const desiredWidth = modelPicker.classList.contains("options-empty")
-        ? 270
+        ? narrow ? Math.min(270, window.innerWidth - margin * 2) : 270
         : narrow ? 290 : 500;
       const width = Math.min(desiredWidth, Math.max(0, window.innerWidth - margin * 2));
       const left = Math.min(
