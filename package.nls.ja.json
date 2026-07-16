@@ -10,5 +10,7 @@
   "command.explainSelection": "Cursor: 選択範囲を説明",
   "command.addFileToChat": "Cursor: チャットに追加",
   "view.agent": "エージェント",
-  "config.notifyOnComplete.description": "エージェントの実行が完了したときに通知を表示します。チャット表示中かつ VS Code にフォーカスがある場合はスキップします。"
+  "config.notifyOnComplete.description": "エージェントの実行が完了したときに通知を表示します。チャット表示中かつ VS Code にフォーカスがある場合はスキップします。",
+  "config.playSoundWhileRunning.description": "エージェントの実行中、落ち着いた音を定期的に鳴らします。",
+  "config.playSoundOnComplete.description": "エージェントが正常に完了したとき、別の完了音を鳴らします。"
 }

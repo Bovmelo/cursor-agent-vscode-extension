@@ -10,5 +10,7 @@
   "command.explainSelection": "Cursor: Explain Selection",
   "command.addFileToChat": "Cursor: Add to Chat",
   "view.agent": "Agent",
-  "config.notifyOnComplete.description": "Show a notification when an agent run finishes. Skipped while the chat view is visible and VS Code is focused."
+  "config.notifyOnComplete.description": "Show a notification when an agent run finishes. Skipped while the chat view is visible and VS Code is focused.",
+  "config.playSoundWhileRunning.description": "Play a calm chime periodically while the agent is running.",
+  "config.playSoundOnComplete.description": "Play a distinct chime when the agent finishes successfully."
 }

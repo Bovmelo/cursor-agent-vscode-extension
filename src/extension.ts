@@ -19,6 +19,7 @@ import {
   detectBlockedProxyEnvironment,
   type BlockedProxyEnvironment,
 } from "./networkEnvironment.js";
+import { RunningSoundController } from "./runningSound.js";
 
 const API_KEY_SECRET = "cursorSubscription.apiKey";
 const CONVERSATIONS_KEY = "cursorSubscription.conversations";
@@ -131,10 +132,12 @@ function makeTitle(prompt: string): string {
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Cursor Agent");
-  const provider = new CursorChatProvider(context, output);
+  const runningSound = new RunningSoundController(context, output);
+  const provider = new CursorChatProvider(context, output, runningSound);
 
   context.subscriptions.push(
     output,
+    runningSound,
     provider,
     vscode.window.registerWebviewViewProvider(VIEW_ID, provider, {
       webviewOptions: { retainContextWhenHidden: true },
@@ -178,6 +181,8 @@ export function activate(context: vscode.ExtensionContext): void {
           resolveRootUri(arg),
           () => provider.promptForApiKey(),
           output,
+          () => runningSound.start(),
+          () => runningSound.playCompletion(),
         ),
     ),
   );
@@ -209,6 +214,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly output: vscode.OutputChannel,
+    private readonly runningSound: RunningSoundController,
   ) {
     this.conversations = context.workspaceState.get<Conversation[]>(CONVERSATIONS_KEY, []);
   }
@@ -250,6 +256,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             this.webviewReady = true;
             this.post({ type: "modelSelected", id: this.selectedModel() });
             this.post({ type: "approvalModeSelected", mode: this.selectedApprovalMode() });
+            this.postRunningSoundSetting();
             this.post({ type: "workspace", name: vscode.workspace.workspaceFolders?.[0]?.name });
             this.postView();
             await this.publishWorkspaceFileIndex();
@@ -424,6 +431,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.disposables.push(
       vscode.window.onDidChangeActiveTextEditor(() => this.postContextInfo()),
       vscode.window.onDidChangeTextEditorSelection(() => this.postContextInfo()),
+      vscode.workspace.onDidChangeConfiguration((event) => {
+        if (
+          event.affectsConfiguration("cursorSubscription.playSoundWhileRunning")
+          || event.affectsConfiguration("cursorSubscription.playSoundOnComplete")
+        ) {
+          this.postRunningSoundSetting();
+        }
+      }),
       fileWatcher,
       fileWatcher.onDidCreate(invalidateWorkspaceFiles),
       fileWatcher.onDidDelete(invalidateWorkspaceFiles),
@@ -936,6 +951,19 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.post({ type: "queueState", items });
   }
 
+  private postRunningSoundSetting(): void {
+    const enabled = vscode.workspace
+      .getConfiguration("cursorSubscription")
+      .get<boolean>("playSoundWhileRunning", true)
+      && process.platform !== "win32";
+    const completionEnabled = vscode.workspace
+      .getConfiguration("cursorSubscription")
+      .get<boolean>("playSoundOnComplete", true)
+      && process.platform !== "win32";
+    this.post({ type: "runningSoundSetting", enabled });
+    this.post({ type: "completionSoundSetting", enabled: completionEnabled });
+  }
+
   private async enqueueMessage(
     prompt: string,
     attachContext: boolean,
@@ -1101,6 +1129,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
     this.busy = true;
     this.runningConversationId = conversationId;
+    const runningSound = this.runningSound.start();
     this.post({ type: "started" });
     if (contextLabel) {
       this.postIfActive(conversationId, { type: "contextAttached", label: contextLabel });
@@ -1228,6 +1257,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         assistantText = text;
       }
     } finally {
+      runningSound.dispose();
+      if (progressState === "completed") {
+        this.runningSound.playCompletion();
+      }
       this.run = undefined;
       this.busy = false;
       this.runningConversationId = undefined;
@@ -2327,6 +2360,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           detach: "添付を解除",
           referencedFiles: "参照ファイル",
           workspaceFiles: "ワークスペースのファイル",
+          slashCommands: "スラッシュコマンド",
           prompt: "何でも依頼してください",
           promptLabel: "プロンプト",
           attachActive: "アクティブファイル/選択範囲を添付",
@@ -2334,6 +2368,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           standardProfile: "標準",
           planProfile: "Plan",
           multitaskProfile: "Multitask",
+          standardProfileDescription: "通常のエージェント実行",
+          planProfileDescription: "実装計画を作成（ファイルは編集しない）",
+          multitaskProfileDescription: "並列サブエージェントに分割して実行",
+          noMatchingCommands: "一致するコマンドがありません",
           image: "画像を添付",
           skills: "Skills",
           mcpServers: "MCPサーバー",
@@ -2406,6 +2444,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           detach: "Remove attachment",
           referencedFiles: "Referenced files",
           workspaceFiles: "Workspace files",
+          slashCommands: "Slash commands",
           prompt: "Ask anything",
           promptLabel: "Prompt",
           attachActive: "Attach active file/selection",
@@ -2413,6 +2452,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           standardProfile: "Standard",
           planProfile: "Plan",
           multitaskProfile: "Multitask",
+          standardProfileDescription: "Standard agent run",
+          planProfileDescription: "Create an implementation plan without edits",
+          multitaskProfileDescription: "Split work across parallel subagents",
+          noMatchingCommands: "No matching commands",
           image: "Attach image",
           skills: "Skills",
           mcpServers: "MCP Servers",
@@ -2854,7 +2897,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
 
     /* ---- Composer card ---- */
-    .composer-wrap { padding: 8px 12px 4px; }
+    .composer-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 8px 12px 4px;
+    }
     .card {
       position: relative;
       background: var(--vscode-editor-background);
@@ -2879,7 +2927,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       pointer-events: none;
     }
     .card.drag-active #dropHint { display: flex; }
-    #filePicker {
+    #filePicker,
+    #slashPicker {
       max-height: 250px;
       margin: -2px -4px 8px;
       overflow-y: auto;
@@ -2888,7 +2937,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       border-radius: 10px;
       box-shadow: 0 5px 18px rgba(0, 0, 0, .25);
     }
-    #filePicker[hidden] { display: none; }
+    #filePicker[hidden],
+    #slashPicker[hidden] { display: none; }
     .file-result {
       display: flex;
       align-items: center;
@@ -3034,20 +3084,22 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       gap: 8px;
     }
     #runningActions {
-      display: inline-flex;
+      display: flex;
       align-items: center;
-      gap: 4px;
+      gap: 6px;
     }
     #runningActions[hidden] { display: none; }
     .run-action {
-      height: 26px;
-      padding: 0 7px;
+      flex: 1;
+      min-width: 0;
+      height: 28px;
+      padding: 0 10px;
       color: var(--vscode-foreground);
-      background: transparent;
+      background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
       border: 1px solid var(--vscode-panel-border);
-      border-radius: 7px;
+      border-radius: 8px;
       font: inherit;
-      font-size: 11px;
+      font-size: 12px;
       cursor: pointer;
     }
     .run-action:hover { background: var(--vscode-toolbar-hoverBackground); }
@@ -3383,35 +3435,6 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         row-gap: 6px;
         column-gap: 6px;
       }
-      .add-control,
-      #profileChip,
-      #authChip {
-        order: 0;
-      }
-      #runningActions:not([hidden]) {
-        order: 1;
-        flex: 1 0 100%;
-        display: flex;
-        gap: 4px;
-      }
-      #runningActions .run-action {
-        flex: 1;
-        min-width: 0;
-        height: 28px;
-      }
-      .card-row .spacer {
-        order: 2;
-        flex: 1 0 100%;
-        height: 0;
-        margin: 0;
-        overflow: hidden;
-        pointer-events: none;
-      }
-      #approvalSelect,
-      .model-control,
-      #sendButton {
-        order: 3;
-      }
       .model-control { min-width: 0; }
       #sendButton { margin-left: auto; }
       #approvalSelect { max-width: min(96px, 28vw); }
@@ -3599,6 +3622,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   </div>
 
   <div class="composer-wrap">
+    <div id="runningActions" hidden>
+      <button id="queueButton" class="run-action" type="button" title="${ui.queueTitle}">${ui.queue}</button>
+      <button id="interruptButton" class="run-action" type="button" title="${ui.interruptTitle}">${ui.interrupt}</button>
+    </div>
     <div class="card">
       <div id="dropHint" aria-live="polite">${ui.dropFiles}</div>
       <div id="contextRow" hidden>
@@ -3614,6 +3641,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       <div id="mentionRow" aria-label="${ui.referencedFiles}" hidden></div>
       <div id="queueRow" aria-label="${ui.queuedMessages}" hidden></div>
       <div id="filePicker" role="listbox" aria-label="${ui.workspaceFiles}" hidden></div>
+      <div id="slashPicker" role="listbox" aria-label="${ui.slashCommands}" hidden></div>
       <textarea id="prompt" placeholder="${ui.prompt}" aria-label="${ui.promptLabel}" rows="2"></textarea>
       <div class="card-row">
         <div class="add-control">
@@ -3628,10 +3656,6 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         </div>
         <button id="profileChip" type="button"></button>
         <button id="authChip" type="button" title="${ui.setApiKey}">${ui.apiKeyMissing}</button>
-        <div id="runningActions" hidden>
-          <button id="queueButton" class="run-action" type="button" title="${ui.queueTitle}">${ui.queue}</button>
-          <button id="interruptButton" class="run-action" type="button" title="${ui.interruptTitle}">${ui.interrupt}</button>
-        </div>
         <span class="spacer"></span>
         <select id="approvalSelect" aria-label="${ui.approvalMode}">
           <option value="auto-review">${ui.autoReview}</option>
@@ -3723,10 +3747,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const queueButton = document.getElementById("queueButton");
     const interruptButton = document.getElementById("interruptButton");
     const filePicker = document.getElementById("filePicker");
+    const slashPicker = document.getElementById("slashPicker");
     let assistantNode;
     let assistantRaw = "";
     let activeProgress;
     let running = false;
+    let runningSoundEnabled = false;
+    let completionSoundEnabled = false;
+    let runningSoundTimer;
+    let runningAudioContext;
     let sandboxUnavailable = false;
     let attach = false;
     let view = "home";
@@ -3737,6 +3766,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     let selectedFileIndex = 0;
     let fileRequestId = 0;
     let mentionRange;
+    let slashResults = [];
+    let selectedSlashIndex = 0;
+    let slashRange;
     let workspacePaths = new Set();
     let workspaceBasenames = new Set();
     let attachmentRequestId = 0;
@@ -3809,6 +3841,46 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       runProfile = profile;
       updateProfileChip();
       closeAddMenu();
+    }
+
+    function slashCommands() {
+      return [
+        {
+          id: "agent",
+          aliases: ["agent", "standard"],
+          label: i18n.standardProfile,
+          description: i18n.standardProfileDescription,
+          icon: "A",
+          profile: "agent",
+        },
+        {
+          id: "plan",
+          aliases: ["plan"],
+          label: i18n.planProfile,
+          description: i18n.planProfileDescription,
+          icon: "☷",
+          profile: "plan",
+        },
+        {
+          id: "multitask",
+          aliases: ["multitask"],
+          label: i18n.multitaskProfile,
+          description: i18n.multitaskProfileDescription,
+          icon: "⑂",
+          profile: "multitask",
+        },
+      ];
+    }
+
+    function consumeLeadingSlashCommand(text) {
+      const match = /^\\/(agent|standard|plan|multitask)(?:\\s+|$)/i.exec(text);
+      if (!match) return { text, profile: undefined };
+      const command = match[1].toLowerCase();
+      const profile = command === "standard" || command === "agent" ? "agent" : command;
+      return {
+        text: text.slice(match[0].length).replace(/^\\s+/, ""),
+        profile,
+      };
     }
 
     function renderMainAddMenu() {
@@ -4254,6 +4326,18 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       };
     }
 
+    function activeSlashCommand() {
+      const caret = prompt.selectionStart;
+      const beforeCaret = prompt.value.slice(0, caret);
+      const match = /(^|\\s)\\/([\\w-]*)$/.exec(beforeCaret);
+      if (!match) return undefined;
+      return {
+        start: caret - match[2].length - 1,
+        end: caret,
+        query: match[2].toLowerCase(),
+      };
+    }
+
     function closeFilePicker() {
       filePicker.hidden = true;
       filePicker.innerHTML = "";
@@ -4262,12 +4346,21 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       mentionRange = undefined;
     }
 
+    function closeSlashPicker() {
+      slashPicker.hidden = true;
+      slashPicker.innerHTML = "";
+      slashResults = [];
+      selectedSlashIndex = 0;
+      slashRange = undefined;
+    }
+
     function requestFileResults() {
       const mention = activeMention();
       if (!mention) {
         closeFilePicker();
         return;
       }
+      closeSlashPicker();
       mentionRange = mention;
       selectedFileIndex = 0;
       fileRequestId += 1;
@@ -4276,6 +4369,83 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         query: mention.query,
         requestId: fileRequestId,
       });
+    }
+
+    function requestSlashResults() {
+      if (activeMention()) {
+        closeSlashPicker();
+        return;
+      }
+      const slash = activeSlashCommand();
+      if (!slash) {
+        closeSlashPicker();
+        return;
+      }
+      closeFilePicker();
+      slashRange = slash;
+      slashResults = slashCommands().filter((command) =>
+        command.aliases.some((alias) => alias.startsWith(slash.query))
+          || command.label.toLowerCase().startsWith(slash.query),
+      );
+      selectedSlashIndex = 0;
+      renderSlashResults();
+    }
+
+    function renderSlashResults() {
+      slashPicker.innerHTML = "";
+      if (slashResults.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "file-empty";
+        empty.textContent = i18n.noMatchingCommands;
+        slashPicker.appendChild(empty);
+        slashPicker.hidden = false;
+        return;
+      }
+
+      selectedSlashIndex = Math.max(0, Math.min(selectedSlashIndex, slashResults.length - 1));
+      slashResults.forEach((command, index) => {
+        const row = document.createElement("button");
+        row.className = "file-result" + (index === selectedSlashIndex ? " selected" : "");
+        row.type = "button";
+        row.setAttribute("role", "option");
+        row.setAttribute("aria-selected", index === selectedSlashIndex ? "true" : "false");
+        row.title = "/" + command.id;
+
+        const icon = document.createElement("span");
+        icon.textContent = command.icon;
+        const label = document.createElement("span");
+        label.className = "file-result-label";
+        label.textContent = "/" + command.id;
+        const description = document.createElement("span");
+        description.className = "file-result-path";
+        description.textContent = command.description;
+        row.append(icon, label, description);
+        row.addEventListener("mousedown", (event) => event.preventDefault());
+        row.addEventListener("click", () => selectSlashCommand(command));
+        slashPicker.appendChild(row);
+      });
+      slashPicker.hidden = false;
+      slashPicker.querySelector(".selected")?.scrollIntoView({ block: "nearest" });
+    }
+
+    function selectSlashCommand(command) {
+      if (slashRange) {
+        prompt.value = prompt.value.slice(0, slashRange.start) + prompt.value.slice(slashRange.end);
+        prompt.selectionStart = prompt.selectionEnd = slashRange.start;
+      }
+      selectRunProfile(command.profile);
+      closeSlashPicker();
+      autoGrow();
+      prompt.focus();
+    }
+
+    function updateComposerSuggestions() {
+      if (activeMention()) {
+        requestFileResults();
+        return;
+      }
+      closeFilePicker();
+      requestSlashResults();
     }
 
     function renderFileResults() {
@@ -4806,12 +4976,139 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       selectedFiles = [];
       renderMentionChips();
       closeFilePicker();
+      closeSlashPicker();
       autoGrow();
     }
 
+    function ensureRunningAudioContext() {
+      if (runningAudioContext) return runningAudioContext;
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return undefined;
+      runningAudioContext = new AudioContextClass();
+      return runningAudioContext;
+    }
+
+    function primeRunningSound() {
+      if (!runningSoundEnabled && !completionSoundEnabled) return;
+      const audio = ensureRunningAudioContext();
+      if (audio?.state === "suspended") {
+        void audio.resume().catch(() => {});
+      }
+    }
+
+    function scheduleRunningSound(delay = 5000) {
+      if (!running || !runningSoundEnabled || runningSoundTimer) return;
+      runningSoundTimer = setTimeout(() => {
+        runningSoundTimer = undefined;
+        playRunningSound();
+      }, delay);
+    }
+
+    function playRunningSound() {
+      if (!running || !runningSoundEnabled) return;
+      const audio = ensureRunningAudioContext();
+      if (!audio) return;
+
+      const playPulse = () => {
+        if (!running || !runningSoundEnabled || audio.state !== "running") return;
+        const now = audio.currentTime;
+        const playTone = (frequency, start, duration, volume) => {
+          const oscillator = audio.createOscillator();
+          const gain = audio.createGain();
+          oscillator.type = "sine";
+          oscillator.frequency.setValueAtTime(frequency, start);
+          gain.gain.setValueAtTime(0.0001, start);
+          gain.gain.exponentialRampToValueAtTime(volume, start + 0.16);
+          gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+          oscillator.connect(gain);
+          gain.connect(audio.destination);
+          oscillator.addEventListener("ended", () => {
+            oscillator.disconnect();
+            gain.disconnect();
+          }, { once: true });
+          oscillator.start(start);
+          oscillator.stop(start + duration + 0.01);
+        };
+        playTone(261.63, now, 0.5, 0.025);
+        playTone(329.63, now + 0.16, 0.65, 0.019);
+      };
+
+      if (audio.state === "suspended") {
+        void audio.resume().then(playPulse).catch(() => {});
+      } else {
+        playPulse();
+      }
+      scheduleRunningSound();
+    }
+
+    function startRunningSound() {
+      if (!runningSoundEnabled) return;
+      primeRunningSound();
+      playRunningSound();
+    }
+
+    function stopRunningSound() {
+      if (runningSoundTimer) {
+        clearTimeout(runningSoundTimer);
+        runningSoundTimer = undefined;
+      }
+    }
+
+    function playCompletionSound() {
+      if (!completionSoundEnabled) return;
+      const audio = ensureRunningAudioContext();
+      if (!audio) return;
+
+      const playChime = () => {
+        if (!completionSoundEnabled || audio.state !== "running") return;
+        const now = audio.currentTime;
+        const playTone = (frequency, start, duration, volume) => {
+          const oscillator = audio.createOscillator();
+          const gain = audio.createGain();
+          oscillator.type = "sine";
+          oscillator.frequency.setValueAtTime(frequency, start);
+          gain.gain.setValueAtTime(0.0001, start);
+          gain.gain.exponentialRampToValueAtTime(volume, start + 0.03);
+          gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+          oscillator.connect(gain);
+          gain.connect(audio.destination);
+          oscillator.addEventListener("ended", () => {
+            oscillator.disconnect();
+            gain.disconnect();
+          }, { once: true });
+          oscillator.start(start);
+          oscillator.stop(start + duration + 0.01);
+        };
+        playTone(392, now, 0.3, 0.025);
+        playTone(523.25, now + 0.14, 0.34, 0.022);
+        playTone(659.25, now + 0.3, 0.4, 0.019);
+      };
+
+      if (audio.state === "suspended") {
+        void audio.resume().then(playChime).catch(() => {});
+      } else {
+        playChime();
+      }
+    }
+
+    document.addEventListener("pointerdown", primeRunningSound, { once: true });
+    document.addEventListener("keydown", primeRunningSound, { once: true });
+
     function submitMessage(action = "send") {
-      const text = prompt.value.trim();
-      if (!text) return;
+      const consumed = consumeLeadingSlashCommand(prompt.value.trim());
+      if (consumed.profile) {
+        runProfile = consumed.profile;
+        updateProfileChip();
+      }
+      const text = consumed.text;
+      if (!text) {
+        if (consumed.profile) {
+          prompt.value = "";
+          closeSlashPicker();
+          autoGrow();
+        }
+        return;
+      }
       const files = selectedFiles.slice();
 
       if (running) {
@@ -4827,6 +5124,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       assistantRaw = "";
       assistantNode = addAssistantMessage("");
       clearComposerMessage();
+      primeRunningSound();
       vscode.postMessage(messagePayload("send", text, files));
     }
 
@@ -4945,9 +5243,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     });
     prompt.addEventListener("input", () => {
       autoGrow();
-      requestFileResults();
+      updateComposerSuggestions();
     });
-    prompt.addEventListener("click", requestFileResults);
+    prompt.addEventListener("click", updateComposerSuggestions);
     prompt.addEventListener("keydown", (event) => {
       if (!filePicker.hidden) {
         if ((event.key === "ArrowDown" || event.key === "ArrowUp") && fileResults.length > 0) {
@@ -4965,6 +5263,25 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         if (event.key === "Escape") {
           event.preventDefault();
           closeFilePicker();
+          return;
+        }
+      }
+      if (!slashPicker.hidden) {
+        if ((event.key === "ArrowDown" || event.key === "ArrowUp") && slashResults.length > 0) {
+          event.preventDefault();
+          const direction = event.key === "ArrowDown" ? 1 : -1;
+          selectedSlashIndex = (selectedSlashIndex + direction + slashResults.length) % slashResults.length;
+          renderSlashResults();
+          return;
+        }
+        if ((event.key === "Enter" || event.key === "Tab") && slashResults.length > 0) {
+          event.preventDefault();
+          selectSlashCommand(slashResults[selectedSlashIndex]);
+          return;
+        }
+        if (event.key === "Escape") {
+          event.preventDefault();
+          closeSlashPicker();
           return;
         }
       }
@@ -4990,6 +5307,17 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         case "authRequired":
           auth.style.display = "block";
           authChip.style.display = "inline-flex";
+          break;
+        case "runningSoundSetting":
+          runningSoundEnabled = data.enabled === true;
+          if (runningSoundEnabled && running) {
+            startRunningSound();
+          } else {
+            stopRunningSound();
+          }
+          break;
+        case "completionSoundSetting":
+          completionSoundEnabled = data.enabled === true;
           break;
         case "workspace":
           if (data.name) workspaceLabel.textContent = data.name + " " + i18n.runningIn;
@@ -5095,6 +5423,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         }
         case "started":
           running = true;
+          startRunningSound();
           runningIndicator.hidden = false;
           sendButton.classList.add("running");
           sendButton.title = i18n.stop;
@@ -5148,9 +5477,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           break;
         case "finished":
           finishProgress("completed");
+          stopRunningSound();
+          playCompletionSound();
           break;
         case "idle":
           running = false;
+          stopRunningSound();
           runningIndicator.hidden = true;
           sendButton.classList.remove("running");
           sendButton.title = i18n.send;

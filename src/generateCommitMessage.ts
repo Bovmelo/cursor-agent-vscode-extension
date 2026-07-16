@@ -94,6 +94,8 @@ export async function generateCommitMessage(
   rootUri: vscode.Uri | undefined,
   promptForApiKey: () => Promise<void>,
   output: vscode.OutputChannel,
+  startRunningSound: () => vscode.Disposable,
+  playCompletionSound: () => void,
 ): Promise<void> {
   let apiKey = await context.secrets.get(API_KEY_SECRET);
   if (!apiKey) {
@@ -157,40 +159,50 @@ export async function generateCommitMessage(
         cancellable: false,
       },
       async () => {
-        const result = await Agent.prompt(prompt, {
-          apiKey,
-          model: selectedModelSelection(context),
-          name: "VS Code: Generate Commit Message",
-          mode: "plan",
-          local: {
-            cwd: repository.rootUri.fsPath,
-            // Inline config only; avoid loading ambient project settings for this one-shot.
-            settingSources: [],
-          },
-        });
+        const runningSound = startRunningSound();
+        let completed = false;
+        try {
+          const result = await Agent.prompt(prompt, {
+            apiKey,
+            model: selectedModelSelection(context),
+            name: "VS Code: Generate Commit Message",
+            mode: "plan",
+            local: {
+              cwd: repository.rootUri.fsPath,
+              // Inline config only; avoid loading ambient project settings for this one-shot.
+              settingSources: [],
+            },
+          });
 
-        if (result.status === "error") {
-          throw new Error(
-            result.error?.message ??
-              localize("Commit message generation failed.", "コミットメッセージの生成に失敗しました。"),
-          );
+          if (result.status === "error") {
+            throw new Error(
+              result.error?.message ??
+                localize("Commit message generation failed.", "コミットメッセージの生成に失敗しました。"),
+            );
+          }
+
+          if (result.status === "cancelled") {
+            return;
+          }
+
+          const message = cleanCommitMessage(result.result ?? "");
+          if (!message) {
+            throw new Error(
+              localize(
+                "The model returned an empty commit message.",
+                "モデルが空のコミットメッセージを返しました。",
+              ),
+            );
+          }
+
+          repository.inputBox.value = message;
+          completed = true;
+        } finally {
+          runningSound.dispose();
+          if (completed) {
+            playCompletionSound();
+          }
         }
-
-        if (result.status === "cancelled") {
-          return;
-        }
-
-        const message = cleanCommitMessage(result.result ?? "");
-        if (!message) {
-          throw new Error(
-            localize(
-              "The model returned an empty commit message.",
-              "モデルが空のコミットメッセージを返しました。",
-            ),
-          );
-        }
-
-        repository.inputBox.value = message;
       },
     );
   } catch (error) {
