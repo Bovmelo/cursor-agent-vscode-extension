@@ -5629,6 +5629,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     window.addEventListener("dragend", () => setDragActive(false));
     window.addEventListener("blur", () => setDragActive(false));
     prompt.addEventListener("paste", (event) => {
+      // Voice tools like Typeless paste polished text. Prefer that over file-drag
+      // heuristics, which can otherwise swallow the paste when clipboard also
+      // advertises file/URI payloads.
+      const plain = event.clipboardData?.getData("text/plain") ?? "";
+      if (plain.length > 0) return;
       if (!isFileDrag(event.clipboardData)) return;
       event.preventDefault();
       void resolveTransferredFiles(event.clipboardData, false, i18n.pasteFailed);
@@ -5637,8 +5642,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       autoGrow();
       updateComposerSuggestions();
     });
+    prompt.addEventListener("compositionend", () => {
+      autoGrow();
+      updateComposerSuggestions();
+    });
     prompt.addEventListener("click", updateComposerSuggestions);
     prompt.addEventListener("keydown", (event) => {
+      // Dictation / IME confirmation uses Enter and keyCode 229; never treat as send.
+      if (event.isComposing || event.keyCode === 229) return;
       if (!filePicker.hidden) {
         if ((event.key === "ArrowDown" || event.key === "ArrowUp") && fileResults.length > 0) {
           event.preventDefault();
