@@ -22,6 +22,7 @@ const render = new Function(
   "purifyUri",
   "IS_JAPANESE",
   "webview",
+  "extensionVersion",
   `return ${templateLiteral};`,
 );
 const html = render(
@@ -31,6 +32,7 @@ const html = render(
   "purify.js",
   false,
   { cspSource: "test-csp-source" },
+  "0.0.0",
 );
 const inlineScripts = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)]
   .map((match) => match[1])

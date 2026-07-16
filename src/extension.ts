@@ -2331,6 +2331,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
   private getHtml(webview: vscode.Webview): string {
     const nonce = randomBytes(16).toString("base64");
+    const extensionVersion = String(
+      (this.context.extension.packageJSON as { version?: string }).version ?? "",
+    );
     const markedUri = webview.asWebviewUri(
       vscode.Uri.joinPath(
         this.context.extensionUri,
@@ -3505,7 +3508,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       #auth .row button { width: 100%; }
       .footer > svg:first-child,
       #workspaceLabel,
-      .footer-sep {
+      .footer-sep:not(.footer-version-sep) {
         display: none;
       }
       #runningIndicator { padding: 2px 5px; }
@@ -3548,6 +3551,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+    }
+    #extensionVersion {
+      flex: none;
+      opacity: .85;
+      font-variant-numeric: tabular-nums;
     }
     #runningIndicator {
       display: inline-flex;
@@ -3699,6 +3707,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     <span id="workspaceLabel">${ui.localRun}</span>
     <span class="footer-sep" aria-hidden="true">·</span>
     <span id="status">${ui.checkingConnection}</span>
+    <span class="footer-sep footer-version-sep" aria-hidden="true">·</span>
+    <span id="extensionVersion" title="Extension version">v${extensionVersion}</span>
     <span id="runningIndicator" hidden>
       <span class="running-spinner" aria-hidden="true"></span>
       <span>${ui.running}</span>
