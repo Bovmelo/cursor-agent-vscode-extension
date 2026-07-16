@@ -1,0 +1,77 @@
+{
+  "name": "cursor-subscription-for-vscode",
+  "displayName": "%extension.displayName%",
+  "description": "%extension.description%",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
+  "activationEvents": [
+    "onView:cursorSubscription.chatView"
+  ],
+  "main": "./out/extension.js",
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "validate:webview": "node scripts/validate-webview.mjs",
+    "validate": "npm run compile && npm run validate:webview",
+    "vscode:prepublish": "npm run validate",
+    "package": "vsce package"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "cursorSubscription.openChat",
+        "title": "%command.openChat%"
+      },
+      {
+        "command": "cursorSubscription.setApiKey",
+        "title": "%command.setApiKey%"
+      },
+      {
+        "command": "cursorSubscription.clearApiKey",
+        "title": "%command.clearApiKey%"
+      },
+      {
+        "command": "cursorSubscription.newChat",
+        "title": "%command.newChat%"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cursorSubscription",
+          "title": "Cursor",
+          "icon": "media/cursor.svg"
+        }
+      ]
+    },
+    "views": {
+      "cursorSubscription": [
+        {
+          "type": "webview",
+          "id": "cursorSubscription.chatView",
+          "name": "%view.agent%"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.23",
+    "dompurify": "^3.4.12",
+    "marked": "^18.0.6"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "@types/vscode": "~1.100.0",
+    "@vscode/vsce": "^3.9.2",
+    "typescript": "^7.0.2"
+  }
+}

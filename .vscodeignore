@@ -1,0 +1,6 @@
+.git/**
+.vscode/**
+src/**
+scripts/**
+tsconfig.json
+*.log

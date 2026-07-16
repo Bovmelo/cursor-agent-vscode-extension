@@ -1,0 +1,9 @@
+{
+  "extension.displayName": "Cursor Subscription for VS Code",
+  "extension.description": "Use Cursor agents from VS Code with your Cursor plan.",
+  "command.openChat": "Cursor: Open Chat",
+  "command.setApiKey": "Cursor: Set API Key",
+  "command.clearApiKey": "Cursor: Clear API Key",
+  "command.newChat": "Cursor: New Chat",
+  "view.agent": "Agent"
+}
