@@ -31,15 +31,28 @@ const DEFAULT_MODEL = "auto";
 const TITLE_MAX_LENGTH = 40;
 const IS_JAPANESE = vscode.env.language.toLowerCase().startsWith("ja");
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_DROPPED_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_EDITOR_GENERATION_CONTEXT = 60_000;
 const SUPPORTS_LOCAL_SANDBOX = process.platform !== "win32";
-const IMAGE_MIME_TYPES: Record<string, string> = {
-  ".gif": "image/gif",
-  ".jpeg": "image/jpeg",
-  ".jpg": "image/jpeg",
-  ".png": "image/png",
-  ".webp": "image/webp",
+const IMAGE_FORMATS: Record<string, { mimeType: string; vision: boolean }> = {
+  ".avif": { mimeType: "image/avif", vision: false },
+  ".bmp": { mimeType: "image/bmp", vision: false },
+  ".gif": { mimeType: "image/gif", vision: true },
+  ".heic": { mimeType: "image/heic", vision: false },
+  ".heif": { mimeType: "image/heif", vision: false },
+  ".ico": { mimeType: "image/x-icon", vision: false },
+  ".jfif": { mimeType: "image/jpeg", vision: true },
+  ".jpeg": { mimeType: "image/jpeg", vision: true },
+  ".jpg": { mimeType: "image/jpeg", vision: true },
+  ".png": { mimeType: "image/png", vision: true },
+  ".svg": { mimeType: "image/svg+xml", vision: false },
+  ".tif": { mimeType: "image/tiff", vision: false },
+  ".tiff": { mimeType: "image/tiff", vision: false },
+  ".webp": { mimeType: "image/webp", vision: true },
 };
+const IMAGE_FILE_EXTENSIONS = Object.keys(IMAGE_FORMATS).map((extension) =>
+  extension.slice(1)
+);
 
 type ApprovalMode = "auto-review" | "full-access";
 type RunProfile = "agent" | "plan" | "multitask";
@@ -56,9 +69,14 @@ interface TranscriptEntry {
   text: string;
   error?: boolean;
   files?: string[];
-  attachments?: string[];
+  attachments?: Array<string | TranscriptAttachment>;
   progress?: ToolProgressEntry[];
   progressState?: "completed" | "stopped" | "error";
+}
+
+interface TranscriptAttachment {
+  path: string;
+  label: string;
 }
 
 interface ToolProgressEntry {
@@ -71,6 +89,11 @@ interface WorkspaceFileItem {
   path: string;
   label: string;
   description: string;
+}
+
+interface DroppedFileUpload {
+  name: string;
+  data: Uint8Array;
 }
 
 interface AttachedFileReference {
@@ -210,6 +233,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private pendingCancelConversationId: string | undefined;
   private webviewReady = false;
   private readonly pendingChatFiles: string[] = [];
+  private pendingAttachmentRoot: Promise<vscode.Uri> | undefined;
+  private readonly pendingAttachmentLabels = new Map<string, string>();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -250,6 +275,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         approvalMode?: string;
         path?: string;
         id?: string;
+        uploads?: { name?: unknown; data?: unknown }[];
       }) => {
         switch (message.type) {
           case "ready":
@@ -333,6 +359,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
                   )
                 : [],
               typeof message.requestId === "number" ? message.requestId : 0,
+              this.parseDroppedFileUploads(message.uploads),
             );
             break;
           case "cancel":
@@ -435,6 +462,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         if (
           event.affectsConfiguration("cursorSubscription.playSoundWhileRunning")
           || event.affectsConfiguration("cursorSubscription.playSoundOnComplete")
+          || event.affectsConfiguration("cursorSubscription.playSoundOnError")
         ) {
           this.postRunningSoundSetting();
         }
@@ -803,6 +831,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   public async dispose(): Promise<void> {
     await this.cancel();
     await this.disposeAgent();
+    if (this.pendingAttachmentRoot) {
+      try {
+        const root = await this.pendingAttachmentRoot;
+        await vscode.workspace.fs.delete(root, { recursive: true });
+      } catch {
+        // Pending dropped files may already have been removed.
+      }
+    }
     for (const disposable of this.disposables) {
       disposable.dispose();
     }
@@ -960,8 +996,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       .getConfiguration("cursorSubscription")
       .get<boolean>("playSoundOnComplete", true)
       && process.platform !== "win32";
+    const errorEnabled = vscode.workspace
+      .getConfiguration("cursorSubscription")
+      .get<boolean>("playSoundOnError", true)
+      && process.platform !== "win32";
     this.post({ type: "runningSoundSetting", enabled });
     this.post({ type: "completionSoundSetting", enabled: completionEnabled });
+    this.post({ type: "errorSoundSetting", enabled: errorEnabled });
   }
 
   private async enqueueMessage(
@@ -1140,7 +1181,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       text: contextLabel
         ? `${prompt}\n\n[${localize("Attached", "添付")}: ${contextLabel}]`
         : prompt,
-      attachments: attachedFiles.length > 0 ? attachedFiles : undefined,
+      attachments: attachmentReferences.length > 0
+        ? attachmentReferences.map((reference) => ({
+            path: reference.agentPath,
+            label: path.basename(reference.displayPath) || path.basename(reference.agentPath),
+          }))
+        : undefined,
     };
     let assistantText = "";
     const editedFiles = new Set<string>();
@@ -1260,6 +1306,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       runningSound.dispose();
       if (progressState === "completed") {
         this.runningSound.playCompletion();
+      } else if (progressState === "error") {
+        this.runningSound.playError();
       }
       this.run = undefined;
       this.busy = false;
@@ -1628,8 +1676,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const images: SDKImage[] = [];
     let skippedLargeImages = 0;
     for (const file of files) {
-      const mimeType = IMAGE_MIME_TYPES[path.extname(file).toLowerCase()];
-      if (!mimeType || images.length >= 8) {
+      const format = IMAGE_FORMATS[path.extname(file).toLowerCase()];
+      if (!format?.vision || images.length >= 8) {
         continue;
       }
       const absolute = path.isAbsolute(file) ? path.resolve(file) : path.resolve(root, file);
@@ -1643,7 +1691,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         const data = await vscode.workspace.fs.readFile(uri);
         images.push({
           data: Buffer.from(data).toString("base64"),
-          mimeType,
+          mimeType: format.mimeType,
         });
       } catch {
         // Invalid or stale attachments are already omitted from the file list.
@@ -1665,13 +1713,92 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       canSelectMany: true,
       title: localize("Attach images", "画像を添付"),
       filters: {
-        [localize("Images", "画像")]: ["png", "jpg", "jpeg", "gif", "webp"],
+        [localize("Images", "画像")]: IMAGE_FILE_EXTENSIONS,
       },
     });
     if (!uris?.length) {
       return;
     }
     await this.resolveAttachmentReferences(uris.map((uri) => uri.fsPath), requestId);
+  }
+
+  private parseDroppedFileUploads(
+    uploads: { name?: unknown; data?: unknown }[] | undefined,
+  ): DroppedFileUpload[] {
+    if (!Array.isArray(uploads)) {
+      return [];
+    }
+
+    const parsed: DroppedFileUpload[] = [];
+    for (const upload of uploads.slice(0, 20)) {
+      if (typeof upload?.name !== "string") {
+        continue;
+      }
+      let data: Uint8Array | undefined;
+      if (upload.data instanceof Uint8Array) {
+        data = upload.data;
+      } else if (upload.data instanceof ArrayBuffer) {
+        data = new Uint8Array(upload.data);
+      } else if (
+        Array.isArray(upload.data)
+        && upload.data.every(
+          (value) => Number.isInteger(value) && value >= 0 && value <= 255,
+        )
+      ) {
+        data = Uint8Array.from(upload.data);
+      }
+      if (data) {
+        parsed.push({ name: upload.name, data });
+      }
+    }
+    return parsed;
+  }
+
+  private ensurePendingAttachmentRoot(): Promise<vscode.Uri> {
+    if (!this.pendingAttachmentRoot) {
+      this.pendingAttachmentRoot = (async () => {
+        const root = vscode.Uri.joinPath(
+          this.context.globalStorageUri,
+          "pending-attachments",
+        );
+        try {
+          await vscode.workspace.fs.delete(root, { recursive: true });
+        } catch {
+          // There may be no stale pending attachment directory yet.
+        }
+        await vscode.workspace.fs.createDirectory(root);
+        return root;
+      })();
+    }
+    return this.pendingAttachmentRoot;
+  }
+
+  private async stageDroppedFileUpload(
+    upload: DroppedFileUpload,
+  ): Promise<WorkspaceFileItem | undefined> {
+    if (upload.data.byteLength > MAX_DROPPED_FILE_BYTES) {
+      return undefined;
+    }
+
+    const originalName = path.basename(upload.name.trim());
+    const safeName = originalName
+      .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
+      .replace(/[. ]+$/g, "")
+      || "attachment";
+    const hash = createHash("sha256")
+      .update(upload.data)
+      .digest("hex")
+      .slice(0, 12);
+    const root = await this.ensurePendingAttachmentRoot();
+    const uri = vscode.Uri.joinPath(root, `${hash}-${safeName}`);
+    await vscode.workspace.fs.writeFile(uri, upload.data);
+    const normalized = uri.fsPath.replaceAll("\\", "/");
+    this.pendingAttachmentLabels.set(path.resolve(uri.fsPath).toLowerCase(), safeName);
+    return {
+      path: normalized,
+      label: safeName,
+      description: path.posix.dirname(normalized),
+    };
   }
 
   private async stageExternalAttachments(
@@ -1712,8 +1839,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         `${hash}-${path.basename(absolute)}`,
       );
       await vscode.workspace.fs.copy(vscode.Uri.file(absolute), stagedUri, { overwrite: true });
+      const pendingLabel = this.pendingAttachmentLabels.get(absolute.toLowerCase());
       references.push({
-        displayPath: absolute.replaceAll("\\", "/"),
+        displayPath: pendingLabel ?? absolute.replaceAll("\\", "/"),
         agentPath: stagedUri.fsPath.replaceAll("\\", "/"),
         external: true,
       });
@@ -1729,10 +1857,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private async resolveAttachmentReferences(
     references: string[],
     requestId: number,
+    uploads: DroppedFileUpload[] = [],
   ): Promise<void> {
     const workspace = vscode.workspace.workspaceFolders?.[0];
     if (!workspace) {
       this.post({ type: "resolvedAttachments", requestId, files: [] });
+      void vscode.window.showWarningMessage(localize(
+        "Open a workspace folder to attach dropped files.",
+        "ドロップしたファイルを添付するには、ワークスペースフォルダーを開いてください。",
+      ));
       return;
     }
 
@@ -1740,6 +1873,19 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const workspaceFiles = await this.getWorkspaceFiles(workspace);
     const resolved = new Map<string, WorkspaceFileItem>();
     let rejected = 0;
+
+    for (const upload of uploads) {
+      try {
+        const item = await this.stageDroppedFileUpload(upload);
+        if (item) {
+          resolved.set(item.path, item);
+        } else {
+          rejected += 1;
+        }
+      } catch {
+        rejected += 1;
+      }
+    }
 
     for (const rawReference of [...new Set(references)].slice(0, 20)) {
       const reference = rawReference.trim();
@@ -2031,14 +2177,94 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const absolute = path.isAbsolute(filePath)
       ? path.resolve(filePath)
       : path.resolve(root, filePath);
+    let uri = vscode.Uri.file(absolute);
     try {
-      await vscode.window.showTextDocument(vscode.Uri.file(absolute), { preview: true });
+      await vscode.workspace.fs.stat(uri);
+    } catch {
+      const recovered = await this.recoverStoredAttachment(filePath);
+      if (recovered) {
+        uri = recovered;
+      } else {
+        void vscode.window.showWarningMessage(localize(
+          `Could not open file: ${filePath}`,
+          `ファイルを開けませんでした: ${filePath}`,
+        ));
+        return;
+      }
+    }
+
+    try {
+      await vscode.commands.executeCommand("vscode.open", uri);
     } catch {
       void vscode.window.showWarningMessage(localize(
         `Could not open file: ${filePath}`,
         `ファイルを開けませんでした: ${filePath}`,
       ));
     }
+  }
+
+  private async recoverStoredAttachment(filePath: string): Promise<vscode.Uri | undefined> {
+    const missingName = path.basename(filePath);
+    if (!missingName) {
+      return undefined;
+    }
+
+    const active = this.activeId
+      ? this.conversations.find((conversation) => conversation.id === this.activeId)
+      : undefined;
+    const conversations = [
+      ...(active ? [active] : []),
+      ...this.conversations.filter((conversation) => conversation !== active),
+    ];
+
+    for (const conversation of conversations) {
+      if (!conversation.attachmentRoot) {
+        continue;
+      }
+      const root = vscode.Uri.file(conversation.attachmentRoot);
+      let entries: [string, vscode.FileType][];
+      try {
+        entries = await vscode.workspace.fs.readDirectory(root);
+      } catch {
+        continue;
+      }
+      const lowerName = missingName.toLowerCase();
+      const match = entries.find(([name, type]) =>
+        (type & vscode.FileType.File) !== 0
+        && (
+          name.toLowerCase() === lowerName
+          || name.toLowerCase().endsWith(`-${lowerName}`)
+        )
+      );
+      if (!match) {
+        continue;
+      }
+
+      const recovered = vscode.Uri.joinPath(root, match[0]);
+      const recoveredPath = recovered.fsPath.replaceAll("\\", "/");
+      const label = missingName.replace(/^[0-9a-f]{12}-/i, "");
+      let changed = false;
+      for (const entry of conversation.transcript) {
+        if (!entry.attachments) {
+          continue;
+        }
+        entry.attachments = entry.attachments.map((attachment) => {
+          const attachmentPath = typeof attachment === "string"
+            ? attachment
+            : attachment.path;
+          if (path.resolve(attachmentPath).toLowerCase() !== path.resolve(filePath).toLowerCase()) {
+            return attachment;
+          }
+          changed = true;
+          return { path: recoveredPath, label };
+        });
+      }
+      if (changed) {
+        await this.saveConversations();
+      }
+      return recovered;
+    }
+    return undefined;
   }
 
   private async openReferencedFile(reference: string): Promise<void> {
@@ -2424,7 +2650,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           progressStopped: "処理を停止しました",
           progressFailed: "処理中にエラーが発生しました",
           progressStep: "ステップ",
-          dropFiles: "ファイルをドロップして添付",
+          dropFiles: "Shiftを押しながらドロップして添付",
+          dropFailed: "ドロップしたファイルを読み取れませんでした。Shiftを押しながらドロップしてください。",
+          pasteFailed: "クリップボードの画像を読み取れませんでした。",
           approvalMode: "実行権限",
           autoReview: "自動レビュー",
           autoReviewDescription: SUPPORTS_LOCAL_SANDBOX
@@ -2508,7 +2736,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           progressStopped: "Work stopped",
           progressFailed: "Work failed",
           progressStep: "steps",
-          dropFiles: "Drop files to attach",
+          dropFiles: "Hold Shift and drop files to attach",
+          dropFailed: "Could not read the dropped files. Hold Shift while dropping.",
+          pasteFailed: "Could not read the image from the clipboard.",
           approvalMode: "Execution permissions",
           autoReview: "Auto-review",
           autoReviewDescription: SUPPORTS_LOCAL_SANDBOX
@@ -3764,6 +3994,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     let running = false;
     let runningSoundEnabled = false;
     let completionSoundEnabled = false;
+    let errorSoundEnabled = false;
     let runningSoundTimer;
     let runningAudioContext;
     let sandboxUnavailable = false;
@@ -3782,7 +4013,6 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     let workspacePaths = new Set();
     let workspaceBasenames = new Set();
     let attachmentRequestId = 0;
-    let dragDepth = 0;
     let availableModels = [];
     let selectedModelId = "auto";
     let modelParamState = {};
@@ -4556,26 +4786,72 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }
     }
 
+    function isUriTransferType(type) {
+      const lower = String(type || "").toLowerCase();
+      return lower.includes("uri-list")
+        || lower === "codefiles"
+        || lower === "resourceurls"
+        || lower.includes("code.uri");
+    }
+
+    function isFileDrag(transfer) {
+      if (!transfer) return false;
+      const types = Array.from(transfer.types || []).map((type) => String(type).toLowerCase());
+      return (transfer.files?.length || 0) > 0
+        || Array.from(transfer.items || []).some((item) => item.kind === "file")
+        || types.includes("files")
+        || types.some(isUriTransferType);
+    }
+
+    function transferredFiles(transfer) {
+      const files = [];
+      const seen = new Set();
+      const addFile = (file) => {
+        if (!file) return;
+        const key = [file.name, file.type, file.size, file.lastModified].join("\\n");
+        if (seen.has(key)) return;
+        seen.add(key);
+        files.push(file);
+      };
+      for (const file of Array.from(transfer?.files || [])) addFile(file);
+      for (const item of Array.from(transfer?.items || [])) {
+        if (item.kind === "file") addFile(item.getAsFile());
+      }
+      return files;
+    }
+
     function transferFileReferences(transfer, includePlainText) {
       const references = [];
       if (!transfer) return references;
 
-      for (const file of Array.from(transfer.files || [])) {
-        const filePath = file.path || file.webkitRelativePath || file.name;
+      for (const file of transferredFiles(transfer)) {
+        const filePath = file.path || file.webkitRelativePath;
         if (filePath) references.push(filePath);
       }
 
-      const supportedTypes = [
+      const types = Array.from(transfer.types || []);
+      const tried = new Set();
+      for (const type of types) {
+        if (!isUriTransferType(type)) continue;
+        addTransferValue(references, transfer.getData(type));
+        tried.add(type.toLowerCase());
+      }
+
+      // Some hosts omit MIME types from \`types\` even when getData still works on drop.
+      for (const type of [
         "text/uri-list",
         "application/vnd.code.uri-list",
         "CodeFiles",
         "ResourceURLs",
         "codefiles",
         "resourceurls",
-      ];
-      for (const type of supportedTypes) {
-        if (Array.from(transfer.types || []).includes(type)) {
-          addTransferValue(references, transfer.getData(type));
+      ]) {
+        if (tried.has(type.toLowerCase())) continue;
+        try {
+          const data = transfer.getData(type);
+          if (data) addTransferValue(references, data);
+        } catch {
+          // Unsupported MIME types throw in some webview hosts.
         }
       }
 
@@ -4592,13 +4868,63 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return [...new Set(references)];
     }
 
-    function resolveTransferredFiles(references) {
-      if (references.length === 0) return;
+    function fallbackFileName(file, index) {
+      const original = String(file.name || "").trim();
+      if (original) return original;
+      const extension = {
+        "image/avif": "avif",
+        "image/bmp": "bmp",
+        "image/gif": "gif",
+        "image/heic": "heic",
+        "image/heif": "heif",
+        "image/jfif": "jfif",
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/svg+xml": "svg",
+        "image/tiff": "tiff",
+        "image/webp": "webp",
+        "image/x-icon": "ico",
+      }[String(file.type || "").toLowerCase()] || "bin";
+      return "clipboard-image-" + String(index + 1) + "." + extension;
+    }
+
+    async function transferFileUploads(transfer) {
+      const uploads = [];
+      const files = transferredFiles(transfer).slice(0, 20);
+      for (const [index, file] of files.entries()) {
+        if (file.path || file.webkitRelativePath) continue;
+        if (file.size > ${MAX_DROPPED_FILE_BYTES}) continue;
+        try {
+          uploads.push({
+            name: fallbackFileName(file, index),
+            data: new Uint8Array(await file.arrayBuffer()),
+          });
+        } catch {
+          // The host may expose metadata without allowing the file contents to be read.
+        }
+      }
+      return uploads;
+    }
+
+    function setDragActive(active) {
+      composerCard.classList.toggle("drag-active", active);
+    }
+
+    async function resolveTransferredFiles(transfer, includePlainText, failureText) {
+      const references = transferFileReferences(transfer, includePlainText);
+      const uploads = references.length === 0
+        ? await transferFileUploads(transfer)
+        : [];
+      if (references.length === 0 && uploads.length === 0) {
+        status.textContent = failureText;
+        return;
+      }
       attachmentRequestId += 1;
       vscode.postMessage({
         type: "resolveAttachments",
         requestId: attachmentRequestId,
         references,
+        uploads,
       });
     }
 
@@ -4999,7 +5325,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
 
     function primeRunningSound() {
-      if (!runningSoundEnabled && !completionSoundEnabled) return;
+      if (!runningSoundEnabled && !completionSoundEnabled && !errorSoundEnabled) return;
       const audio = ensureRunningAudioContext();
       if (audio?.state === "suspended") {
         void audio.resume().catch(() => {});
@@ -5098,6 +5424,43 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         void audio.resume().then(playChime).catch(() => {});
       } else {
         playChime();
+      }
+    }
+
+    function playErrorSound() {
+      if (!errorSoundEnabled) return;
+      const audio = ensureRunningAudioContext();
+      if (!audio) return;
+
+      const playAlert = () => {
+        if (!errorSoundEnabled || audio.state !== "running") return;
+        const now = audio.currentTime;
+        const playTone = (frequency, start, duration, volume) => {
+          const oscillator = audio.createOscillator();
+          const gain = audio.createGain();
+          oscillator.type = "sine";
+          oscillator.frequency.setValueAtTime(frequency, start);
+          gain.gain.setValueAtTime(0.0001, start);
+          gain.gain.exponentialRampToValueAtTime(volume, start + 0.02);
+          gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+          oscillator.connect(gain);
+          gain.connect(audio.destination);
+          oscillator.addEventListener("ended", () => {
+            oscillator.disconnect();
+            gain.disconnect();
+          }, { once: true });
+          oscillator.start(start);
+          oscillator.stop(start + duration + 0.01);
+        };
+        playTone(415.3, now, 0.28, 0.028);
+        playTone(311.13, now + 0.16, 0.3, 0.026);
+        playTone(233.08, now + 0.34, 0.42, 0.024);
+      };
+
+      if (audio.state === "suspended") {
+        void audio.resume().then(playAlert).catch(() => {});
+      } else {
+        playAlert();
       }
     }
 
@@ -5226,30 +5589,36 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       event.preventDefault();
       vscode.postMessage({ type: "openReferencedFile", path: target.dataset.workspaceFile });
     });
-    composerCard.addEventListener("dragenter", (event) => {
+    // VS Code disables webview pointer events during resource drags unless Shift is held.
+    // Listen on document so the whole view accepts drops once Shift re-enables the webview.
+    document.addEventListener("dragenter", (event) => {
+      if (!isFileDrag(event.dataTransfer)) return;
       event.preventDefault();
-      dragDepth += 1;
-      composerCard.classList.add("drag-active");
+      setDragActive(true);
     });
-    composerCard.addEventListener("dragover", (event) => {
+    document.addEventListener("dragover", (event) => {
+      if (!isFileDrag(event.dataTransfer)) return;
       event.preventDefault();
       if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+      setDragActive(true);
     });
-    composerCard.addEventListener("dragleave", () => {
-      dragDepth = Math.max(0, dragDepth - 1);
-      if (dragDepth === 0) composerCard.classList.remove("drag-active");
+    document.addEventListener("dragleave", (event) => {
+      const related = event.relatedTarget;
+      if (related instanceof Node && document.documentElement.contains(related)) return;
+      setDragActive(false);
     });
-    composerCard.addEventListener("drop", (event) => {
+    document.addEventListener("drop", (event) => {
+      if (!isFileDrag(event.dataTransfer)) return;
       event.preventDefault();
-      dragDepth = 0;
-      composerCard.classList.remove("drag-active");
-      resolveTransferredFiles(transferFileReferences(event.dataTransfer, true));
+      setDragActive(false);
+      void resolveTransferredFiles(event.dataTransfer, true, i18n.dropFailed);
     });
+    window.addEventListener("dragend", () => setDragActive(false));
+    window.addEventListener("blur", () => setDragActive(false));
     prompt.addEventListener("paste", (event) => {
-      const references = transferFileReferences(event.clipboardData, false);
-      if (references.length === 0) return;
+      if (!isFileDrag(event.clipboardData)) return;
       event.preventDefault();
-      resolveTransferredFiles(references);
+      void resolveTransferredFiles(event.clipboardData, false, i18n.pasteFailed);
     });
     prompt.addEventListener("input", () => {
       autoGrow();
@@ -5329,6 +5698,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         case "completionSoundSetting":
           completionSoundEnabled = data.enabled === true;
           break;
+        case "errorSoundSetting":
+          errorSoundEnabled = data.enabled === true;
+          break;
         case "workspace":
           if (data.name) workspaceLabel.textContent = data.name + " " + i18n.runningIn;
           break;
@@ -5401,7 +5773,18 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           showChat();
           for (const entry of data.entries) {
             if (entry.role === "user") {
-              const attachments = (entry.attachments || []).map((p) => ({ path: p, label: p }));
+              const attachments = (entry.attachments || []).map((attachment) => {
+                if (typeof attachment === "string") {
+                  return {
+                    path: attachment,
+                    label: attachment.split(/[\\\\/]/).pop() || attachment,
+                  };
+                }
+                return {
+                  path: attachment.path,
+                  label: attachment.label || attachment.path.split(/[\\\\/]/).pop() || attachment.path,
+                };
+              });
               addUserMessage(entry.text, attachments);
             } else {
               const files = (entry.files || []).map((p) => ({ path: p, label: p.split(/[\\\\/]/).pop() || p }));
@@ -5470,6 +5853,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           break;
         case "error":
           finishProgress("error");
+          stopRunningSound();
+          playErrorSound();
           if (assistantNode && !assistantRaw) {
             messageBody(assistantNode).textContent = data.text;
             assistantNode.classList.add("error");

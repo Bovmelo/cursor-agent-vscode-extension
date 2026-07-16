@@ -23,6 +23,7 @@ const render = new Function(
   "IS_JAPANESE",
   "webview",
   "extensionVersion",
+  "MAX_DROPPED_FILE_BYTES",
   `return ${templateLiteral};`,
 );
 const html = render(
@@ -33,6 +34,7 @@ const html = render(
   false,
   { cspSource: "test-csp-source" },
   "0.0.0",
+  20 * 1024 * 1024,
 );
 const inlineScripts = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)]
   .map((match) => match[1])

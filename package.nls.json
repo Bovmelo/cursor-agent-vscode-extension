@@ -12,5 +12,6 @@
   "view.agent": "Agent",
   "config.notifyOnComplete.description": "Show a notification when an agent run finishes. Skipped while the chat view is visible and VS Code is focused.",
   "config.playSoundWhileRunning.description": "Play a calm chime periodically while the agent is running.",
-  "config.playSoundOnComplete.description": "Play a distinct chime when the agent finishes successfully."
+  "config.playSoundOnComplete.description": "Play a distinct chime when the agent finishes successfully.",
+  "config.playSoundOnError.description": "Play a distinct alert when the agent stops because of an error."
 }

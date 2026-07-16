@@ -6,8 +6,10 @@ import * as vscode from "vscode";
 const CONFIG_SECTION = "cursorSubscription";
 const CONFIG_KEY = "playSoundWhileRunning";
 const COMPLETION_CONFIG_KEY = "playSoundOnComplete";
+const ERROR_CONFIG_KEY = "playSoundOnError";
 const SOUND_FILE_NAME = "calm-running-sound.wav";
 const COMPLETION_SOUND_FILE_NAME = "completion-sound.wav";
+const ERROR_SOUND_FILE_NAME = "error-sound.wav";
 
 export class RunningSoundController implements vscode.Disposable {
   private activeRuns = 0;
@@ -15,7 +17,8 @@ export class RunningSoundController implements vscode.Disposable {
   private starting: Promise<void> | undefined;
   private soundFile: Promise<vscode.Uri> | undefined;
   private completionSoundFile: Promise<vscode.Uri> | undefined;
-  private readonly completionPlayers = new Set<ChildProcess>();
+  private errorSoundFile: Promise<vscode.Uri> | undefined;
+  private readonly oneShotPlayers = new Set<ChildProcess>();
   private disposed = false;
   private readonly configurationDisposable: vscode.Disposable;
 
@@ -46,39 +49,19 @@ export class RunningSoundController implements vscode.Disposable {
   }
 
   public playCompletion(): void {
-    if (
-      this.disposed
-      || !this.completionEnabled()
-      || process.platform !== "win32"
-    ) {
-      return;
-    }
+    this.playOneShot(
+      () => this.ensureCompletionSoundFile(),
+      () => this.completionEnabled(),
+      "completion",
+    );
+  }
 
-    void this.ensureCompletionSoundFile()
-      .then((soundUri) => {
-        if (this.disposed || !this.completionEnabled()) {
-          return;
-        }
-        const player = this.spawnSoundPlayer(soundUri, false);
-        this.completionPlayers.add(player);
-        const removePlayer = (): void => {
-          this.completionPlayers.delete(player);
-        };
-        player.once("error", (error) => {
-          removePlayer();
-          this.output.appendLine(
-            `[${new Date().toISOString()}] Could not play completion sound: ${error.message}`,
-          );
-        });
-        player.once("exit", removePlayer);
-      })
-      .catch((error: unknown) => {
-        this.output.appendLine(
-          `[${new Date().toISOString()}] Could not prepare completion sound: ${
-            error instanceof Error ? error.message : String(error)
-          }`,
-        );
-      });
+  public playError(): void {
+    this.playOneShot(
+      () => this.ensureErrorSoundFile(),
+      () => this.errorEnabled(),
+      "error",
+    );
   }
 
   public dispose(): void {
@@ -86,12 +69,12 @@ export class RunningSoundController implements vscode.Disposable {
     this.activeRuns = 0;
     this.configurationDisposable.dispose();
     this.stopPlayer();
-    for (const player of this.completionPlayers) {
+    for (const player of this.oneShotPlayers) {
       if (!player.killed) {
         player.kill();
       }
     }
-    this.completionPlayers.clear();
+    this.oneShotPlayers.clear();
   }
 
   private enabled(): boolean {
@@ -104,6 +87,48 @@ export class RunningSoundController implements vscode.Disposable {
     return vscode.workspace
       .getConfiguration(CONFIG_SECTION)
       .get<boolean>(COMPLETION_CONFIG_KEY, true);
+  }
+
+  private errorEnabled(): boolean {
+    return vscode.workspace
+      .getConfiguration(CONFIG_SECTION)
+      .get<boolean>(ERROR_CONFIG_KEY, true);
+  }
+
+  private playOneShot(
+    ensureFile: () => Promise<vscode.Uri>,
+    enabled: () => boolean,
+    label: string,
+  ): void {
+    if (this.disposed || !enabled() || process.platform !== "win32") {
+      return;
+    }
+
+    void ensureFile()
+      .then((soundUri) => {
+        if (this.disposed || !enabled()) {
+          return;
+        }
+        const player = this.spawnSoundPlayer(soundUri, false);
+        this.oneShotPlayers.add(player);
+        const removePlayer = (): void => {
+          this.oneShotPlayers.delete(player);
+        };
+        player.once("error", (error) => {
+          removePlayer();
+          this.output.appendLine(
+            `[${new Date().toISOString()}] Could not play ${label} sound: ${error.message}`,
+          );
+        });
+        player.once("exit", removePlayer);
+      })
+      .catch((error: unknown) => {
+        this.output.appendLine(
+          `[${new Date().toISOString()}] Could not prepare ${label} sound: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
   }
 
   private syncPlayback(): void {
@@ -219,6 +244,13 @@ export class RunningSoundController implements vscode.Disposable {
     return this.completionSoundFile;
   }
 
+  private ensureErrorSoundFile(): Promise<vscode.Uri> {
+    if (!this.errorSoundFile) {
+      this.errorSoundFile = this.writeErrorSoundFile();
+    }
+    return this.errorSoundFile;
+  }
+
   private async writeSoundFile(): Promise<vscode.Uri> {
     await vscode.workspace.fs.createDirectory(this.context.globalStorageUri);
     const soundUri = vscode.Uri.joinPath(this.context.globalStorageUri, SOUND_FILE_NAME);
@@ -235,6 +267,16 @@ export class RunningSoundController implements vscode.Disposable {
     await vscode.workspace.fs.writeFile(soundUri, createCompletionSound());
     return soundUri;
   }
+
+  private async writeErrorSoundFile(): Promise<vscode.Uri> {
+    await vscode.workspace.fs.createDirectory(this.context.globalStorageUri);
+    const soundUri = vscode.Uri.joinPath(
+      this.context.globalStorageUri,
+      ERROR_SOUND_FILE_NAME,
+    );
+    await vscode.workspace.fs.writeFile(soundUri, createErrorSound());
+    return soundUri;
+  }
 }
 
 function createCalmRunningSound(): Uint8Array {
@@ -249,6 +291,14 @@ function createCompletionSound(): Uint8Array {
     synthTone(time, 0.06, 0.3, 392, 0.042, 0.025, 0.12)
     + synthTone(time, 0.2, 0.34, 523.25, 0.038, 0.025, 0.14)
     + synthTone(time, 0.36, 0.4, 659.25, 0.032, 0.03, 0.18)
+  );
+}
+
+function createErrorSound(): Uint8Array {
+  return createPcmWav(1.05, (time) =>
+    synthTone(time, 0.04, 0.28, 415.3, 0.048, 0.02, 0.12)
+    + synthTone(time, 0.2, 0.3, 311.13, 0.044, 0.02, 0.14)
+    + synthTone(time, 0.38, 0.42, 233.08, 0.04, 0.025, 0.2)
   );
 }
 

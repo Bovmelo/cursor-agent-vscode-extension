@@ -164,6 +164,11 @@
           "type": "boolean",
           "default": true,
           "description": "%config.playSoundOnComplete.description%"
+        },
+        "cursorSubscription.playSoundOnError": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.playSoundOnError.description%"
         }
       }
     }
