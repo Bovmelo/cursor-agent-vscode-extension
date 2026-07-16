@@ -53,6 +53,8 @@ npm run package
 - 実行中メッセージの会話別キュー（`Enter` / `Alt+Enter`）
 - 現在の実行を停止し、追加指示を最優先で続ける割り込み（`Ctrl+Enter`）
 - SecretStorageによるAPIキー管理
+- Source Controlからのコミットメッセージ生成（差分をCursorに渡し、Gitの入力欄へ反映）
+- チャットのメッセージ／コードブロックのワンクリックコピー
 
 この拡張機能はCursor公式製品ではなく、Cursor SDKの公開ベータAPIに依存します。
 

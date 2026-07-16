@@ -14,6 +14,11 @@ import {
   type TokenUsage,
 } from "@cursor/sdk";
 import * as vscode from "vscode";
+import { generateCommitMessage, resolveRootUri } from "./generateCommitMessage.js";
+import {
+  detectBlockedProxyEnvironment,
+  type BlockedProxyEnvironment,
+} from "./networkEnvironment.js";
 
 const API_KEY_SECRET = "cursorSubscription.apiKey";
 const CONVERSATIONS_KEY = "cursorSubscription.conversations";
@@ -25,6 +30,7 @@ const DEFAULT_MODEL = "auto";
 const TITLE_MAX_LENGTH = 40;
 const IS_JAPANESE = vscode.env.language.toLowerCase().startsWith("ja");
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_EDITOR_GENERATION_CONTEXT = 60_000;
 const SUPPORTS_LOCAL_SANDBOX = process.platform !== "win32";
 const IMAGE_MIME_TYPES: Record<string, string> = {
   ".gif": "image/gif",
@@ -72,6 +78,14 @@ interface AttachedFileReference {
   external: boolean;
 }
 
+interface EditorContextSnapshot {
+  filePath: string;
+  languageId: string;
+  startLine?: number;
+  endLine?: number;
+  selectedText?: string;
+}
+
 interface Conversation {
   id: string;
   title: string;
@@ -93,6 +107,7 @@ interface QueuedMessage {
   skills: string[];
   model: ModelSelection;
   kind: "queued" | "interrupt";
+  editorContext?: EditorContextSnapshot;
 }
 
 function addTokenUsage(current: TokenUsage | undefined, usage: TokenUsage): TokenUsage {
@@ -115,9 +130,11 @@ function makeTitle(prompt: string): string {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
-  const provider = new CursorChatProvider(context);
+  const output = vscode.window.createOutputChannel("Cursor Agent");
+  const provider = new CursorChatProvider(context, output);
 
   context.subscriptions.push(
+    output,
     provider,
     vscode.window.registerWebviewViewProvider(VIEW_ID, provider, {
       webviewOptions: { retainContextWhenHidden: true },
@@ -132,6 +149,24 @@ export function activate(context: vscode.ExtensionContext): void {
       provider.clearApiKey(),
     ),
     vscode.commands.registerCommand("cursorSubscription.newChat", () => provider.newChat()),
+    vscode.commands.registerTextEditorCommand(
+      "cursorSubscription.generateCode",
+      (editor) => provider.generateCode(editor),
+    ),
+    vscode.commands.registerTextEditorCommand(
+      "cursorSubscription.explainSelection",
+      (editor) => provider.explainSelection(editor),
+    ),
+    vscode.commands.registerCommand(
+      "cursorSubscription.generateCommitMessage",
+      (arg?: unknown) =>
+        generateCommitMessage(
+          context,
+          resolveRootUri(arg),
+          () => provider.promptForApiKey(),
+          output,
+        ),
+    ),
   );
 }
 
@@ -156,7 +191,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private runningConversationId: string | undefined;
   private pendingCancelConversationId: string | undefined;
 
-  constructor(private readonly context: vscode.ExtensionContext) {
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly output: vscode.OutputChannel,
+  ) {
     this.conversations = context.workspaceState.get<Conversation[]>(CONVERSATIONS_KEY, []);
   }
 
@@ -420,6 +458,231 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     await this.publishAuthState();
   }
 
+  public async generateCode(editor: vscode.TextEditor): Promise<void> {
+    if (editor.document.uri.scheme !== "file") {
+      void vscode.window.showInformationMessage(localize(
+        "Save the file before generating code.",
+        "コードを生成する前にファイルを保存してください。",
+      ));
+      return;
+    }
+
+    const selection = new vscode.Range(editor.selection.start, editor.selection.end);
+    const selectedText = editor.document.getText(selection);
+    if (selectedText.length > MAX_EDITOR_GENERATION_CONTEXT) {
+      void vscode.window.showWarningMessage(localize(
+        "The selected code is too large to generate safely. Select a smaller range.",
+        "選択範囲が大きすぎるため、安全にコードを生成できません。範囲を小さくしてください。",
+      ));
+      return;
+    }
+
+    const instruction = await vscode.window.showInputBox({
+      title: localize("Cursor: Generate Code", "Cursor: コードを生成"),
+      prompt: selection.isEmpty
+        ? localize(
+            "Describe the code to insert at the cursor.",
+            "カーソル位置に挿入するコードを指示してください。",
+          )
+        : localize(
+            "Describe how the selected code should be changed.",
+            "選択したコードをどのように変更するか指示してください。",
+          ),
+      ignoreFocusOut: true,
+    });
+    if (!instruction?.trim()) {
+      return;
+    }
+
+    let apiKey = await this.context.secrets.get(API_KEY_SECRET);
+    if (!apiKey) {
+      await this.promptForApiKey();
+      apiKey = await this.context.secrets.get(API_KEY_SECRET);
+      if (!apiKey) {
+        return;
+      }
+    }
+
+    const blockedProxy = detectBlockedProxyEnvironment();
+    if (blockedProxy) {
+      void vscode.window.showErrorMessage(this.formatBlockedProxyError(blockedProxy));
+      return;
+    }
+
+    const document = editor.document;
+    const documentVersion = document.version;
+    const relativePath = vscode.workspace.asRelativePath(document.uri);
+    const cursorOffset = document.offsetAt(selection.start);
+    const selectionEndOffset = document.offsetAt(selection.end);
+    const surroundingBudget = Math.max(
+      0,
+      MAX_EDITOR_GENERATION_CONTEXT - selectedText.length,
+    );
+    const contextPerSide = Math.floor(surroundingBudget / 2);
+    const beforeStartOffset = Math.max(
+      0,
+      cursorOffset - contextPerSide,
+    );
+    const afterEndOffset = Math.min(
+      document.getText().length,
+      selectionEndOffset + contextPerSide,
+    );
+    const beforeText = document.getText(
+      new vscode.Range(document.positionAt(beforeStartOffset), selection.start),
+    );
+    const afterText = document.getText(
+      new vscode.Range(selection.end, document.positionAt(afterEndOffset)),
+    );
+    const task = selection.isEmpty
+      ? [
+          "Generate code to insert at the cursor according to the user's instruction.",
+          "Use the surrounding code for context.",
+        ]
+      : [
+          "Generate replacement code for the selected range according to the user's instruction.",
+          "Preserve behavior outside the selected range.",
+        ];
+    const prompt = [
+      ...task,
+      "Return ONLY the code to insert. Do not use Markdown fences and do not add explanations.",
+      "",
+      `File: ${relativePath}`,
+      `Language: ${document.languageId}`,
+      `Instruction: ${instruction.trim()}`,
+      "",
+      "Code before the target:",
+      "<before>",
+      beforeText,
+      "</before>",
+      selection.isEmpty ? undefined : "Selected code:",
+      selection.isEmpty ? undefined : "<selection>",
+      selection.isEmpty ? undefined : selectedText,
+      selection.isEmpty ? undefined : "</selection>",
+      "Code after the target:",
+      "<after>",
+      afterText,
+      "</after>",
+    ].filter((line): line is string => line !== undefined).join("\n");
+
+    try {
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: localize("Generating code…", "コードを生成中…"),
+          cancellable: false,
+        },
+        async () => {
+          const result = await Agent.prompt(prompt, {
+            apiKey,
+            model: this.selectedModelSelection(),
+            name: "VS Code: Generate Code",
+            mode: "plan",
+            local: {
+              cwd:
+                vscode.workspace.getWorkspaceFolder(document.uri)?.uri.fsPath ??
+                path.dirname(document.uri.fsPath),
+              settingSources: [],
+            },
+          });
+
+          if (result.status === "error") {
+            throw new Error(this.formatRunFailure(result));
+          }
+          if (result.status === "cancelled") {
+            return;
+          }
+
+          const generatedCode = this.cleanGeneratedCode(result.result ?? "");
+          if (!generatedCode) {
+            throw new Error(localize(
+              "The model returned empty code.",
+              "モデルから空のコードが返されました。",
+            ));
+          }
+
+          const currentDocument =
+            vscode.workspace.textDocuments.find(
+              (candidate) => candidate.uri.toString() === document.uri.toString(),
+            ) ?? await vscode.workspace.openTextDocument(document.uri);
+          if (currentDocument.version !== documentVersion) {
+            throw new Error(localize(
+              "The file changed while code was being generated. Run the command again.",
+              "コードの生成中にファイルが変更されました。もう一度実行してください。",
+            ));
+          }
+
+          const edit = new vscode.WorkspaceEdit();
+          edit.replace(document.uri, selection, generatedCode);
+          const applied = await vscode.workspace.applyEdit(edit);
+          if (!applied) {
+            throw new Error(localize(
+              "Could not apply the generated code.",
+              "生成したコードを適用できませんでした。",
+            ));
+          }
+
+          const end = this.positionAfterText(selection.start, generatedCode);
+          const updatedEditor = await vscode.window.showTextDocument(document.uri, {
+            preview: false,
+            viewColumn: editor.viewColumn,
+          });
+          updatedEditor.selection = new vscode.Selection(end, end);
+          updatedEditor.revealRange(new vscode.Range(selection.start, end));
+        },
+      );
+    } catch (error) {
+      const message =
+        error instanceof CursorAgentError
+          ? localize(
+              `Could not start code generation: ${error.message}`,
+              `コード生成を開始できませんでした: ${error.message}`,
+            )
+          : error instanceof Error
+            ? error.message
+            : String(error);
+      this.output.appendLine(
+        `[${new Date().toISOString()}] Code generation error: ${message}`,
+      );
+      void vscode.window.showErrorMessage(message);
+    }
+  }
+
+  public async explainSelection(editor: vscode.TextEditor): Promise<void> {
+    if (editor.selection.isEmpty) {
+      void vscode.window.showInformationMessage(localize(
+        "Select the code you want Cursor to explain.",
+        "Cursorに説明してほしいコードを選択してください。",
+      ));
+      return;
+    }
+
+    const editorContext = this.captureEditorContext(editor);
+    if (!editorContext?.selectedText) {
+      return;
+    }
+    if (editorContext.selectedText.length > MAX_EDITOR_GENERATION_CONTEXT) {
+      void vscode.window.showWarningMessage(localize(
+        "The selected code is too large to explain safely. Select a smaller range.",
+        "選択範囲が大きすぎるため、安全に説明できません。範囲を小さくしてください。",
+      ));
+      return;
+    }
+
+    await vscode.commands.executeCommand(`${VIEW_ID}.focus`);
+    await this.enqueueMessage(
+      localize(
+        "Explain what the selected code does, how it works, and any important caveats.",
+        "選択したコードが何をしているのか、どのように動作するのか、注意点も含めて説明してください。",
+      ),
+      true,
+      [],
+      "agent",
+      [],
+      false,
+      editorContext,
+    );
+  }
+
   public async newChat(): Promise<void> {
     await this.cancel();
     this.activeId = undefined;
@@ -471,6 +734,40 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
   private selectedModel(): string {
     return this.context.globalState.get<string>(MODEL_KEY, DEFAULT_MODEL);
+  }
+
+  private cleanGeneratedCode(raw: string): string {
+    const trimmed = raw.trim();
+    const fenced = trimmed.match(/^```(?:[^\r\n]*)\r?\n([\s\S]*?)\r?\n```$/);
+    if (fenced) {
+      return fenced[1];
+    }
+    return raw
+      .replace(/^(?:\r?\n)+/, "")
+      .replace(/(?:\r?\n)+$/, "");
+  }
+
+  private positionAfterText(start: vscode.Position, text: string): vscode.Position {
+    const lines = text.split(/\r?\n/);
+    return lines.length === 1
+      ? start.translate(0, lines[0].length)
+      : new vscode.Position(start.line + lines.length - 1, lines.at(-1)?.length ?? 0);
+  }
+
+  private captureEditorContext(editor: vscode.TextEditor): EditorContextSnapshot | undefined {
+    if (editor.document.uri.scheme !== "file") {
+      return undefined;
+    }
+    const selection = editor.selection;
+    return {
+      filePath: vscode.workspace.asRelativePath(editor.document.uri),
+      languageId: editor.document.languageId,
+      startLine: selection.isEmpty ? undefined : selection.start.line + 1,
+      endLine: selection.isEmpty ? undefined : selection.end.line + 1,
+      selectedText: selection.isEmpty
+        ? undefined
+        : editor.document.getText(selection),
+    };
   }
 
   private storedModelParams(): Record<string, ModelParameterValue[]> {
@@ -585,6 +882,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     profile: RunProfile,
     skills: string[],
     interrupt: boolean,
+    editorContext?: EditorContextSnapshot,
   ): Promise<void> {
     if (!prompt) {
       return;
@@ -592,7 +890,16 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
     const conversationId = this.runningConversationId ?? this.activeId;
     if (!conversationId) {
-      await this.send(prompt, attachContext, files, profile, skills);
+      await this.send(
+        prompt,
+        attachContext,
+        files,
+        profile,
+        skills,
+        undefined,
+        undefined,
+        editorContext,
+      );
       await this.drainMessageQueue();
       return;
     }
@@ -607,6 +914,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       skills,
       model: this.selectedModelSelection(),
       kind: interrupt ? "interrupt" : "queued",
+      editorContext,
     };
     if (interrupt) {
       this.messageQueue.unshift(item);
@@ -666,6 +974,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           item.skills,
           item.conversationId,
           item.model,
+          item.editorContext,
         );
       }
     } finally {
@@ -681,6 +990,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     requestedSkills: string[],
     targetConversationId?: string,
     modelSelection?: ModelSelection,
+    editorContext?: EditorContextSnapshot,
   ): Promise<void> {
     if (!prompt || this.busy) {
       return;
@@ -723,6 +1033,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       attachmentReferences,
       profile,
       requestedSkills,
+      editorContext,
     );
     const images = await this.loadAttachedImages(attachedFiles, workspace);
     const conversationId = conversation.id;
@@ -748,6 +1059,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     let progressState: "completed" | "stopped" | "error" = "completed";
 
     try {
+      const blockedProxy = detectBlockedProxyEnvironment();
+      if (blockedProxy) {
+        const text = this.formatBlockedProxyError(blockedProxy);
+        this.output.appendLine(
+          `[${new Date().toISOString()}] Run blocked before SDK connection: ${blockedProxy.variable}=${blockedProxy.address}`,
+        );
+        throw new Error(text);
+      }
+
       const cwd = workspace.uri.fsPath;
       const agentRoots = [cwd, conversation.attachmentRoot].filter(
         (root): root is string => typeof root === "string",
@@ -806,6 +1126,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         failed = true;
         progressState = "error";
         const errorText = this.formatRunFailure(result);
+        this.output.appendLine(
+          `[${new Date().toISOString()}] Run ${result.id} failed: ${result.error?.code ?? "unknown"} ${result.error?.message ?? ""}`.trim(),
+        );
         this.postIfActive(conversationId, {
           type: "error",
           text: errorText,
@@ -825,6 +1148,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     } catch (error) {
       failed = true;
       progressState = "error";
+      this.output.appendLine(
+        `[${new Date().toISOString()}] Cursor Agent error: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
       const text =
         error instanceof CursorAgentError
           ? localize(
@@ -888,7 +1216,19 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const searchable = `${result.error?.code ?? ""} ${detail ?? ""}`.toLowerCase();
     let summary: string;
 
-    if (/exchange.*fetch failed|failed to connect.*exchange|network|unavailable/.test(searchable)) {
+    const blockedProxy = detectBlockedProxyEnvironment();
+    if (blockedProxy) {
+      return [
+        this.formatBlockedProxyError(blockedProxy),
+        `Run: ${result.id}`,
+      ].join("\n");
+    }
+
+    if (
+      /exchange.*fetch failed|failed to connect.*exchange|network|unavailable|connection (?:failed|stalled)(?: repeatedly)?/.test(
+        searchable,
+      )
+    ) {
       summary = localize(
         "Could not connect to Cursor's authentication server. Check the network, VPN, or proxy, then try again.",
         "Cursorの認証サーバーに接続できませんでした。ネットワーク、VPN、プロキシを確認して再試行してください。",
@@ -930,6 +1270,21 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     ].filter((line): line is string => Boolean(line)).join("\n");
   }
 
+  private formatBlockedProxyError(proxy: BlockedProxyEnvironment): string {
+    return localize(
+      [
+        "Cursor Agent network access is blocked by the current VS Code process.",
+        `Details: ${proxy.variable} points to the blocked loopback address ${proxy.address}.`,
+        "Fully quit VS Code and reopen it normally, outside the restricted or sandboxed launcher.",
+      ].join("\n"),
+      [
+        "現在のVS CodeプロセスではCursor Agentのネットワーク接続が遮断されています。",
+        `詳細: ${proxy.variable} が遮断用ループバックアドレス ${proxy.address} を参照しています。`,
+        "VS Codeをすべて終了し、制限環境やサンドボックス経由ではなく通常の方法で起動し直してください。",
+      ].join("\n"),
+    );
+  }
+
   private postContextInfo(): void {
     this.post({ type: "contextInfo", label: this.currentContextLabel() ?? null });
   }
@@ -940,6 +1295,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     attachedFiles: AttachedFileReference[],
     profile: RunProfile,
     requestedSkills: string[],
+    editorContext?: EditorContextSnapshot,
   ): { composed: string; contextLabel?: string } {
     const profileInstruction: Partial<Record<RunProfile, string>> = {
       plan: "Create a concrete implementation plan. Do not edit files or run mutating commands.",
@@ -968,6 +1324,31 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (!attachContext) {
       return {
         composed: fileReference ? `${fileReference}${effectivePrompt}` : effectivePrompt,
+      };
+    }
+
+    if (editorContext) {
+      if (editorContext.selectedText === undefined) {
+        return {
+          composed: `${fileReference}${localize("Target file", "対象ファイル")}: ${editorContext.filePath}\n\n${effectivePrompt}`,
+          contextLabel: editorContext.filePath,
+        };
+      }
+
+      const startLine = editorContext.startLine ?? 1;
+      const endLine = editorContext.endLine ?? startLine;
+      return {
+        composed: [
+          fileReference.trimEnd(),
+          `${localize("Target file", "対象ファイル")}: ${editorContext.filePath} (L${startLine}-L${endLine})`,
+          `${localize("Selection", "選択範囲")}:`,
+          `\`\`\`${editorContext.languageId}`,
+          editorContext.selectedText,
+          "```",
+          "",
+          effectivePrompt,
+        ].filter(Boolean).join("\n"),
+        contextLabel: `${editorContext.filePath} L${startLine}-L${endLine}`,
       };
     }
 
@@ -1734,6 +2115,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }[];
     }[] = [];
     try {
+      const blockedProxy = detectBlockedProxyEnvironment();
+      if (blockedProxy) {
+        this.output.appendLine(
+          `[${new Date().toISOString()}] Model refresh skipped: ${blockedProxy.variable}=${blockedProxy.address}`,
+        );
+        throw new Error(this.formatBlockedProxyError(blockedProxy));
+      }
       const list = await Cursor.models.list({ apiKey });
       models = list.map((model) => {
         return {
@@ -1895,6 +2283,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           fullAccess: "フルアクセス",
           fullAccessDescription: "確認とサンドボックスなしで実行します",
           sandboxUnavailable: "サンドボックスなし・自動レビュー有効",
+          copyCode: "コードをコピー",
+          copyMessage: "メッセージをコピー",
+          copied: "コピーしました",
         }
       : {
           history: "Conversation history",
@@ -1971,6 +2362,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           fullAccess: "Full access",
           fullAccessDescription: "Run without review or sandbox restrictions",
           sandboxUnavailable: "No sandbox · Auto-review enabled",
+          copyCode: "Copy code",
+          copyMessage: "Copy message",
+          copied: "Copied",
         };
 
     return /* html */ `<!doctype html>
@@ -2116,28 +2510,37 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       opacity: .28;
     }
     .message {
+      position: relative;
       line-height: 1.55;
       overflow-wrap: anywhere;
     }
     .user {
       align-self: flex-end;
       max-width: 88%;
-      padding: 8px 12px;
+      padding: 8px 28px 8px 12px;
       background: var(--vscode-input-background);
       border: 1px solid var(--vscode-input-border, transparent);
       border-radius: 14px;
       border-bottom-right-radius: 4px;
       white-space: pre-wrap;
     }
-    .assistant { align-self: stretch; }
-    .assistant.error {
+    .assistant {
+      align-self: stretch;
+      padding-right: 28px;
+    }
+    .assistant.error > .message-body {
       color: var(--vscode-errorForeground);
       white-space: pre-wrap;
     }
-    .assistant > :first-child { margin-top: 0; }
-    .assistant > :last-child { margin-bottom: 0; }
-    .assistant pre {
-      padding: 10px;
+    .assistant > .message-body > :first-child { margin-top: 0; }
+    .assistant > .message-body > :last-child { margin-bottom: 0; }
+    .assistant .code-block {
+      position: relative;
+      margin: .75em 0;
+    }
+    .assistant .code-block > pre {
+      margin: 0;
+      padding: 10px 36px 10px 10px;
       overflow-x: auto;
       background: var(--vscode-textCodeBlock-background);
       border: 1px solid var(--vscode-panel-border);
@@ -2151,6 +2554,50 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       padding: 1px 4px;
       background: var(--vscode-textCodeBlock-background);
       border-radius: 4px;
+    }
+    .copy-btn {
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      z-index: 1;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      color: var(--vscode-icon-foreground);
+      background: var(--vscode-editor-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 6px;
+      opacity: 0;
+      cursor: pointer;
+    }
+    .code-block > .copy-btn {
+      top: 6px;
+      right: 6px;
+      background: var(--vscode-textCodeBlock-background);
+    }
+    .message:hover > .copy-btn,
+    .message:focus-within > .copy-btn,
+    .code-block:hover > .copy-btn,
+    .code-block:focus-within > .copy-btn,
+    .copy-btn:focus-visible,
+    .copy-btn.copied {
+      opacity: 1;
+    }
+    .copy-btn:hover { background: var(--vscode-toolbar-hoverBackground); }
+    .copy-btn:focus-visible {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 1px;
+    }
+    .copy-btn.copied {
+      color: var(--vscode-testing-iconPassed, var(--vscode-charts-green, #3fb950));
+    }
+    .copy-btn svg {
+      width: 14px;
+      height: 14px;
+      pointer-events: none;
     }
     .chat-progress {
       align-self: stretch;
@@ -3783,7 +4230,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       const textNodes = [];
       while (walker.nextNode()) {
         const parent = walker.currentNode.parentElement;
-        if (!parent || parent.closest("a, pre, button, .files, .user-attachments")) continue;
+        if (!parent || parent.closest("a, pre, button, .files, .user-attachments, .copy-btn")) continue;
         textNodes.push(walker.currentNode);
       }
 
@@ -3817,15 +4264,106 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }
     }
 
-    function renderMarkdown(node, raw) {
-      node.innerHTML = DOMPurify.sanitize(marked.parse(raw));
-      linkifyWorkspaceFiles(node);
+    const COPY_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5.5" y="5.5" width="7" height="8" rx="1"/><path d="M10.5 5.5V4.5a1 1 0 0 0-1-1h-5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h1"/></svg>';
+
+    function createCopyButton(kind, label) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "copy-btn " + (kind === "code" ? "code-copy" : "message-copy");
+      btn.dataset.copy = kind;
+      btn.setAttribute("aria-label", label);
+      btn.title = label;
+      btn.innerHTML = COPY_SVG;
+      return btn;
+    }
+
+    function messageBody(messageNode) {
+      let body = messageNode.querySelector(":scope > .message-body");
+      if (!body) {
+        body = document.createElement("div");
+        body.className = "message-body";
+        const copyBtn = messageNode.querySelector(":scope > .message-copy");
+        if (copyBtn) {
+          copyBtn.before(body);
+        } else {
+          messageNode.appendChild(body);
+        }
+      }
+      return body;
+    }
+
+    function ensureMessageCopy(messageNode) {
+      if (messageNode.querySelector(":scope > .message-copy")) return;
+      messageNode.appendChild(createCopyButton("message", i18n.copyMessage));
+    }
+
+    function enhanceCodeBlocks(root) {
+      for (const pre of root.querySelectorAll("pre")) {
+        if (pre.parentElement?.classList.contains("code-block")) continue;
+        const wrap = document.createElement("div");
+        wrap.className = "code-block";
+        pre.replaceWith(wrap);
+        wrap.append(createCopyButton("code", i18n.copyCode), pre);
+      }
+    }
+
+    async function writeClipboard(text) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.cssText = "position:fixed;left:-9999px;top:0";
+        document.body.appendChild(ta);
+        ta.select();
+        let ok = false;
+        try {
+          ok = document.execCommand("copy");
+        } catch {
+          ok = false;
+        }
+        ta.remove();
+        return ok;
+      }
+    }
+
+    function flashCopied(btn) {
+      const prevLabel = btn.getAttribute("aria-label") || "";
+      btn.classList.add("copied");
+      btn.setAttribute("aria-label", i18n.copied);
+      btn.title = i18n.copied;
+      clearTimeout(btn._copyTimer);
+      btn._copyTimer = setTimeout(() => {
+        btn.classList.remove("copied");
+        btn.setAttribute("aria-label", prevLabel);
+        btn.title = prevLabel;
+      }, 1200);
+    }
+
+    function copyTextForButton(btn) {
+      if (btn.dataset.copy === "code") {
+        return btn.closest(".code-block")?.querySelector("pre")?.innerText ?? "";
+      }
+      const message = btn.closest(".message");
+      const body = message?.querySelector(":scope > .message-body");
+      return body?.innerText?.trim() ?? "";
+    }
+
+    function renderMarkdown(messageNode, raw) {
+      const body = messageBody(messageNode);
+      body.innerHTML = DOMPurify.sanitize(marked.parse(raw));
+      linkifyWorkspaceFiles(body);
+      enhanceCodeBlocks(body);
+      ensureMessageCopy(messageNode);
     }
 
     function addUserMessage(text, attachments = []) {
       const node = document.createElement("div");
       node.className = "message user";
       const body = document.createElement("div");
+      body.className = "message-body";
       body.textContent = text;
       node.appendChild(body);
       linkifyWorkspaceFiles(body);
@@ -3843,6 +4381,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         }
         node.appendChild(attachmentsNode);
       }
+      ensureMessageCopy(node);
       messages.appendChild(node);
       scrollToBottom();
       return node;
@@ -3951,7 +4490,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     ) {
       const node = document.createElement("div");
       node.className = "message assistant" + (isError ? " error" : "");
-      if (raw) renderMarkdown(node, raw);
+      if (raw) {
+        renderMarkdown(node, raw);
+      } else {
+        messageBody(node);
+        ensureMessageCopy(node);
+      }
       if (progress.length > 0) {
         messages.appendChild(createProgressPanel(progress, progressState).node);
       }
@@ -4100,6 +4644,16 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     });
     modelSearch.addEventListener("input", renderModelList);
     window.addEventListener("resize", positionModelPicker);
+    window.addEventListener("blur", () => {
+      closeModelPicker();
+      closeAddMenu();
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        closeModelPicker();
+        closeAddMenu();
+      }
+    });
     document.addEventListener("pointerdown", (event) => {
       if (!modelPicker.hidden && !document.querySelector(".model-control").contains(event.target)) {
         closeModelPicker();
@@ -4124,9 +4678,19 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     document.getElementById("connectButton").addEventListener("click", () => vscode.postMessage({ type: "setApiKey" }));
     document.getElementById("dashboardButton").addEventListener("click", () => vscode.postMessage({ type: "openDashboard" }));
     messages.addEventListener("click", (event) => {
-      const target = event.target instanceof Element
-        ? event.target.closest("[data-workspace-file]")
-        : null;
+      const el = event.target instanceof Element ? event.target : null;
+      const copyBtn = el?.closest("[data-copy]");
+      if (copyBtn instanceof HTMLButtonElement) {
+        event.preventDefault();
+        const text = copyTextForButton(copyBtn);
+        if (!text) return;
+        void writeClipboard(text).then((ok) => {
+          if (ok) flashCopied(copyBtn);
+        });
+        return;
+      }
+
+      const target = el?.closest("[data-workspace-file]");
       if (!(target instanceof HTMLElement) || !target.dataset.workspaceFile) return;
       event.preventDefault();
       vscode.postMessage({ type: "openReferencedFile", path: target.dataset.workspaceFile });
@@ -4345,15 +4909,19 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         case "error":
           finishProgress("error");
           if (assistantNode && !assistantRaw) {
-            assistantNode.textContent = data.text;
+            messageBody(assistantNode).textContent = data.text;
             assistantNode.classList.add("error");
+            ensureMessageCopy(assistantNode);
           } else {
             addAssistantMessage(data.text, true);
           }
           break;
         case "cancelled":
           finishProgress("stopped");
-          if (assistantNode && !assistantRaw) assistantNode.textContent = i18n.stopped;
+          if (assistantNode && !assistantRaw) {
+            messageBody(assistantNode).textContent = i18n.stopped;
+            ensureMessageCopy(assistantNode);
+          }
           break;
         case "finished":
           finishProgress("completed");

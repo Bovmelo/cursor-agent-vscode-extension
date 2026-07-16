@@ -13,8 +13,14 @@
     "Other",
     "Machine Learning"
   ],
+  "extensionDependencies": [
+    "vscode.git"
+  ],
   "activationEvents": [
-    "onView:cursorSubscription.chatView"
+    "onView:cursorSubscription.chatView",
+    "onCommand:cursorSubscription.generateCommitMessage",
+    "onCommand:cursorSubscription.generateCode",
+    "onCommand:cursorSubscription.explainSelection"
   ],
   "main": "./out/extension.js",
   "scripts": {
@@ -42,8 +48,42 @@
       {
         "command": "cursorSubscription.newChat",
         "title": "%command.newChat%"
+      },
+      {
+        "command": "cursorSubscription.generateCommitMessage",
+        "title": "%command.generateCommitMessage%",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "cursorSubscription.generateCode",
+        "title": "%command.generateCode%"
+      },
+      {
+        "command": "cursorSubscription.explainSelection",
+        "title": "%command.explainSelection%"
       }
     ],
+    "menus": {
+      "scm/title": [
+        {
+          "command": "cursorSubscription.generateCommitMessage",
+          "when": "scmProvider == git",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "cursorSubscription.generateCode",
+          "when": "editorTextFocus && !editorReadonly",
+          "group": "cursor@1"
+        },
+        {
+          "command": "cursorSubscription.explainSelection",
+          "when": "editorHasSelection",
+          "group": "cursor@2"
+        }
+      ]
+    },
     "viewsContainers": {
       "activitybar": [
         {
