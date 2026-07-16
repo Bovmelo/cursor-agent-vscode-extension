@@ -1,61 +1,81 @@
 # Cursor Subscription for VS Code
 
-Cursor公式TypeScript SDKを使い、VS CodeのサイドバーからCursor Agentを実行する拡張機能です。
+**Unofficial** community extension. Not affiliated with Anysphere / Cursor.
 
-## 必要なもの
+Run [Cursor](https://cursor.com) agents from the VS Code sidebar with your Cursor user API key and plan. Built on the public [Cursor TypeScript SDK](https://cursor.com/docs/sdk/typescript) (beta).
 
-- VS Code 1.100以降
-- Node.js 22.13以降
-- CursorアカウントのユーザーAPIキー
+日本語は下の [日本語](#日本語) を参照してください。
 
-ユーザーAPIキーによるSDK実行は、そのユーザーのCursorプランと同じ利用枠・課金ルールに従います。Cursorアプリのログインセッションを読み取ることはありません。
+## Features
 
-## 開発実行
+- Local Cursor Agent for the current workspace
+- Multi-turn chat with streaming Markdown
+- Model picker (search, thinking / context / effort; default Auto)
+- Profiles: Agent, Plan, Multitask (SDK subagents)
+- Image context (PNG, JPEG, GIF, WebP)
+- Project Skills and `.cursor/mcp.json` MCP servers
+- Permission modes (auto-review / full access)
+- `@` file search, drag-and-drop / paste file references
+- Active editor and selection context
+- Conversation history across restarts
+- Commit message generation from Source Control
+- Japanese / English UI (follows VS Code display language)
 
-```powershell
-npm install
-npm run compile
-```
+## Requirements
 
-VS Codeでこのフォルダーを開き、`F5`を押します。Extension Development HostのActivity Barにある「Cursor」を開いてください。
+- VS Code 1.100 or later
+- Node.js 22.13 or later (local agent runtime used by the SDK)
+- A Cursor account and [user API key](https://cursor.com/dashboard)
 
-初回利用時は「APIキーを設定」を選択し、[Cursor Dashboard](https://cursor.com/dashboard) の **API Keys** で発行したユーザーAPIキーを入力します。キーはVS CodeのSecretStorageに保存され、ワークスペースや設定ファイルには書き込まれません。
+Usage follows **your** Cursor plan. This extension does not read the Cursor desktop app login session.
 
-## VSIXの作成
+## Getting started
 
-```powershell
-npm run package
-```
+1. Install this extension from the Marketplace.
+2. Open the **Cursor** view in the Activity Bar.
+3. Run **Cursor: Set API Key** and paste your key from the [Cursor Dashboard](https://cursor.com/dashboard).
 
-生成された`.vsix`は、VS Codeのコマンド「Extensions: Install from VSIX...」からインストールできます。
+The API key is stored in VS Code SecretStorage (not in settings or the workspace).
 
-## 現在の機能
+## Notes
 
-- ワークスペースを対象にしたローカルCursor Agent
-- 会話コンテキストを維持する連続チャット
-- 応答のストリーミング表示（Markdownレンダリング対応）
-- モデル選択（検索付きポップオーバー、モデルごとのThinking・Context・Effortなどの対応オプション、既定はAuto）
-- `+` メニューからの実行プロファイル切り替え（Plan、Multitask）
-- Cursor SDKのサブエージェントを使ったMultitask（調査、実装、レビュー）
-- 画像コンテキストの直接入力（PNG、JPEG、GIF、WebP）
-- プロジェクトSkillsの選択と`.cursor/skills`への導線
-- `.cursor/mcp.json`で設定したMCPサーバーの読み込みと一覧表示
-- 実行権限の切り替え（自動レビュー、フルアクセス。対応環境では自動レビューにサンドボックスを併用）
-- `@` 入力によるワークスペース内ファイルの検索・参照
-- ドラッグ＆ドロップとクリップボード貼り付けによるファイル参照（ワークスペース外も対応）
-- チャット内に表示された実在ファイル名の自動リンク
-- VS Codeの表示言語に連動した英語・日本語UI
-- アクティブファイル・選択範囲のコンテキスト添付
-- エージェントが編集したファイルのチップ表示（クリックでGit差分を表示）
-- 会話履歴の保存・復元（VS Code再起動後も継続、エージェントの会話状態も復元）
-- 新規チャット開始（会話のリセット）
-- 実行のキャンセル
-- 実行中メッセージの会話別キュー（`Enter` / `Alt+Enter`）
-- 現在の実行を停止し、追加指示を最優先で続ける割り込み（`Ctrl+Enter`）
-- SecretStorageによるAPIキー管理
-- Source Controlからのコミットメッセージ生成（差分をCursorに渡し、Gitの入力欄へ反映）
-- チャットのメッセージ／コードブロックのワンクリックコピー
+- The Cursor SDK is in public beta; APIs may change.
+- **Interrupt (`Ctrl+Enter`):** There is no public SDK API to steer a running prompt in place. This extension cancels the current run and sends a priority follow-up on the same conversation.
 
-この拡張機能はCursor公式製品ではなく、Cursor SDKの公開ベータAPIに依存します。
+## Links
 
-> **割り込みについて:** 現在のCursor SDKには実行中プロンプトを直接ステアする公開APIがないため、この拡張機能では現在のRunをキャンセルし、同じ会話の優先フォローアップとして送信します。
+- [Source code](https://github.com/ark4ez/cursor-agent-vscode-extension)
+- [Issues](https://github.com/ark4ez/cursor-agent-vscode-extension/issues)
+- [Changelog](https://github.com/ark4ez/cursor-agent-vscode-extension/blob/master/CHANGELOG.md)
+- [License (MIT)](https://github.com/ark4ez/cursor-agent-vscode-extension/blob/master/LICENSE)
+
+---
+
+## 日本語
+
+Anysphere / Cursor 非提携の**非公式**拡張機能です。公式 TypeScript SDK（公開ベータ）を使い、VS Code のサイドバーから Cursor Agent を実行します。
+
+### できること
+
+- ワークスペース対象のローカル Cursor Agent
+- 連続チャットとストリーミング Markdown
+- モデル選択（検索、Thinking / Context / Effort、既定は Auto）
+- 実行プロファイル: Agent / Plan / Multitask
+- 画像コンテキスト、Skills、`.cursor/mcp.json` の MCP
+- `@` ファイル参照、D&D / 貼り付け、選択範囲の添付
+- 会話履歴の復元、コミットメッセージ生成
+- VS Code の表示言語に連動した日英 UI
+
+### 必要なもの
+
+- VS Code 1.100 以降
+- Node.js 22.13 以降
+- [Cursor Dashboard](https://cursor.com/dashboard) のユーザー API キー
+
+課金・利用枠はご自身の Cursor プランに従います。Cursor アプリのログインは使いません。
+
+### 使い方
+
+1. Marketplace からインストール
+2. Activity Bar の **Cursor** を開く
+3. **Cursor: APIキーを設定** でキーを入力（SecretStorage に保存）

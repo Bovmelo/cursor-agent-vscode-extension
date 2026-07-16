@@ -1,6 +1,6 @@
 {
   "extension.displayName": "Cursor Subscription for VS Code",
-  "extension.description": "Use Cursor agents from VS Code with your Cursor plan.",
+  "extension.description": "Unofficial: run Cursor agents in VS Code with your Cursor plan and API key. Not affiliated with Anysphere.",
   "command.openChat": "Cursor: Open Chat",
   "command.setApiKey": "Cursor: Set API Key",
   "command.clearApiKey": "Cursor: Clear API Key",

@@ -1,6 +1,6 @@
 {
   "extension.displayName": "VS Code用Cursorサブスクリプション",
-  "extension.description": "Cursorプランを利用してVS CodeからCursor Agentを実行します。",
+  "extension.description": "非公式: CursorのAPIキーとプランで、VS CodeからCursor Agentを実行します。Anysphere非提携です。",
   "command.openChat": "Cursor: チャットを開く",
   "command.setApiKey": "Cursor: APIキーを設定",
   "command.clearApiKey": "Cursor: APIキーを削除",

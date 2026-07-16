@@ -2,16 +2,36 @@
   "name": "cursor-subscription-for-vscode",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.1.6",
-  "publisher": "local",
+  "version": "0.1.7",
+  "publisher": "ark4ez",
   "license": "MIT",
   "type": "module",
+  "icon": "media/icon.png",
+  "galleryBanner": {
+    "color": "#1e1e1e",
+    "theme": "dark"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ark4ez/cursor-agent-vscode-extension.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ark4ez/cursor-agent-vscode-extension/issues"
+  },
+  "homepage": "https://github.com/ark4ez/cursor-agent-vscode-extension#readme",
   "engines": {
     "vscode": "^1.100.0"
   },
   "categories": [
     "Other",
     "Machine Learning"
+  ],
+  "keywords": [
+    "cursor",
+    "agent",
+    "ai",
+    "chat",
+    "sdk"
   ],
   "extensionDependencies": [
     "vscode.git"
@@ -30,7 +50,8 @@
     "validate:webview": "node scripts/validate-webview.mjs",
     "validate": "npm run compile && npm run validate:webview",
     "vscode:prepublish": "npm run validate",
-    "package": "vsce package"
+    "package": "vsce package",
+    "publish": "vsce publish"
   },
   "contributes": {
     "commands": [
@@ -113,7 +134,7 @@
         {
           "id": "cursorSubscription",
           "title": "Cursor",
-          "icon": "media/cursor.svg"
+          "icon": "media/activity.svg"
         }
       ]
     },

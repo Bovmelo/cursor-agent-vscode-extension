@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <!-- Outline hexagon with a diagonal slash — monochrome for VS Code activity bar -->
+  <path
+    stroke="currentColor"
+    stroke-width="1.75"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    d="M12 3.25 18.75 7.2v9.6L12 20.75 5.25 16.8V7.2L12 3.25Z"
+  />
+  <path
+    stroke="currentColor"
+    stroke-width="2"
+    stroke-linecap="round"
+    d="M7.2 16.4 16.8 7.6"
+  />
+</svg>

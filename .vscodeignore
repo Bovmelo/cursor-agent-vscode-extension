@@ -1,6 +1,14 @@
 .git/**
+.github/**
 .vscode/**
 src/**
 scripts/**
 tsconfig.json
+**/*.ts
+**/*.map
 *.log
+*.vsix
+.gitignore
+.gitattributes
+node_modules/@types/**
+node_modules/typescript/**
