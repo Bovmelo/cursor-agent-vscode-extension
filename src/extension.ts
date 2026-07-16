@@ -4021,6 +4021,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     let selectedSkills = [];
     let availableMcpServers = [];
     let queuedMessages = [];
+    let followOutput = true;
 
     function profileLabel(profile) {
       return {
@@ -4507,6 +4508,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       assistantNode = undefined;
       assistantRaw = "";
       activeProgress = undefined;
+      followOutput = true;
+      scroller.scrollTop = 0;
     }
 
     function showHome(convs) {
@@ -4928,7 +4931,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       });
     }
 
-    function scrollToBottom() {
+    function isNearBottom() {
+      return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= 48;
+    }
+
+    function scrollToBottom(force = false) {
+      if (!force && !followOutput) return;
+      followOutput = true;
       scroller.scrollTop = scroller.scrollHeight;
     }
 
@@ -5466,6 +5475,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
     document.addEventListener("pointerdown", primeRunningSound, { once: true });
     document.addEventListener("keydown", primeRunningSound, { once: true });
+    scroller.addEventListener("scroll", () => {
+      followOutput = isNearBottom();
+    }, { passive: true });
 
     function submitMessage(action = "send") {
       const consumed = consumeLeadingSlashCommand(prompt.value.trim());
@@ -5493,6 +5505,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }
 
       showChat();
+      followOutput = true;
       addUserMessage(text, files);
       assistantRaw = "";
       assistantNode = addAssistantMessage("");
