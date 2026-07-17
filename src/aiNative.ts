@@ -1,5 +1,5 @@
 import { exec as execCallback, execFile as execFileCallback } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -41,17 +41,45 @@ export interface ChangeSessionSnapshot {
   finishedAt?: number;
   phase: ChangeSessionPhase;
   baselineClean: boolean;
+  checkpointReady?: boolean;
+  headOid?: string;
   files: string[];
+  fileDecisions?: Record<string, "pending" | "kept" | "restored">;
+  baselineFiles?: Record<string, BaselineFileSnapshot>;
+  proposedFiles?: Record<string, ProposedFileSnapshot>;
+  nonRestorableFiles?: string[];
   verification?: VerificationResult;
+}
+
+interface BaselineFileSnapshot {
+  relative: string;
+  worktreeExisted: boolean;
+  backupName?: string;
+  indexMode?: string;
+  indexOid?: string;
+  trackedInHead: boolean;
+}
+
+interface ProposedFileSnapshot {
+  worktreeExisted: boolean;
+  worktreeHash?: string;
+  indexMode?: string;
+  indexOid?: string;
 }
 
 interface SessionNode {
   kind: "session" | "phase" | "file" | "verification" | "action";
   label: string;
   description?: string;
+  sessionId?: string;
   file?: string;
+  contextValue?: string;
   command?: vscode.Command;
 }
+
+const SESSION_HISTORY_KEY = "cursorSubscription.changeSessionHistory";
+const LAST_SESSION_KEY = "cursorSubscription.lastChangeSession";
+const MAX_SESSION_HISTORY = 20;
 
 function compactOutput(value: string): string {
   const trimmed = value.trim();
@@ -63,6 +91,16 @@ function compactOutput(value: string): string {
 function isInside(root: string, candidate: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function baselineKey(relative: string): string {
+  const normalized = relative.replaceAll("\\", "/");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function fileIdentity(file: string): string {
+  const absolute = path.resolve(file);
+  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
 }
 
 async function gitStatusIsClean(root: string): Promise<boolean> {
@@ -78,9 +116,56 @@ async function gitStatusIsClean(root: string): Promise<boolean> {
   }
 }
 
+async function isTrackedInHead(root: string, relative: string): Promise<boolean> {
+  try {
+    await execFileAsync(
+      "git",
+      ["cat-file", "-e", `HEAD:${relative}`],
+      { cwd: root, windowsHide: true },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readIndexEntry(
+  root: string,
+  relative: string,
+): Promise<{ mode: string; oid: string } | undefined> {
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["ls-files", "--stage", "--", relative],
+      { cwd: root, windowsHide: true, maxBuffer: 1024 * 1024 },
+    );
+    const match = stdout.match(/^(\d+)\s+([0-9a-f]+)\s+\d+\t/);
+    return match ? { mode: match[1], oid: match[2] } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readWorktreeState(file: string): Promise<{
+  existed: boolean;
+  bytes?: Uint8Array;
+  hash?: string;
+}> {
+  try {
+    const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(file));
+    return {
+      existed: true,
+      bytes,
+      hash: createHash("sha256").update(bytes).digest("hex"),
+    };
+  } catch {
+    return { existed: false };
+  }
+}
+
 export class ChangeSessionController implements vscode.TreeDataProvider<SessionNode>, vscode.Disposable {
   private readonly changedEmitter = new vscode.EventEmitter<SessionNode | undefined>();
-  private current: ChangeSessionSnapshot | undefined;
+  private readonly sessions: ChangeSessionSnapshot[];
 
   public readonly onDidChangeTreeData = this.changedEmitter.event;
 
@@ -88,12 +173,27 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     private readonly state: vscode.Memento,
     private readonly output: vscode.OutputChannel,
     private readonly japanese: boolean,
+    private readonly storageRoot: vscode.Uri,
+    private readonly enabled: () => boolean = () => true,
   ) {
-    this.current = state.get<ChangeSessionSnapshot>("cursorSubscription.lastChangeSession");
+    const history = state.get<ChangeSessionSnapshot[]>(SESSION_HISTORY_KEY);
+    const legacy = state.get<ChangeSessionSnapshot>(LAST_SESSION_KEY);
+    this.sessions = history?.length ? history : legacy ? [legacy] : [];
+    const removed = this.sessions.splice(MAX_SESSION_HISTORY);
+    for (const session of removed) {
+      void this.deleteCheckpoint(session.id);
+    }
+    if (removed.length > 0) {
+      void this.persist();
+    }
   }
 
   public snapshot(): ChangeSessionSnapshot | undefined {
-    return this.current;
+    return this.sessions[0];
+  }
+
+  public history(): readonly ChangeSessionSnapshot[] {
+    return this.sessions;
   }
 
   public async begin(goal: string, root: string): Promise<ChangeSessionSnapshot> {
@@ -106,91 +206,353 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       startedAt: Date.now(),
       phase: "observe",
       baselineClean: await gitStatusIsClean(root),
+      checkpointReady: false,
       files: [],
+      fileDecisions: {},
+      baselineFiles: {},
     };
-    this.current = snapshot;
+    snapshot.checkpointReady = await this.captureCheckpoint(snapshot);
+    this.sessions.unshift(snapshot);
+    const removed = this.sessions.splice(MAX_SESSION_HISTORY);
+    for (const session of removed) {
+      await this.deleteCheckpoint(session.id);
+    }
     await this.persist();
     return snapshot;
   }
 
   public setPhase(phase: ChangeSessionPhase): void {
-    if (!this.current) {
+    if (!this.enabled()) {
       return;
     }
-    this.current.phase = phase;
+    const current = this.snapshot();
+    if (!current) {
+      return;
+    }
+    current.phase = phase;
     if (["complete", "failed", "stopped", "reverted"].includes(phase)) {
-      this.current.finishedAt = Date.now();
+      current.finishedAt = Date.now();
     }
     void this.persist();
   }
 
   public noteTool(toolName: string): void {
+    if (!this.enabled()) {
+      return;
+    }
     const lower = toolName.toLowerCase();
     if (/edit|write|apply.?patch/.test(lower)) {
       this.setPhase("edit");
-    } else if (/read|search|grep|find|glob/.test(lower) && this.current?.phase === "observe") {
+    } else if (/read|search|grep|find|glob/.test(lower) && this.snapshot()?.phase === "observe") {
       this.setPhase("plan");
     }
   }
 
   public noteFile(filePath: string): void {
-    if (!this.current || !isInside(this.current.root, filePath)) {
+    if (!this.enabled()) {
+      return;
+    }
+    const current = this.snapshot();
+    if (!current || !isInside(current.root, filePath)) {
       return;
     }
     const absolute = path.resolve(filePath);
-    if (!this.current.files.includes(absolute)) {
-      this.current.files.push(absolute);
+    if (!current.files.some((file) => fileIdentity(file) === fileIdentity(absolute))) {
+      current.files.push(absolute);
       void this.persist();
     }
   }
 
   public setVerification(result: VerificationResult): void {
-    if (!this.current) {
+    if (!this.enabled()) {
       return;
     }
-    this.current.verification = result;
-    this.current.phase = result.success ? "review" : "failed";
+    const current = this.snapshot();
+    if (!current) {
+      return;
+    }
+    current.verification = result;
+    current.phase = result.success ? "review" : "failed";
     void this.persist();
   }
 
-  public canRevert(): boolean {
+  public async markPending(filePaths: readonly string[]): Promise<void> {
+    const current = this.snapshot();
+    if (!current) {
+      return;
+    }
+    current.fileDecisions ??= {};
+    current.proposedFiles ??= {};
+    for (const filePath of filePaths) {
+      const absolute = path.resolve(filePath);
+      if (isInside(current.root, absolute)) {
+        this.noteFile(absolute);
+        const trackedFile = current.files.find(
+          (file) => fileIdentity(file) === fileIdentity(absolute),
+        ) ?? absolute;
+        current.fileDecisions[trackedFile] = "pending";
+        const relative = path.relative(current.root, absolute).replaceAll("\\", "/");
+        const worktree = await readWorktreeState(absolute);
+        const indexEntry = await readIndexEntry(current.root, relative);
+        current.proposedFiles[trackedFile] = {
+          worktreeExisted: worktree.existed,
+          worktreeHash: worktree.hash,
+          indexMode: indexEntry?.mode,
+          indexOid: indexEntry?.oid,
+        };
+      }
+    }
+    current.phase = "review";
+    await this.persist();
+  }
+
+  public async detectChangedFiles(candidateHints: readonly string[] = []): Promise<string[]> {
+    const session = this.snapshot();
+    if (!session) {
+      return [];
+    }
+    const postRunChanges = await listWorkspaceChanges(session.root);
+    const postRunIdentities = new Set(postRunChanges.map(fileIdentity));
+    const hintIdentities = new Set(candidateHints.map(fileIdentity));
+    const candidates = new Map<string, string>();
+    for (const file of [...postRunChanges, ...candidateHints]) {
+      if (isInside(session.root, file)) {
+        candidates.set(fileIdentity(file), path.resolve(file));
+      }
+    }
+    for (const baseline of Object.values(session.baselineFiles ?? {})) {
+      const file = path.resolve(session.root, baseline.relative);
+      candidates.set(fileIdentity(file), file);
+    }
+
+    const changed: string[] = [];
+    for (const [identity, file] of candidates) {
+      const relative = path.relative(session.root, file).replaceAll("\\", "/");
+      const baseline = session.baselineFiles?.[baselineKey(relative)];
+      if (!baseline) {
+        if (postRunIdentities.has(identity) || hintIdentities.has(identity)) {
+          changed.push(file);
+        }
+        continue;
+      }
+      const worktree = await readWorktreeState(file);
+      const indexEntry = await readIndexEntry(session.root, relative);
+      const baselineBytes = baseline.backupName
+        ? await vscode.workspace.fs.readFile(
+            vscode.Uri.joinPath(
+              this.storageRoot,
+              "change-sessions",
+              session.id,
+              baseline.backupName,
+            ),
+          )
+        : undefined;
+      const baselineHash = baselineBytes
+        ? createHash("sha256").update(baselineBytes).digest("hex")
+        : undefined;
+      if (
+        worktree.existed !== baseline.worktreeExisted
+        || worktree.hash !== baselineHash
+        || indexEntry?.mode !== baseline.indexMode
+        || indexEntry?.oid !== baseline.indexOid
+      ) {
+        changed.push(file);
+      }
+    }
+    session.files = changed;
+    session.proposedFiles ??= {};
+    session.nonRestorableFiles = [];
+    for (const file of changed) {
+      const relative = path.relative(session.root, file).replaceAll("\\", "/");
+      const worktree = await readWorktreeState(file);
+      const indexEntry = await readIndexEntry(session.root, relative);
+      session.proposedFiles[file] = {
+        worktreeExisted: worktree.existed,
+        worktreeHash: worktree.hash,
+        indexMode: indexEntry?.mode,
+        indexOid: indexEntry?.oid,
+      };
+      if (
+        !session.baselineFiles?.[baselineKey(relative)]
+        && !(await this.isTrackedAtCheckpoint(session, relative))
+        && await this.isIgnored(session.root, relative)
+      ) {
+        session.nonRestorableFiles.push(file);
+      }
+    }
+    await this.persist();
+    return changed;
+  }
+
+  public pendingFiles(sessionId = this.snapshot()?.id): string[] {
+    const session = this.session(sessionId);
+    if (!session) {
+      return [];
+    }
+    return session.files.filter((file) => session.fileDecisions?.[file] === "pending");
+  }
+
+  public keptFiles(sessionId = this.snapshot()?.id): string[] {
+    const session = this.session(sessionId);
+    if (!session) {
+      return [];
+    }
+    return session.files.filter((file) => session.fileDecisions?.[file] !== "restored");
+  }
+
+  public async baselineContent(sessionId: string, file: string): Promise<string> {
+    const session = this.session(sessionId);
+    if (!session || !isInside(session.root, file)) {
+      return "";
+    }
+    const relative = path.relative(session.root, file).replaceAll("\\", "/");
+    const baseline = session.baselineFiles?.[baselineKey(relative)];
+    if (baseline) {
+      if (!baseline.worktreeExisted || !baseline.backupName) {
+        return "";
+      }
+      const bytes = await vscode.workspace.fs.readFile(
+        vscode.Uri.joinPath(this.storageRoot, "change-sessions", session.id, baseline.backupName),
+      );
+      return new TextDecoder().decode(bytes);
+    }
+    try {
+      const { stdout } = await execFileAsync(
+        "git",
+        ["show", `${session.headOid ?? "HEAD"}:${relative}`],
+        { cwd: session.root, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
+      );
+      return stdout;
+    } catch {
+      return "";
+    }
+  }
+
+  public keep(file: string, sessionId = this.snapshot()?.id): void {
+    const session = this.session(sessionId);
+    if (!session || session.fileDecisions?.[file] !== "pending") {
+      return;
+    }
+    session.fileDecisions ??= {};
+    session.fileDecisions[file] = "kept";
+    void this.persist();
+  }
+
+  public keepAll(sessionId = this.snapshot()?.id): void {
+    const session = this.session(sessionId);
+    if (!session) {
+      return;
+    }
+    session.fileDecisions ??= {};
+    for (const file of session.files) {
+      if (session.fileDecisions[file] === "pending") {
+        session.fileDecisions[file] = "kept";
+      }
+    }
+    void this.persist();
+  }
+
+  public canRevert(sessionId = this.snapshot()?.id): boolean {
+    if (!this.enabled()) {
+      return false;
+    }
+    const session = this.session(sessionId);
     return Boolean(
-      this.current?.baselineClean
-      && this.current.files.length > 0
-      && this.current.phase !== "reverted",
+      session
+      && session.id === this.snapshot()?.id
+      && (session.checkpointReady ?? session.baselineClean)
+      && session.files.length > 0
+      && (session.nonRestorableFiles?.length ?? 0) === 0
+      && session.phase !== "reverted",
     );
   }
 
-  public async revert(): Promise<{ restored: string[]; removed: string[] }> {
-    const session = this.current;
-    if (!session?.baselineClean) {
-      throw new Error(this.japanese
-        ? "開始時の作業ツリーがクリーンではないため、このセッションは安全に戻せません。"
-        : "This session cannot be safely reverted because the working tree was not clean when it started.");
-    }
+  public canRestoreFile(file: string, sessionId = this.snapshot()?.id): boolean {
+    const session = this.session(sessionId);
+    return Boolean(
+      session
+      && (session.checkpointReady ?? session.baselineClean)
+      && !session.nonRestorableFiles?.some(
+        (candidate) => fileIdentity(candidate) === fileIdentity(file),
+      ),
+    );
+  }
 
+  public canRestorePending(sessionId = this.snapshot()?.id): boolean {
+    return this.pendingFiles(sessionId).every((file) => this.canRestoreFile(file, sessionId));
+  }
+
+  public async restoreFile(
+    file: string,
+    sessionId = this.snapshot()?.id,
+  ): Promise<{ restored: string[]; removed: string[] }> {
+    const session = this.session(sessionId);
+    if (!session || !session.files.includes(file)) {
+      return { restored: [], removed: [] };
+    }
+    if (session.fileDecisions?.[file] !== "pending") {
+      return { restored: [], removed: [] };
+    }
+    if (!(session.checkpointReady ?? session.baselineClean)) {
+      throw new Error(this.japanese
+        ? "このセッションには安全に復元できるチェックポイントがありません。"
+        : "This session does not have a safe checkpoint to restore.");
+    }
+    const result = await this.restoreFiles(session, [file]);
+    return result;
+  }
+
+  public async restorePending(
+    sessionId = this.snapshot()?.id,
+  ): Promise<{ restored: string[]; removed: string[] }> {
+    const session = this.session(sessionId);
+    if (!session) {
+      return { restored: [], removed: [] };
+    }
+    if (!(session.checkpointReady ?? session.baselineClean)) {
+      throw new Error(this.japanese
+        ? "このセッションには安全に復元できるチェックポイントがありません。"
+        : "This session does not have a safe checkpoint to restore.");
+    }
+    const files = this.pendingFiles(session.id);
+    return this.restoreFiles(session, files);
+  }
+
+  public async revert(sessionId = this.snapshot()?.id): Promise<{ restored: string[]; removed: string[] }> {
+    const session = this.session(sessionId);
+    if (!session || !(session.checkpointReady ?? session.baselineClean)) {
+      throw new Error(this.japanese
+        ? "このセッションには安全に復元できるチェックポイントがありません。"
+        : "This session does not have a safe checkpoint to restore.");
+    }
+    const result = await this.restoreFiles(session, session.files);
+    session.phase = "reverted";
+    session.finishedAt = Date.now();
+    await this.persist();
+    return result;
+  }
+
+  private async restoreFiles(
+    session: ChangeSessionSnapshot,
+    files: readonly string[],
+  ): Promise<{ restored: string[]; removed: string[] }> {
+    await this.assertCanRestore(session, files);
     const restored: string[] = [];
     const removed: string[] = [];
-    for (const file of session.files) {
+    for (const file of files) {
       if (!isInside(session.root, file)) {
         continue;
       }
       const relative = path.relative(session.root, file).replaceAll("\\", "/");
-      let trackedInHead = true;
-      try {
-        await execFileAsync(
-          "git",
-          ["cat-file", "-e", `HEAD:${relative}`],
-          { cwd: session.root, windowsHide: true },
-        );
-      } catch {
-        trackedInHead = false;
-      }
+      const baseline = session.baselineFiles?.[baselineKey(relative)];
 
-      if (trackedInHead) {
+      if (baseline) {
+        await this.restoreBaselineFile(session, file, baseline);
+        (baseline.worktreeExisted ? restored : removed).push(file);
+      } else if (await this.isTrackedAtCheckpoint(session, relative)) {
         await execFileAsync(
           "git",
-          ["restore", "--source=HEAD", "--staged", "--worktree", "--", relative],
+          ["restore", `--source=${session.headOid ?? "HEAD"}`, "--staged", "--worktree", "--", relative],
           { cwd: session.root, windowsHide: true },
         );
         restored.push(file);
@@ -200,17 +562,13 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
           ["rm", "--cached", "--ignore-unmatch", "--", relative],
           { cwd: session.root, windowsHide: true },
         );
-        try {
-          await vscode.workspace.fs.delete(vscode.Uri.file(file), { useTrash: true });
-          removed.push(file);
-        } catch (error) {
-          this.output.appendLine(
-            `[${new Date().toISOString()}] Could not remove session-created file ${file}: ${String(error)}`,
-          );
-        }
+        await this.deleteWorktreeFile(file);
+        removed.push(file);
       }
+      session.fileDecisions ??= {};
+      session.fileDecisions[file] = "restored";
+      await this.persist();
     }
-    this.setPhase("reverted");
     return { restored, removed };
   }
 
@@ -218,31 +576,41 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     this.changedEmitter.dispose();
   }
 
+  public refresh(): void {
+    this.changedEmitter.fire(undefined);
+  }
+
   public getTreeItem(element: SessionNode): vscode.TreeItem {
     const collapsibleState = element.kind === "session"
-      ? vscode.TreeItemCollapsibleState.Expanded
+      ? element.sessionId === this.snapshot()?.id
+        ? vscode.TreeItemCollapsibleState.Expanded
+        : vscode.TreeItemCollapsibleState.Collapsed
       : vscode.TreeItemCollapsibleState.None;
     const item = new vscode.TreeItem(element.label, collapsibleState);
     item.description = element.description;
     item.command = element.command;
-    item.contextValue = `cursorAiSession.${element.kind}`;
+    item.contextValue = element.contextValue ?? `cursorAiSession.${element.kind}`;
     item.iconPath = this.iconFor(element);
     return item;
   }
 
   public getChildren(element?: SessionNode): SessionNode[] {
-    const session = this.current;
-    if (!session) {
+    if (!this.enabled()) {
       return [];
     }
     if (!element) {
-      return [{
+      return this.sessions.map((session) => ({
         kind: "session",
         label: session.goal,
-        description: new Date(session.startedAt).toLocaleTimeString(),
-      }];
+        description: new Date(session.startedAt).toLocaleString(),
+        sessionId: session.id,
+      }));
     }
     if (element.kind !== "session") {
+      return [];
+    }
+    const session = this.session(element.sessionId);
+    if (!session) {
       return [];
     }
 
@@ -255,9 +623,11 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       {
         kind: "phase",
         label: this.japanese ? "チェックポイント" : "Checkpoint",
-        description: session.baselineClean
-          ? (this.japanese ? "復元可能" : "revertible")
-          : (this.japanese ? "開始時に未コミット変更あり" : "baseline was dirty"),
+        description: (session.checkpointReady ?? session.baselineClean)
+          ? session.baselineClean
+            ? (this.japanese ? "復元可能" : "revertible")
+            : (this.japanese ? "未コミット変更を保存済み" : "dirty baseline saved")
+          : (this.japanese ? "復元不可" : "unavailable"),
       },
     ];
     if (session.verification) {
@@ -275,22 +645,57 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       nodes.push({
         kind: "file",
         label: path.basename(file),
-        description: vscode.workspace.asRelativePath(file),
+        description: [
+          vscode.workspace.asRelativePath(file),
+          this.fileDecisionLabel(session.fileDecisions?.[file]),
+        ].filter(Boolean).join(" · "),
+        sessionId: session.id,
         file,
+        contextValue: session.fileDecisions?.[file] === "pending"
+          ? this.canRestoreFile(file, session.id)
+            ? "cursorAiSession.file.pending"
+            : "cursorAiSession.file.pendingKeepOnly"
+          : "cursorAiSession.file",
         command: {
           command: "cursorSubscription.openSessionFile",
           title: this.japanese ? "差分を開く" : "Open diff",
-          arguments: [file],
+          arguments: [session.id, file],
         },
       });
     }
-    if (this.canRevert()) {
+    if (this.pendingFiles(session.id).length > 0) {
+      nodes.push({
+        kind: "action",
+        label: this.japanese ? "すべて保持" : "Keep all",
+        sessionId: session.id,
+        command: {
+          command: "cursorSubscription.keepAllSessionEdits",
+          title: this.japanese ? "すべて保持" : "Keep all",
+          arguments: [session.id],
+        },
+      });
+      if (this.canRestorePending(session.id)) {
+        nodes.push({
+          kind: "action",
+          label: this.japanese ? "すべて復元" : "Restore all",
+          sessionId: session.id,
+          command: {
+            command: "cursorSubscription.restoreAllSessionEdits",
+            title: this.japanese ? "すべて復元" : "Restore all",
+            arguments: [session.id],
+          },
+        });
+      }
+    }
+    if (this.canRevert(session.id)) {
       nodes.push({
         kind: "action",
         label: this.japanese ? "このセッションを元に戻す" : "Revert this session",
+        sessionId: session.id,
         command: {
           command: "cursorSubscription.revertLastSession",
           title: this.japanese ? "元に戻す" : "Revert",
+          arguments: [session.id],
         },
       });
     }
@@ -304,7 +709,7 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       case "file":
         return new vscode.ThemeIcon("diff");
       case "verification":
-        return new vscode.ThemeIcon(this.current?.verification?.success ? "pass" : "error");
+        return new vscode.ThemeIcon("beaker");
       case "action":
         return new vscode.ThemeIcon("discard");
       default:
@@ -328,21 +733,219 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
   }
 
   private async persist(): Promise<void> {
-    await this.state.update("cursorSubscription.lastChangeSession", this.current);
+    await Promise.all([
+      this.state.update(SESSION_HISTORY_KEY, this.sessions),
+      this.state.update(LAST_SESSION_KEY, this.snapshot()),
+    ]);
     this.changedEmitter.fire(undefined);
+  }
+
+  private session(sessionId: string | undefined): ChangeSessionSnapshot | undefined {
+    return sessionId ? this.sessions.find((session) => session.id === sessionId) : undefined;
+  }
+
+  private fileDecisionLabel(
+    decision: "pending" | "kept" | "restored" | undefined,
+  ): string | undefined {
+    if (!decision) {
+      return undefined;
+    }
+    const labels = {
+      pending: ["pending review", "確認待ち"],
+      kept: ["kept", "保持"],
+      restored: ["restored", "復元"],
+    } as const;
+    return labels[decision][this.japanese ? 1 : 0];
+  }
+
+  private async captureCheckpoint(session: ChangeSessionSnapshot): Promise<boolean> {
+    try {
+      const { stdout: headOid } = await execFileAsync(
+        "git",
+        ["rev-parse", "HEAD"],
+        { cwd: session.root, windowsHide: true },
+      );
+      session.headOid = headOid.trim();
+      const { stdout: unmerged } = await execFileAsync(
+        "git",
+        ["ls-files", "--unmerged"],
+        { cwd: session.root, windowsHide: true, maxBuffer: 1024 * 1024 },
+      );
+      if (unmerged.trim()) {
+        throw new Error("Cannot checkpoint an unmerged Git index.");
+      }
+      const changedFiles = await listWorkspaceChanges(session.root);
+      const checkpointFolder = vscode.Uri.joinPath(this.storageRoot, "change-sessions", session.id);
+      await vscode.workspace.fs.createDirectory(checkpointFolder);
+      for (const file of changedFiles) {
+        if (!isInside(session.root, file)) {
+          continue;
+        }
+        const relative = path.relative(session.root, file).replaceAll("\\", "/");
+        const indexEntry = await readIndexEntry(session.root, relative);
+        const baseline: BaselineFileSnapshot = {
+          relative,
+          worktreeExisted: false,
+          indexMode: indexEntry?.mode,
+          indexOid: indexEntry?.oid,
+          trackedInHead: await isTrackedInHead(session.root, relative),
+        };
+        const worktree = await readWorktreeState(file);
+        if (worktree.existed && worktree.bytes) {
+          baseline.worktreeExisted = true;
+          baseline.backupName = `${randomUUID()}.bin`;
+          await vscode.workspace.fs.writeFile(
+            vscode.Uri.joinPath(checkpointFolder, baseline.backupName),
+            worktree.bytes,
+          );
+        }
+        session.baselineFiles![baselineKey(relative)] = baseline;
+      }
+      return true;
+    } catch (error) {
+      this.output.appendLine(
+        `[${new Date().toISOString()}] Could not create change-session checkpoint: ${String(error)}`,
+      );
+      return false;
+    }
+  }
+
+  private async restoreBaselineFile(
+    session: ChangeSessionSnapshot,
+    file: string,
+    baseline: BaselineFileSnapshot,
+  ): Promise<void> {
+    const uri = vscode.Uri.file(file);
+    if (baseline.worktreeExisted && baseline.backupName) {
+      const bytes = await vscode.workspace.fs.readFile(
+        vscode.Uri.joinPath(this.storageRoot, "change-sessions", session.id, baseline.backupName),
+      );
+      await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(file)));
+      await vscode.workspace.fs.writeFile(uri, bytes);
+    } else {
+      await this.deleteWorktreeFile(file);
+    }
+
+    if (baseline.indexMode && baseline.indexOid) {
+      await execFileAsync(
+        "git",
+        ["update-index", "--add", "--cacheinfo", `${baseline.indexMode},${baseline.indexOid},${baseline.relative}`],
+        { cwd: session.root, windowsHide: true },
+      );
+    } else {
+      await execFileAsync(
+        "git",
+        ["rm", "--cached", "--ignore-unmatch", "--", baseline.relative],
+        { cwd: session.root, windowsHide: true },
+      );
+    }
+  }
+
+  private async deleteCheckpoint(sessionId: string): Promise<void> {
+    try {
+      await vscode.workspace.fs.delete(
+        vscode.Uri.joinPath(this.storageRoot, "change-sessions", sessionId),
+        { recursive: true },
+      );
+    } catch {
+      // Older sessions may not have checkpoint files.
+    }
+  }
+
+  private async assertCanRestore(
+    session: ChangeSessionSnapshot,
+    files: readonly string[],
+  ): Promise<void> {
+    for (const file of files) {
+      const proposed = session.proposedFiles?.[file];
+      if (proposed) {
+        const current = await readWorktreeState(file);
+        const relative = path.relative(session.root, file).replaceAll("\\", "/");
+        const indexEntry = await readIndexEntry(session.root, relative);
+        if (
+          current.existed !== proposed.worktreeExisted
+          || current.hash !== proposed.worktreeHash
+          || indexEntry?.mode !== proposed.indexMode
+          || indexEntry?.oid !== proposed.indexOid
+        ) {
+          throw new Error(this.japanese
+            ? `${vscode.workspace.asRelativePath(file)} はAI編集後に変更されたため、自動復元を中止しました。`
+            : `${vscode.workspace.asRelativePath(file)} changed after the AI edit, so automatic restore was cancelled.`);
+        }
+      }
+
+      const relative = path.relative(session.root, file).replaceAll("\\", "/");
+      const baseline = session.baselineFiles?.[baselineKey(relative)];
+      if (!baseline && !(await this.isTrackedAtCheckpoint(session, relative))) {
+        if (await this.isIgnored(session.root, relative)) {
+          throw new Error(this.japanese
+            ? `${vscode.workspace.asRelativePath(file)} は開始時の状態を確認できない除外ファイルのため、自動復元できません。`
+            : `${vscode.workspace.asRelativePath(file)} is ignored and has no known starting state, so it cannot be restored automatically.`);
+        }
+      }
+    }
+  }
+
+  private async isTrackedAtCheckpoint(
+    session: ChangeSessionSnapshot,
+    relative: string,
+  ): Promise<boolean> {
+    try {
+      await execFileAsync(
+        "git",
+        ["cat-file", "-e", `${session.headOid ?? "HEAD"}:${relative}`],
+        { cwd: session.root, windowsHide: true },
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async isIgnored(root: string, relative: string): Promise<boolean> {
+    try {
+      await execFileAsync(
+        "git",
+        ["check-ignore", "-q", "--", relative],
+        { cwd: root, windowsHide: true },
+      );
+      return true;
+    } catch (error) {
+      if ((error as { code?: number }).code === 1) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  private async deleteWorktreeFile(file: string): Promise<void> {
+    try {
+      await vscode.workspace.fs.delete(vscode.Uri.file(file), { useTrash: true });
+    } catch (error) {
+      if (error instanceof vscode.FileSystemError && error.code === "FileNotFound") {
+        return;
+      }
+      throw error;
+    }
   }
 }
 
 export class CursorAiCodeActionProvider implements vscode.CodeActionProvider {
   public static readonly providedCodeActionKinds = [vscode.CodeActionKind.QuickFix];
 
-  public constructor(private readonly japanese: boolean) {}
+  public constructor(
+    private readonly japanese: boolean,
+    private readonly enabled: () => boolean = () => true,
+  ) {}
 
   public provideCodeActions(
     document: vscode.TextDocument,
     range: vscode.Range,
     context: vscode.CodeActionContext,
   ): vscode.CodeAction[] {
+    if (!this.enabled()) {
+      return [];
+    }
     const diagnostics = context.diagnostics.filter(
       (diagnostic) => diagnostic.range.intersection(range) !== undefined,
     );

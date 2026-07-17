@@ -64,6 +64,11 @@
         "title": "%command.openChat%"
       },
       {
+        "command": "cursorSubscription.openSettings",
+        "title": "%command.openSettings%",
+        "icon": "$(settings-gear)"
+      },
+      {
         "command": "cursorSubscription.setApiKey",
         "title": "%command.setApiKey%"
       },
@@ -119,6 +124,24 @@
       {
         "command": "cursorSubscription.revertLastSession",
         "title": "%command.revertLastSession%"
+      },
+      {
+        "command": "cursorSubscription.keepSessionEdit",
+        "title": "%command.keepSessionEdit%",
+        "icon": "$(check)"
+      },
+      {
+        "command": "cursorSubscription.restoreSessionEdit",
+        "title": "%command.restoreSessionEdit%",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "cursorSubscription.keepAllSessionEdits",
+        "title": "%command.keepAllSessionEdits%"
+      },
+      {
+        "command": "cursorSubscription.restoreAllSessionEdits",
+        "title": "%command.restoreAllSessionEdits%"
       }
     ],
     "menus": {
@@ -164,6 +187,18 @@
           "when": "resourceScheme == file",
           "group": "cursor@4"
         }
+      ],
+      "view/item/context": [
+        {
+          "command": "cursorSubscription.keepSessionEdit",
+          "when": "view == cursorSubscription.changeSessions && (viewItem == cursorAiSession.file.pending || viewItem == cursorAiSession.file.pendingKeepOnly)",
+          "group": "inline@1"
+        },
+        {
+          "command": "cursorSubscription.restoreSessionEdit",
+          "when": "view == cursorSubscription.changeSessions && viewItem == cursorAiSession.file.pending",
+          "group": "inline@2"
+        }
       ]
     },
     "viewsContainers": {
@@ -191,6 +226,60 @@
     "configuration": {
       "title": "%extension.displayName%",
       "properties": {
+        "cursorSubscription.enableAiNativeFeatures": {
+          "type": "boolean",
+          "default": true,
+          "order": 1,
+          "description": "%config.enableAiNativeFeatures.description%"
+        },
+        "cursorSubscription.enableAutopilot": {
+          "type": "boolean",
+          "default": true,
+          "order": 2,
+          "description": "%config.enableAutopilot.description%"
+        },
+        "cursorSubscription.enableChangeSessions": {
+          "type": "boolean",
+          "default": true,
+          "order": 3,
+          "description": "%config.enableChangeSessions.description%"
+        },
+        "cursorSubscription.previewGeneratedCode": {
+          "type": "boolean",
+          "default": true,
+          "order": 4,
+          "description": "%config.previewGeneratedCode.description%"
+        },
+        "cursorSubscription.enableDiagnosticQuickFixes": {
+          "type": "boolean",
+          "default": true,
+          "order": 5,
+          "description": "%config.enableDiagnosticQuickFixes.description%"
+        },
+        "cursorSubscription.enableAiReview": {
+          "type": "boolean",
+          "default": true,
+          "order": 6,
+          "description": "%config.enableAiReview.description%"
+        },
+        "cursorSubscription.enableVerification": {
+          "type": "boolean",
+          "default": true,
+          "order": 7,
+          "description": "%config.enableVerification.description%"
+        },
+        "cursorSubscription.enableDebugContext": {
+          "type": "boolean",
+          "default": true,
+          "order": 8,
+          "description": "%config.enableDebugContext.description%"
+        },
+        "cursorSubscription.enableProjectMemory": {
+          "type": "boolean",
+          "default": true,
+          "order": 9,
+          "description": "%config.enableProjectMemory.description%"
+        },
         "cursorSubscription.notifyOnComplete": {
           "type": "boolean",
           "default": true,

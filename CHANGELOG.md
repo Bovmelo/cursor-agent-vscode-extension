@@ -2,7 +2,11 @@
 
 ## Unreleased
 
-- Add Autopilot change sessions with a task-oriented progress view and safe session revert from clean Git baselines
+- Add a master switch and individual settings for every AI-native editor feature, with a settings shortcut in the chat header
+
+- Add Autopilot change sessions with a task-oriented progress view and safe session revert
+- Add post-run Keep/Restore review per Autopilot-edited file and defer verification until decisions are complete
+- Keep the latest 20 AI change sessions and preserve dirty working-tree baselines in private checkpoints
 - Preview generated inline edits in a diff before applying them
 - Add AI Quick Fix actions for editor diagnostics and line-level AI review findings in Problems
 - Automatically detect and run project verification commands after agent edits, with optional bounded self-repair

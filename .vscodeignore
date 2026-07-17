@@ -8,6 +8,7 @@ tsconfig.json
 **/*.map
 *.log
 *.vsix
+memo.txt
 .gitignore
 .gitattributes
 node_modules/@types/**
