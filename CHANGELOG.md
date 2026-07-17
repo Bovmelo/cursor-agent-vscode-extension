@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.12
+
 - Add an AI Supervisor inbox with Observe and Autonomous modes for saved diagnostics and manual goals
 - Run Supervisor tasks in isolated Git worktrees without committing dirty workspace baselines
 - Add per-file and bulk apply/discard with concurrent-edit conflict detection
@@ -16,7 +18,6 @@
 - Add a persistent parallel-agent bar for switching tasks, stopping one agent at a time, and retaining completed parallel tasks until they are opened and left
 - Add a prominent Start parallel agent button with parallel-limit feedback
 - Add a master switch and individual settings for every AI-native editor feature, with a settings shortcut in the chat header
-
 - Add Autopilot change sessions with a task-oriented progress view and safe session revert
 - Add post-run Keep/Restore review per Autopilot-edited file and defer verification until decisions are complete
 - Keep the latest 20 AI change sessions and preserve dirty working-tree baselines in private checkpoints
