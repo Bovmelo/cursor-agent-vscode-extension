@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Add an AI Supervisor inbox with Observe and Autonomous modes for saved diagnostics and manual goals
+- Run Supervisor tasks in isolated Git worktrees without committing dirty workspace baselines
+- Add per-file and bulk apply/discard with concurrent-edit conflict detection
+- Add file, changed-line, time, hourly-run, excluded-path, and safe-auto-apply budgets
+- Stop restoring chat focus when the user has moved to another editor or view
+- Keep Supervisor worktrees on a short path so Cursor SDK SQLite storage opens on Windows, and show failure reasons in the inbox
+- Give AI Supervisor an independent agent runner so normal chat remains available during background work
+- Record a reason for every Supervisor file change and show it in the inbox and diff editor
+- Keep the current Supervisor mode visible in the inbox header, mode row, and status bar
+- Run normal chat agents concurrently across conversations with per-conversation runs, queues, cancellation, and live state
+- Track concurrent AI change sessions by session ID and show running conversations in history
+- Add a persistent parallel-agent bar for switching tasks, stopping one agent at a time, and retaining completed parallel tasks until they are opened and left
+- Add a prominent Start parallel agent button with parallel-limit feedback
 - Add a master switch and individual settings for every AI-native editor feature, with a settings shortcut in the chat header
 
 - Add Autopilot change sessions with a task-oriented progress view and safe session revert

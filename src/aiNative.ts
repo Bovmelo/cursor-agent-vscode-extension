@@ -188,8 +188,8 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     }
   }
 
-  public snapshot(): ChangeSessionSnapshot | undefined {
-    return this.sessions[0];
+  public snapshot(sessionId?: string): ChangeSessionSnapshot | undefined {
+    return sessionId ? this.session(sessionId) : this.sessions[0];
   }
 
   public history(): readonly ChangeSessionSnapshot[] {
@@ -221,11 +221,11 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     return snapshot;
   }
 
-  public setPhase(phase: ChangeSessionPhase): void {
+  public setPhase(phase: ChangeSessionPhase, sessionId?: string): void {
     if (!this.enabled()) {
       return;
     }
-    const current = this.snapshot();
+    const current = this.snapshot(sessionId);
     if (!current) {
       return;
     }
@@ -236,23 +236,26 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     void this.persist();
   }
 
-  public noteTool(toolName: string): void {
+  public noteTool(toolName: string, sessionId?: string): void {
     if (!this.enabled()) {
       return;
     }
     const lower = toolName.toLowerCase();
     if (/edit|write|apply.?patch/.test(lower)) {
-      this.setPhase("edit");
-    } else if (/read|search|grep|find|glob/.test(lower) && this.snapshot()?.phase === "observe") {
-      this.setPhase("plan");
+      this.setPhase("edit", sessionId);
+    } else if (
+      /read|search|grep|find|glob/.test(lower)
+      && this.snapshot(sessionId)?.phase === "observe"
+    ) {
+      this.setPhase("plan", sessionId);
     }
   }
 
-  public noteFile(filePath: string): void {
+  public noteFile(filePath: string, sessionId?: string): void {
     if (!this.enabled()) {
       return;
     }
-    const current = this.snapshot();
+    const current = this.snapshot(sessionId);
     if (!current || !isInside(current.root, filePath)) {
       return;
     }
@@ -263,11 +266,11 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     }
   }
 
-  public setVerification(result: VerificationResult): void {
+  public setVerification(result: VerificationResult, sessionId?: string): void {
     if (!this.enabled()) {
       return;
     }
-    const current = this.snapshot();
+    const current = this.snapshot(sessionId);
     if (!current) {
       return;
     }
@@ -276,8 +279,8 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     void this.persist();
   }
 
-  public async markPending(filePaths: readonly string[]): Promise<void> {
-    const current = this.snapshot();
+  public async markPending(filePaths: readonly string[], sessionId?: string): Promise<void> {
+    const current = this.snapshot(sessionId);
     if (!current) {
       return;
     }
@@ -286,7 +289,7 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     for (const filePath of filePaths) {
       const absolute = path.resolve(filePath);
       if (isInside(current.root, absolute)) {
-        this.noteFile(absolute);
+        this.noteFile(absolute, sessionId);
         const trackedFile = current.files.find(
           (file) => fileIdentity(file) === fileIdentity(absolute),
         ) ?? absolute;
@@ -306,12 +309,17 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     await this.persist();
   }
 
-  public async detectChangedFiles(candidateHints: readonly string[] = []): Promise<string[]> {
-    const session = this.snapshot();
+  public async detectChangedFiles(
+    candidateHints: readonly string[] = [],
+    sessionId?: string,
+    restrictToCandidateHints = false,
+  ): Promise<string[]> {
+    const session = this.snapshot(sessionId);
     if (!session) {
       return [];
     }
-    const postRunChanges = await listWorkspaceChanges(session.root);
+    const restrict = restrictToCandidateHints && candidateHints.length > 0;
+    const postRunChanges = restrict ? [] : await listWorkspaceChanges(session.root);
     const postRunIdentities = new Set(postRunChanges.map(fileIdentity));
     const hintIdentities = new Set(candidateHints.map(fileIdentity));
     const candidates = new Map<string, string>();
@@ -320,9 +328,11 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
         candidates.set(fileIdentity(file), path.resolve(file));
       }
     }
-    for (const baseline of Object.values(session.baselineFiles ?? {})) {
-      const file = path.resolve(session.root, baseline.relative);
-      candidates.set(fileIdentity(file), file);
+    if (!restrict) {
+      for (const baseline of Object.values(session.baselineFiles ?? {})) {
+        const file = path.resolve(session.root, baseline.relative);
+        candidates.set(fileIdentity(file), file);
+      }
     }
 
     const changed: string[] = [];

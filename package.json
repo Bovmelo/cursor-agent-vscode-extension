@@ -39,6 +39,7 @@
   "activationEvents": [
     "onView:cursorSubscription.chatView",
     "onView:cursorSubscription.changeSessions",
+    "onView:cursorSubscription.supervisorTasks",
     "onCommand:cursorSubscription.generateCommitMessage",
     "onCommand:cursorSubscription.generateCode",
     "onCommand:cursorSubscription.explainSelection",
@@ -142,6 +143,54 @@
       {
         "command": "cursorSubscription.restoreAllSessionEdits",
         "title": "%command.restoreAllSessionEdits%"
+      },
+      {
+        "command": "cursorSubscription.chooseSupervisorMode",
+        "title": "%command.chooseSupervisorMode%",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "cursorSubscription.createSupervisorTask",
+        "title": "%command.createSupervisorTask%",
+        "icon": "$(add)"
+      },
+      {
+        "command": "cursorSubscription.scanSupervisorDiagnostics",
+        "title": "%command.scanSupervisorDiagnostics%",
+        "icon": "$(search)"
+      },
+      {
+        "command": "cursorSubscription.runSupervisorTask",
+        "title": "%command.runSupervisorTask%",
+        "icon": "$(play)"
+      },
+      {
+        "command": "cursorSubscription.openSupervisorChange",
+        "title": "%command.openSupervisorChange%"
+      },
+      {
+        "command": "cursorSubscription.applySupervisorChange",
+        "title": "%command.applySupervisorChange%",
+        "icon": "$(check)"
+      },
+      {
+        "command": "cursorSubscription.discardSupervisorChange",
+        "title": "%command.discardSupervisorChange%",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "cursorSubscription.applyAllSupervisorChanges",
+        "title": "%command.applyAllSupervisorChanges%",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "cursorSubscription.discardAllSupervisorChanges",
+        "title": "%command.discardAllSupervisorChanges%"
+      },
+      {
+        "command": "cursorSubscription.dismissSupervisorTask",
+        "title": "%command.dismissSupervisorTask%",
+        "icon": "$(close)"
       }
     ],
     "menus": {
@@ -198,6 +247,53 @@
           "command": "cursorSubscription.restoreSessionEdit",
           "when": "view == cursorSubscription.changeSessions && viewItem == cursorAiSession.file.pending",
           "group": "inline@2"
+        },
+        {
+          "command": "cursorSubscription.runSupervisorTask",
+          "when": "view == cursorSubscription.supervisorTasks && (viewItem == cursorSupervisor.task.detected || viewItem == cursorSupervisor.task.queued || viewItem == cursorSupervisor.task.failed)",
+          "group": "inline@1"
+        },
+        {
+          "command": "cursorSubscription.applyAllSupervisorChanges",
+          "when": "view == cursorSubscription.supervisorTasks && (viewItem == cursorSupervisor.task.review || viewItem == cursorSupervisor.task.blocked)",
+          "group": "inline@1"
+        },
+        {
+          "command": "cursorSubscription.discardAllSupervisorChanges",
+          "when": "view == cursorSubscription.supervisorTasks && (viewItem == cursorSupervisor.task.review || viewItem == cursorSupervisor.task.blocked)",
+          "group": "inline@2"
+        },
+        {
+          "command": "cursorSubscription.dismissSupervisorTask",
+          "when": "view == cursorSubscription.supervisorTasks && (viewItem == cursorSupervisor.task.detected || viewItem == cursorSupervisor.task.queued || viewItem == cursorSupervisor.task.failed || viewItem == cursorSupervisor.task.completed)",
+          "group": "inline@3"
+        },
+        {
+          "command": "cursorSubscription.applySupervisorChange",
+          "when": "view == cursorSubscription.supervisorTasks && viewItem == cursorSupervisor.change.pending",
+          "group": "inline@1"
+        },
+        {
+          "command": "cursorSubscription.discardSupervisorChange",
+          "when": "view == cursorSubscription.supervisorTasks && (viewItem == cursorSupervisor.change.pending || viewItem == cursorSupervisor.change.excluded)",
+          "group": "inline@2"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "cursorSubscription.createSupervisorTask",
+          "when": "view == cursorSubscription.supervisorTasks",
+          "group": "navigation@1"
+        },
+        {
+          "command": "cursorSubscription.scanSupervisorDiagnostics",
+          "when": "view == cursorSubscription.supervisorTasks",
+          "group": "navigation@2"
+        },
+        {
+          "command": "cursorSubscription.chooseSupervisorMode",
+          "when": "view == cursorSubscription.supervisorTasks",
+          "group": "navigation@3"
         }
       ]
     },
@@ -220,6 +316,10 @@
         {
           "id": "cursorSubscription.changeSessions",
           "name": "%view.changeSessions%"
+        },
+        {
+          "id": "cursorSubscription.supervisorTasks",
+          "name": "%view.supervisorTasks%"
         }
       ]
     },
@@ -231,6 +331,93 @@
           "default": true,
           "order": 1,
           "description": "%config.enableAiNativeFeatures.description%"
+        },
+        "cursorSubscription.maxParallelChatAgents": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 8,
+          "order": 2,
+          "description": "%config.maxParallelChatAgents.description%"
+        },
+        "cursorSubscription.enableAiSupervisor": {
+          "type": "boolean",
+          "default": true,
+          "order": 2,
+          "description": "%config.enableAiSupervisor.description%"
+        },
+        "cursorSubscription.supervisorMode": {
+          "type": "string",
+          "enum": [
+            "off",
+            "observe",
+            "autonomous"
+          ],
+          "enumDescriptions": [
+            "%config.supervisorMode.off%",
+            "%config.supervisorMode.observe%",
+            "%config.supervisorMode.autonomous%"
+          ],
+          "default": "observe",
+          "order": 3,
+          "description": "%config.supervisorMode.description%"
+        },
+        "cursorSubscription.supervisorDebounceSeconds": {
+          "type": "integer",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 300,
+          "description": "%config.supervisorDebounceSeconds.description%"
+        },
+        "cursorSubscription.supervisorMaxFiles": {
+          "type": "integer",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "%config.supervisorMaxFiles.description%"
+        },
+        "cursorSubscription.supervisorMaxChangedLines": {
+          "type": "integer",
+          "default": 300,
+          "minimum": 10,
+          "maximum": 10000,
+          "description": "%config.supervisorMaxChangedLines.description%"
+        },
+        "cursorSubscription.supervisorMaxAiRunsPerHour": {
+          "type": "integer",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 100,
+          "description": "%config.supervisorMaxAiRunsPerHour.description%"
+        },
+        "cursorSubscription.supervisorMaxRunMinutes": {
+          "type": "integer",
+          "default": 15,
+          "minimum": 1,
+          "maximum": 240,
+          "description": "%config.supervisorMaxRunMinutes.description%"
+        },
+        "cursorSubscription.supervisorExcludedGlobs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/.env*",
+            "**/*secret*",
+            "**/*credential*",
+            "**/*.pem",
+            "**/*.key",
+            "**/package-lock.json",
+            "**/pnpm-lock.yaml",
+            "**/yarn.lock"
+          ],
+          "description": "%config.supervisorExcludedGlobs.description%"
+        },
+        "cursorSubscription.supervisorAutoApplySafeChanges": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.supervisorAutoApplySafeChanges.description%"
         },
         "cursorSubscription.enableAutopilot": {
           "type": "boolean",
