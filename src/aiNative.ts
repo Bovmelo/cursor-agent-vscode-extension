@@ -116,6 +116,7 @@ interface SessionNode {
   kind: "session" | "phase" | "file" | "verification" | "verificationStep" | "repair" | "repairDetail" | "action";
   label: string;
   description?: string;
+  tooltip?: string;
   sessionId?: string;
   file?: string;
   contextValue?: string;
@@ -694,7 +695,7 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
 
   public getTreeItem(element: SessionNode): vscode.TreeItem {
     const collapsibleState = element.kind === "session"
-      ? element.sessionId === this.snapshot()?.id
+      ? element.sessionId && this.pendingFiles(element.sessionId).length > 0
         ? vscode.TreeItemCollapsibleState.Expanded
         : vscode.TreeItemCollapsibleState.Collapsed
       : element.kind === "verification"
@@ -706,6 +707,7 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       : vscode.TreeItemCollapsibleState.None;
     const item = new vscode.TreeItem(element.label, collapsibleState);
     item.description = element.description;
+    item.tooltip = element.tooltip ?? element.description;
     item.command = element.command;
     item.contextValue = element.contextValue ?? `cursorAiSession.${element.kind}`;
     item.iconPath = this.iconFor(element);
@@ -717,12 +719,18 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       return [];
     }
     if (!element) {
-      return this.sessions.map((session) => ({
-        kind: "session",
-        label: session.goal,
-        description: new Date(session.startedAt).toLocaleString(),
-        sessionId: session.id,
-      }));
+      return this.sessions.map((session) => {
+        const phase = this.phaseLabel(session.phase);
+        const checkpoint = this.checkpointLabel(session);
+        const started = new Date(session.startedAt);
+        return {
+          kind: "session",
+          label: session.goal,
+          description: `${phase} · ${this.compactTime(started)}`,
+          tooltip: [phase, checkpoint, started.toLocaleString()].join("\n"),
+          sessionId: session.id,
+        };
+      });
     }
     if (element.kind === "verification") {
       const session = this.session(element.sessionId);
@@ -753,22 +761,7 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       return [];
     }
 
-    const nodes: SessionNode[] = [
-      {
-        kind: "phase",
-        label: this.japanese ? "進行状況" : "Status",
-        description: this.phaseLabel(session.phase),
-      },
-      {
-        kind: "phase",
-        label: this.japanese ? "チェックポイント" : "Checkpoint",
-        description: (session.checkpointReady ?? session.baselineClean)
-          ? session.baselineClean
-            ? (this.japanese ? "復元可能" : "revertible")
-            : (this.japanese ? "未コミット変更を保存済み" : "dirty baseline saved")
-          : (this.japanese ? "復元不可" : "unavailable"),
-      },
-    ];
+    const nodes: SessionNode[] = [];
     if (session.verification) {
       nodes.push({
         kind: "verification",
@@ -906,6 +899,25 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       reverted: ["Reverted", "復元済み"],
     };
     return labels[phase][this.japanese ? 1 : 0];
+  }
+
+  private checkpointLabel(session: ChangeSessionSnapshot): string {
+    if (!(session.checkpointReady ?? session.baselineClean)) {
+      return this.japanese ? "復元不可" : "unavailable";
+    }
+    if (session.baselineClean) {
+      return this.japanese ? "復元可能" : "revertible";
+    }
+    return this.japanese ? "未コミット変更を保存済み" : "dirty baseline saved";
+  }
+
+  private compactTime(value: Date): string {
+    return value.toLocaleString(undefined, {
+      month: "numeric",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
   }
 
   private repairLabel(status: RepairBudgetSnapshot["status"]): string {

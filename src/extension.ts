@@ -150,6 +150,7 @@ import {
   isSafeRelativePath,
   parseWebviewMessage,
   removeQueuedMessages,
+  requeueUnstartedMessage,
   shouldMigrateToSafeWorktree,
   shouldUseIsolatedWorktree,
   shouldCancelOnInterrupt,
@@ -4520,13 +4521,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         if (!conversation) {
           continue;
         }
-        this.postIfActive(item.conversationId, {
-          type: "queuedStarted",
-          prompt: item.prompt,
-          files: item.files,
-          kind: item.kind,
-        });
-        await this.send(
+        const started = await this.send(
           item.prompt,
           item.attachContext,
           item.files,
@@ -4539,7 +4534,22 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           false,
           item.commandId,
           item.includeProjectMemory !== false,
+          {
+            fromQueue: true,
+            queueKind: item.kind,
+          },
         );
+        if (!started) {
+          // send() rejected before reserving the run (parallel limit race,
+          // missing auth, etc). Put the item back so it is not dropped.
+          this.messageQueue.splice(
+            0,
+            this.messageQueue.length,
+            ...requeueUnstartedMessage(this.messageQueue, item),
+          );
+          this.postQueueState();
+          break;
+        }
       }
     } finally {
       this.drainingConversations.delete(conversationId);
@@ -4559,7 +4569,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     reviewEdits = false,
     commandId?: string,
     includeProjectMemory = true,
-  ): Promise<void> {
+    queue?: { fromQueue: true; queueKind: "queued" | "interrupt" },
+  ): Promise<boolean> {
     const projectCommand = commandId
       ? this.projectCommands.find((command) => command.id === commandId)
       : undefined;
@@ -4567,7 +4578,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       ? expandProjectCommand(projectCommand, prompt)
       : prompt;
     if (!effectivePrompt) {
-      return;
+      return false;
     }
 
     if (!await this.ensureTokenBudgetAllows()) {
@@ -4578,7 +4589,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           "1日のトークン予算を超過したため送信を中止しました。",
         ),
       });
-      return;
+      return false;
     }
 
     await this.ensureWindowsSafeModeMigrated();
@@ -4590,21 +4601,21 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           "エージェントを実行する前に、Windowsのサンドボックス警告を確認してください。",
         ),
       });
-      return;
+      return false;
     }
 
     const apiKey = await this.context.secrets.get(API_KEY_SECRET);
     if (!apiKey) {
       this.post({ type: "authRequired" });
       await this.promptForApiKey();
-      return;
+      return false;
     }
 
     let conversation = targetConversationId
       ? this.conversations.find((candidate) => candidate.id === targetConversationId)
       : this.activeConversation();
     if (!conversation && targetConversationId) {
-      return;
+      return false;
     }
 
     let workspace = conversation
@@ -4618,7 +4629,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           "Cursor Agentを実行するには、先にフォルダーを開いてください。",
         ),
       });
-      return;
+      return false;
     }
 
     if (!conversation) {
@@ -4632,19 +4643,21 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const conversationId = conversation.id;
     const runtime = this.runtimeFor(conversationId);
     if (runtime.busy) {
-      return;
+      return false;
     }
     const maximumParallelAgents = this.alertConfiguration()
       .get<number>("maxParallelChatAgents", 3);
     if (this.activeRunCount() >= Math.max(1, maximumParallelAgents)) {
-      this.postIfActive(conversationId, {
-        type: "error",
-        text: localize(
-          `The parallel chat-agent limit (${maximumParallelAgents}) has been reached. Wait for a run to finish or increase cursorSubscription.maxParallelChatAgents.`,
-          `並列チャットAgentの上限（${maximumParallelAgents}）に達しました。完了を待つか、cursorSubscription.maxParallelChatAgents を増やしてください。`,
-        ),
-      });
-      return;
+      if (!queue?.fromQueue) {
+        this.postIfActive(conversationId, {
+          type: "error",
+          text: localize(
+            `The parallel chat-agent limit (${maximumParallelAgents}) has been reached. Wait for a run to finish or increase cursorSubscription.maxParallelChatAgents.`,
+            `並列チャットAgentの上限（${maximumParallelAgents}）に達しました。完了を待つか、cursorSubscription.maxParallelChatAgents を増やしてください。`,
+          ),
+        });
+      }
+      return false;
     }
     // Reserve this conversation synchronously so a fast double-submit cannot
     // create two root runs for the same agent while attachments are prepared.
@@ -4653,6 +4666,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     runtime.busy = true;
     runtime.pendingCancel = false;
     runtime.mutating = profile !== "plan";
+    if (queue?.fromQueue) {
+      this.postIfActive(conversationId, {
+        type: "queuedStarted",
+        prompt,
+        files: requestedFiles,
+        kind: queue.queueKind,
+      });
+    }
     // Count peers after reserving so two near-simultaneous launches cannot
     // both miss each other and share the live workspace.
     const mutatingRuntimes = [...this.chatRuntimes.entries()]
@@ -4799,7 +4820,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         type: "error",
         text: error instanceof Error ? error.message : String(error),
       });
-      return;
+      // Run was reserved then aborted during prep — drain any waiting messages.
+      setTimeout(() => void this.drainMessageQueue(), 0);
+      return true;
     }
 
     const runningSound = this.runningSound.start();
@@ -5535,6 +5558,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       this.notifyRunComplete(conversation, progressState);
       setTimeout(() => void this.drainMessageQueue(), 0);
     }
+    return true;
   }
 
   private async reviewAutopilotEdits(sessionId?: string): Promise<void> {
@@ -5607,6 +5631,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
     const pending = this.changeSessions.pendingFiles(session.id).length;
     if (pending > 0) {
+      void vscode.commands.executeCommand("cursorSubscription.changeSessions.focus");
       void vscode.window.showInformationMessage(localize(
         `${pending} AI-edited file(s) remain pending. Resolve them in the AI Change Session view before verification.`,
         `${pending}件のAI編集が確認待ちです。検証前にAI変更セッションビューで確定してください。`,

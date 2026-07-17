@@ -19,6 +19,7 @@ import {
   nextSupervisorStatusAfterRun,
   parseWebviewMessage,
   removeQueuedMessages,
+  requeueUnstartedMessage,
   safeResolvePath,
   shouldMigrateToSafeWorktree,
   shouldUseIsolatedWorktree,
@@ -182,6 +183,24 @@ test("cancel / interrupt / queue state transitions", () => {
   const taken = takeNextQueuedMessage(queue, "a");
   assert.equal(taken.next?.id, "2");
   assert.deepEqual(taken.remaining.map((item) => item.id), ["1"]);
+
+  // Failed starts must restore order so drain does not drop the message.
+  let retryQueue = [
+    { id: "b1", conversationId: "b", kind: "queued" },
+    { id: "a2", conversationId: "a", kind: "queued" },
+  ];
+  retryQueue = requeueUnstartedMessage(retryQueue, {
+    id: "a1",
+    conversationId: "a",
+    kind: "queued",
+  });
+  assert.deepEqual(retryQueue.map((item) => item.id), ["b1", "a1", "a2"]);
+  retryQueue = requeueUnstartedMessage(retryQueue, {
+    id: "i",
+    conversationId: "a",
+    kind: "interrupt",
+  });
+  assert.deepEqual(retryQueue.map((item) => item.id), ["i", "b1", "a1", "a2"]);
 
   const cleared = removeQueuedMessages(taken.remaining, (item) => item.conversationId === "a");
   assert.deepEqual(cleared, []);

@@ -163,6 +163,9 @@ export class WebviewController {
           sandboxBannerSafeText: "Windowsではサンドボックスが無効です。安全worktreeで編集を分離しますが、ホストのファイルシステムとネットワークはOSレベルで隔離されません。",
           sandboxBannerDirectText: "Windowsではサンドボックスが無効です。ファイルシステムとネットワークの隔離はなく、エージェントはワークスペースを直接変更できます。",
           sandboxBannerLearnMore: "詳細",
+          sandboxBannerLabel: "サンドボックス警告",
+          expandSandboxBanner: "サンドボックス警告を展開",
+          collapseSandboxBanner: "サンドボックス警告を折りたたむ",
           copyCode: "コードをコピー",
           copyMessage: "メッセージをコピー",
           copied: "コピーしました",
@@ -328,6 +331,9 @@ export class WebviewController {
           sandboxBannerSafeText: "The Windows sandbox is unavailable. Safe worktree mode separates edits, but the host filesystem and network are not OS-isolated.",
           sandboxBannerDirectText: "The Windows sandbox is unavailable. There is no filesystem or network isolation, and the agent can modify your workspace directly.",
           sandboxBannerLearnMore: "Details",
+          sandboxBannerLabel: "Sandbox warning",
+          expandSandboxBanner: "Expand sandbox warning",
+          collapseSandboxBanner: "Collapse sandbox warning",
           copyCode: "Copy code",
           copyMessage: "Copy message",
           copied: "Copied",
@@ -586,24 +592,58 @@ export class WebviewController {
     .sound-option:hover { background: var(--vscode-menu-selectionBackground); }
     .sound-option input { margin: 0; accent-color: var(--vscode-focusBorder); }
 
-    /* ---- Sandbox warning banner ---- */
+    /* ---- Sandbox warning: header chip + expandable panel ---- */
+    #sandboxBannerToggle {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: none;
+      width: 18px;
+      height: 18px;
+      margin: 0 2px 0 0;
+      padding: 0;
+      color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
+      background: var(--vscode-inputValidation-warningBackground, rgba(255, 200, 0, .12));
+      border: 1px solid var(--vscode-inputValidation-warningBorder, rgba(255, 200, 0, .5));
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    #sandboxBannerToggle[hidden] { display: none; }
+    #sandboxBannerToggle:hover {
+      background: color-mix(
+        in srgb,
+        var(--vscode-inputValidation-warningBackground, rgba(255, 200, 0, .12)) 70%,
+        var(--vscode-toolbar-hoverBackground)
+      );
+    }
+    #sandboxBannerToggle:focus-visible {
+      outline: 1px solid var(--vscode-focusBorder);
+      outline-offset: 1px;
+    }
+    #sandboxBannerToggle[aria-expanded="true"] {
+      background: color-mix(
+        in srgb,
+        var(--vscode-inputValidation-warningBackground, rgba(255, 200, 0, .18)) 85%,
+        var(--vscode-toolbar-hoverBackground)
+      );
+    }
+    .sandbox-banner-icon { width: 11px; height: 11px; }
     #sandboxBanner {
       display: flex;
       align-items: flex-start;
       gap: 8px;
       flex: none;
-      margin: 0 10px 6px;
-      padding: 8px 10px;
-      font-size: 11.5px;
-      line-height: 1.45;
+      margin: 0 8px 4px;
+      padding: 5px 8px;
+      font-size: 11px;
+      line-height: 1.4;
       color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
       background: var(--vscode-inputValidation-warningBackground, rgba(255, 200, 0, .12));
       border: 1px solid var(--vscode-inputValidation-warningBorder, rgba(255, 200, 0, .5));
       border-radius: 6px;
     }
     #sandboxBanner[hidden] { display: none; }
-    .sandbox-banner-icon { flex: none; width: 15px; height: 15px; margin-top: 1px; }
-    .sandbox-banner-text { flex: 1; }
+    .sandbox-banner-text { flex: 1; min-width: 0; }
     .sandbox-banner-link {
       flex: none;
       padding: 0;
@@ -2097,6 +2137,12 @@ export class WebviewController {
   <div class="header">
     <span class="brand">Cursor</span>
     <span class="spacer"></span>
+    <button id="sandboxBannerToggle" type="button" hidden aria-expanded="false" aria-controls="sandboxBanner" title="${ui.expandSandboxBanner}" aria-label="${ui.sandboxBannerLabel}">
+      <svg class="sandbox-banner-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M8 1.6 1.8 4.3v3.4c0 3.6 2.5 5.9 6.2 7 3.7-1.1 6.2-3.4 6.2-7V4.3z"/>
+        <path d="M8 5.6v3.1M8 10.7v.05"/>
+      </svg>
+    </button>
     <button id="findInChatButton" class="icon-btn" type="button" title="${ui.findInChat}" aria-label="${ui.findInChat}" hidden>
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="7" cy="7" r="4.2"/>
@@ -2160,10 +2206,6 @@ export class WebviewController {
   </div>
 
   <div id="sandboxBanner" role="alert" hidden>
-    <svg class="sandbox-banner-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <path d="M8 1.6 1.8 4.3v3.4c0 3.6 2.5 5.9 6.2 7 3.7-1.1 6.2-3.4 6.2-7V4.3z"/>
-      <path d="M8 5.6v3.1M8 10.7v.05"/>
-    </svg>
     <span id="sandboxBannerText" class="sandbox-banner-text">${ui.sandboxBannerSafeText}</span>
     <button id="sandboxBannerLearnMore" class="sandbox-banner-link" type="button">${ui.sandboxBannerLearnMore}</button>
   </div>
@@ -2428,6 +2470,7 @@ export class WebviewController {
     const auth = document.getElementById("auth");
     const authChip = document.getElementById("authChip");
     const sandboxBanner = document.getElementById("sandboxBanner");
+    const sandboxBannerToggle = document.getElementById("sandboxBannerToggle");
     const sandboxBannerText = document.getElementById("sandboxBannerText");
     const sandboxBannerLearnMore = document.getElementById("sandboxBannerLearnMore");
     const approvalSelect = document.getElementById("approvalSelect");
@@ -3947,13 +3990,40 @@ export class WebviewController {
       return i18n.sandboxUnavailable;
     }
 
+    let sandboxBannerExpanded = false;
+
+    function setSandboxBannerExpanded(expanded) {
+      sandboxBannerExpanded = expanded;
+      if (sandboxBannerToggle) {
+        sandboxBannerToggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+        const warning = sandboxBannerText?.textContent || i18n.sandboxBannerDirectText;
+        sandboxBannerToggle.title = expanded
+          ? i18n.collapseSandboxBanner
+          : (warning || i18n.expandSandboxBanner);
+        sandboxBannerToggle.setAttribute(
+          "aria-label",
+          expanded ? i18n.collapseSandboxBanner : i18n.sandboxBannerLabel,
+        );
+      }
+      if (sandboxBanner) {
+        sandboxBanner.hidden = !expanded || !sandboxBannerToggle || sandboxBannerToggle.hidden;
+      }
+    }
+
     function updateSandboxBanner() {
-      if (!sandboxBanner) return;
       const safeWorktreeActive = approvalSelect.value === "safe-worktree";
-      sandboxBanner.hidden = sandboxSupported || safeWorktreeActive;
+      const visible = !sandboxSupported && !safeWorktreeActive;
+      if (sandboxBannerToggle) {
+        sandboxBannerToggle.hidden = !visible;
+      }
       if (sandboxBannerText) {
         sandboxBannerText.textContent = i18n.sandboxBannerDirectText;
       }
+      if (!visible) {
+        if (sandboxBanner) sandboxBanner.hidden = true;
+        return;
+      }
+      setSandboxBannerExpanded(sandboxBannerExpanded);
     }
 
     function updateContextChip(label) {
@@ -5129,6 +5199,11 @@ export class WebviewController {
       setApprovalMode(approvalSelect.value);
       vscode.postMessage({ type: "selectApprovalMode", approvalMode: approvalSelect.value });
     });
+    if (sandboxBannerToggle) {
+      sandboxBannerToggle.addEventListener("click", () => {
+        setSandboxBannerExpanded(!sandboxBannerExpanded);
+      });
+    }
     if (sandboxBannerLearnMore) {
       sandboxBannerLearnMore.addEventListener("click", () => {
         vscode.postMessage({ type: "sandboxLearnMore" });

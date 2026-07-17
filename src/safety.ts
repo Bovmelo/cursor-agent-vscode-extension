@@ -273,6 +273,24 @@ export function takeNextQueuedMessage<T extends QueueMessageItem>(
   return { next, remaining };
 }
 
+/**
+ * Put a message back after a drain attempt failed to start a run.
+ * Preserves per-conversation order; interrupts stay ahead of other work.
+ */
+export function requeueUnstartedMessage<T extends QueueMessageItem>(
+  queue: readonly T[],
+  item: T,
+): T[] {
+  if (item.kind === "interrupt") {
+    return [item, ...queue];
+  }
+  const insertAt = queue.findIndex((candidate) => candidate.conversationId === item.conversationId);
+  if (insertAt < 0) {
+    return [...queue, item];
+  }
+  return [...queue.slice(0, insertAt), item, ...queue.slice(insertAt)];
+}
+
 export type ConversationRunState = "idle" | "running" | "queued" | "cancelling";
 
 export function conversationRunState(input: {

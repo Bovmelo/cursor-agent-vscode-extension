@@ -85,6 +85,33 @@ function resolveWindowsExecutable(file: string): string {
   return file;
 }
 
+/** Quote one argv token for `cmd.exe /d /s /c` without enabling a full shell. */
+export function quoteForCmd(argument: string): string {
+  if (argument.length === 0) {
+    return '""';
+  }
+  if (!/[\s"]/.test(argument)) {
+    return argument;
+  }
+  return `"${argument.replace(/"/g, '""')}"`;
+}
+
+/**
+ * Node 20+ rejects direct spawn of `.cmd`/`.bat` on Windows (`spawn EINVAL`)
+ * unless a shell is used. Route those through `cmd.exe /d /s /c` instead of
+ * `shell: true`, so argv stays explicit after parseCommandLine validation.
+ */
+export function toExecFileInvocation(parsed: ParsedCommand): ParsedCommand {
+  if (process.platform !== "win32" || !/\.(cmd|bat)$/i.test(parsed.file)) {
+    return parsed;
+  }
+  const commandLine = [parsed.file, ...parsed.args].map(quoteForCmd).join(" ");
+  return {
+    file: process.env.ComSpec || "cmd.exe",
+    args: ["/d", "/s", "/c", commandLine],
+  };
+}
+
 export async function runConfiguredCommand(
   command: string,
   options: {
@@ -93,8 +120,8 @@ export async function runConfiguredCommand(
     maxBuffer: number;
   },
 ): Promise<{ stdout: string; stderr: string }> {
-  const parsed = parseCommandLine(command);
-  return execFileAsync(parsed.file, parsed.args, {
+  const invocation = toExecFileInvocation(parseCommandLine(command));
+  return execFileAsync(invocation.file, invocation.args, {
     cwd: options.cwd,
     windowsHide: true,
     timeout: options.timeout,

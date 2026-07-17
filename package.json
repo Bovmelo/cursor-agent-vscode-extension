@@ -482,27 +482,38 @@
         {
           "type": "webview",
           "id": "cursorSubscription.chatView",
-          "name": "%view.agent%"
+          "name": "%view.agent%",
+          "initialSize": 12
         },
         {
           "id": "cursorSubscription.changeSessions",
-          "name": "%view.changeSessions%"
+          "name": "%view.changeSessions%",
+          "visibility": "hidden",
+          "initialSize": 2
         },
         {
           "id": "cursorSubscription.supervisorTasks",
-          "name": "%view.supervisorTasks%"
+          "name": "%view.supervisorTasks%",
+          "visibility": "hidden",
+          "initialSize": 2
         },
         {
           "id": "cursorSubscription.integrations",
-          "name": "%view.integrations%"
+          "name": "%view.integrations%",
+          "visibility": "hidden",
+          "initialSize": 2
         },
         {
           "id": "cursorSubscription.backgroundJobs",
-          "name": "%view.backgroundJobs%"
+          "name": "%view.backgroundJobs%",
+          "visibility": "hidden",
+          "initialSize": 2
         },
         {
           "id": "cursorSubscription.auditTimeline",
-          "name": "%view.auditTimeline%"
+          "name": "%view.auditTimeline%",
+          "visibility": "hidden",
+          "initialSize": 2
         }
       ]
     },

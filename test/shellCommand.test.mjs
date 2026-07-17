@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseCommandLine } from "../out/shellCommand.js";
+import { parseCommandLine, quoteForCmd, toExecFileInvocation } from "../out/shellCommand.js";
 import { minimalShellEnv } from "../out/shellEnv.js";
 import { isPathInside, resolveCanonicalPath, safeResolvePathResolved } from "../out/safety.js";
 import { mkdtemp, mkdir, symlink, writeFile, rm } from "node:fs/promises";
@@ -20,6 +20,25 @@ test("parseCommandLine tokenizes quotes and rejects shell metacharacters", () =>
   assert.throws(() => parseCommandLine("echo $(whoami)"), /shell metacharacters/i);
   assert.throws(() => parseCommandLine("cat file | grep x"), /shell metacharacters/i);
   assert.throws(() => parseCommandLine("echo 'unterminated"), /unmatched quote/i);
+});
+
+test("toExecFileInvocation routes Windows batch files through cmd.exe", () => {
+  assert.deepEqual(quoteForCmd("plain"), "plain");
+  assert.deepEqual(quoteForCmd("has space"), '"has space"');
+  assert.deepEqual(quoteForCmd('say "hi"'), '"say ""hi"""');
+
+  const npm = parseCommandLine("npm run validate");
+  const invocation = toExecFileInvocation(npm);
+  if (process.platform === "win32") {
+    assert.equal(invocation.file.toLowerCase().endsWith("cmd.exe"), true);
+    assert.deepEqual(invocation.args.slice(0, 3), ["/d", "/s", "/c"]);
+    assert.equal(invocation.args[3], "npm.cmd run validate");
+  } else {
+    assert.deepEqual(invocation, npm);
+  }
+
+  const node = parseCommandLine("node ./scripts/run.js");
+  assert.deepEqual(toExecFileInvocation(node), node);
 });
 
 test("minimalShellEnv forwards only an allowlisted subset", () => {
