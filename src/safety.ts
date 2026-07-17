@@ -261,6 +261,13 @@ export function defaultSafetyApprovalMode(
   return sandboxSupported ? "auto-review" : "safe-worktree";
 }
 
+export function shouldMigrateToSafeWorktree(
+  sandboxSupported: boolean,
+  migrationApplied: boolean,
+): boolean {
+  return !sandboxSupported && !migrationApplied;
+}
+
 /**
  * Safe mode isolates mutating runs when the SDK sandbox is unavailable.
  * Parallel mutations remain isolated on every platform.

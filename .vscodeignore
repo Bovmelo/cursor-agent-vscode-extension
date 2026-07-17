@@ -1,8 +1,10 @@
 .git/**
 .github/**
 .vscode/**
+.pnpm-store/**
 src/**
 scripts/**
+test/**
 tsconfig.json
 **/*.ts
 **/*.map

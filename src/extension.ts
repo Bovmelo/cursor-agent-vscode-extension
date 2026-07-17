@@ -92,6 +92,7 @@ import {
   isSafeRelativePath,
   parseWebviewMessage,
   removeQueuedMessages,
+  shouldMigrateToSafeWorktree,
   shouldUseIsolatedWorktree,
   shouldCancelOnInterrupt,
   takeNextQueuedMessage,
@@ -104,6 +105,7 @@ const MODEL_KEY = "cursorSubscription.model";
 const MODEL_PARAMS_KEY = "cursorSubscription.modelParams";
 const APPROVAL_MODE_KEY = "cursorSubscription.approvalMode";
 const SANDBOX_WARNING_ACK_KEY = "cursorSubscription.sandboxWarningAcknowledged";
+const WINDOWS_SAFE_MODE_MIGRATION_KEY = "cursorSubscription.windowsSafeModeDefaultAppliedV1";
 const PARALLEL_EDIT_WARNING_KEY = "cursorSubscription.parallelEditWarningShown";
 const BEST_OF_N_KEY = "cursorSubscription.bestOfNExperiments";
 const VIEW_ID = "cursorSubscription.chatView";
@@ -387,6 +389,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private workspaceIndexGeneration = 0;
   private workspaceIndexRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   private sandboxWarningPromise: Promise<boolean> | undefined;
+  private windowsSafeModeMigrationPromise: Promise<void> | undefined;
   private readonly messageQueue: QueuedMessage[] = [];
   private readonly drainingConversations = new Set<string>();
   private readonly parallelTaskParticipants = new Set<string>();
@@ -467,6 +470,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         switch (message.type) {
           case "ready":
             this.webviewReady = true;
+            await this.ensureWindowsSafeModeMigrated();
             this.post({ type: "modelSelected", id: this.selectedModel() });
             this.post({ type: "approvalModeSelected", mode: this.selectedApprovalMode() });
             this.post({ type: "sandboxSupport", supported: SUPPORTS_LOCAL_SANDBOX });
@@ -2096,6 +2100,25 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     return this.isApprovalMode(stored) ? stored : fallback;
   }
 
+  private ensureWindowsSafeModeMigrated(): Promise<void> {
+    if (!shouldMigrateToSafeWorktree(
+      SUPPORTS_LOCAL_SANDBOX,
+      this.context.globalState.get<boolean>(WINDOWS_SAFE_MODE_MIGRATION_KEY, false),
+    )) {
+      return Promise.resolve();
+    }
+    this.windowsSafeModeMigrationPromise ??= (async () => {
+      await this.context.globalState.update(APPROVAL_MODE_KEY, "safe-worktree");
+      await this.context.globalState.update(WINDOWS_SAFE_MODE_MIGRATION_KEY, true);
+      this.output.appendLine(
+        `[${new Date().toISOString()}] Migrated Windows execution permissions to Safe worktree mode.`,
+      );
+    })().finally(() => {
+      this.windowsSafeModeMigrationPromise = undefined;
+    });
+    return this.windowsSafeModeMigrationPromise;
+  }
+
   private ensureSandboxWarningAcknowledged(): Promise<boolean> {
     if (SUPPORTS_LOCAL_SANDBOX) {
       return Promise.resolve(true);
@@ -2722,6 +2745,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return;
     }
 
+    await this.ensureWindowsSafeModeMigrated();
     if (!SUPPORTS_LOCAL_SANDBOX && !await this.ensureSandboxWarningAcknowledged()) {
       this.post({
         type: "error",

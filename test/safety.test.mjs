@@ -20,6 +20,7 @@ import {
   parseWebviewMessage,
   removeQueuedMessages,
   safeResolvePath,
+  shouldMigrateToSafeWorktree,
   shouldUseIsolatedWorktree,
   shouldCancelOnInterrupt,
   takeNextQueuedMessage,
@@ -246,6 +247,9 @@ test("multiple agents editing the same file are detected as conflicts", () => {
 test("safe execution defaults to a worktree when the sandbox is unavailable", () => {
   assert.equal(defaultSafetyApprovalMode(true), "auto-review");
   assert.equal(defaultSafetyApprovalMode(false), "safe-worktree");
+  assert.equal(shouldMigrateToSafeWorktree(false, false), true);
+  assert.equal(shouldMigrateToSafeWorktree(false, true), false);
+  assert.equal(shouldMigrateToSafeWorktree(true, false), false);
 
   assert.equal(shouldUseIsolatedWorktree({
     approvalMode: "safe-worktree",

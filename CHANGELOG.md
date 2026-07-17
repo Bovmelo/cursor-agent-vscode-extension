@@ -4,7 +4,7 @@
 
 - Persist each chat's workspace folder in multi-root workspaces, and let the footer label pick a different root
 - Automatically three-way merge non-overlapping parallel-agent edits, with confirmed AI-assisted resolution for overlapping text conflicts
-- Default Windows to Safe worktree mode, require a first-run sandbox warning acknowledgement, and keep the no-OS-isolation warning visible
+- Default and migrate Windows to Safe worktree mode, require a first-run sandbox warning acknowledgement, and keep a non-dismissible warning visible during direct-workspace modes
 
 ## 0.1.13
 

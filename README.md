@@ -85,7 +85,7 @@ Open **Cursor: Open AI Feature Settings** or use the gear button in the chat hea
 
 ## Windows safety
 
-Cursor's local SDK sandbox is unavailable on Windows. The extension therefore defaults Windows to **Safe worktree** mode: Auto-review remains enabled, normal agent edits run in a detached Git worktree, and completed changes are applied only with conflict checks. A first-run modal and a non-dismissible chat banner disclose the limitation. Safe worktree mode reduces accidental workspace edits, but it is not an OS security boundary: tools can still access the host filesystem and network. **Auto-review** (direct workspace) and **Full access** require an explicit warning confirmation when selected.
+Cursor's local SDK sandbox is unavailable on Windows. The extension therefore defaults Windows to **Safe worktree** mode and performs a one-time migration of previously saved permission modes: Auto-review remains enabled, normal agent edits run in a detached Git worktree, and completed changes are applied only with conflict checks. A first-run modal discloses the limitation. Safe worktree mode keeps a compact status indicator; direct-workspace **Auto-review** and **Full access** require explicit confirmation and show a non-dismissible warning banner. Safe worktree mode reduces accidental workspace edits, but it is not an OS security boundary: tools can still access the host filesystem and network.
 
 Safe worktree mode requires the workspace to be a Git repository. Plan mode is read-only and does not create a worktree.
 
@@ -168,7 +168,7 @@ Anysphere / Cursor 非提携の**非公式**拡張機能です。公式 TypeScri
 
 ### Windowsでの安全性
 
-WindowsではCursorローカルSDKのサンドボックスを利用できません。そのため、この拡張機能はWindowsで**安全worktree**を既定にします。自動レビューを維持したまま通常のAgent編集を分離Git worktreeで実行し、完了した変更は競合確認後に適用します。初回警告への確認が必要で、チャットにはOS隔離がないことを示す閉じられない警告を常時表示します。
+WindowsではCursorローカルSDKのサンドボックスを利用できません。そのため、この拡張機能はWindowsで**安全worktree**を既定にし、以前保存された実行権限もアップデート後の初回起動時に一度だけ安全worktreeへ移行します。自動レビューを維持したまま通常のAgent編集を分離Git worktreeで実行し、完了した変更は競合確認後に適用します。初回警告への確認が必要です。安全worktree中は小さな状態表示だけを残し、ワークスペース直接実行またはフルアクセス中は閉じられない警告バナーを表示します。
 
 安全worktreeはワークスペースへの意図しない編集を抑えますが、OSのセキュリティ境界ではありません。ツールはホストのファイルシステムとネットワークへアクセスできます。ワークスペース直接実行の**自動レビュー**または**フルアクセス**へ切り替える際は、明示確認が必要です。安全worktreeにはGitリポジトリが必要です。読み取り専用のPlanモードではworktreeを作成しません。
 

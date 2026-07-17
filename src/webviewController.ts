@@ -3027,11 +3027,10 @@ export class WebviewController {
 
     function updateSandboxBanner() {
       if (!sandboxBanner) return;
-      sandboxBanner.hidden = sandboxSupported;
+      const safeWorktreeActive = approvalSelect.value === "safe-worktree";
+      sandboxBanner.hidden = sandboxSupported || safeWorktreeActive;
       if (sandboxBannerText) {
-        sandboxBannerText.textContent = approvalSelect.value === "safe-worktree"
-          ? i18n.sandboxBannerSafeText
-          : i18n.sandboxBannerDirectText;
+        sandboxBannerText.textContent = i18n.sandboxBannerDirectText;
       }
     }
 
