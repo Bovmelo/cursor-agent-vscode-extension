@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdir, readFile, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -49,6 +49,14 @@ export function worktreeLeasePath(worktreePath: string): string {
 function isInside(root: string, candidate: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
   return relative.length > 0 && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+async function canonicalPath(candidate: string): Promise<string> {
+  try {
+    return await realpath(candidate);
+  } catch {
+    return path.resolve(candidate);
+  }
 }
 
 function processIsAlive(pid: number): boolean {
@@ -224,13 +232,15 @@ export async function cleanupOrphanedManagedWorktrees(
   } catch {
     return [];
   }
-  const managedRoots = options.managedRoots?.map((managedRoot) => path.resolve(managedRoot))
+  const configuredManagedRoots = options.managedRoots?.map((managedRoot) => path.resolve(managedRoot))
     ?? worktreesHomeSegments.map(managedWorktreesRoot);
+  const managedRoots = await Promise.all(configuredManagedRoots.map(canonicalPath));
   const now = options.now ?? Date.now();
   const isProcessAlive = options.isProcessAlive ?? processIsAlive;
   const removed: string[] = [];
   for (const worktreePath of parseWorktreePaths(porcelain)) {
-    if (!managedRoots.some((managedRoot) => isInside(managedRoot, worktreePath))) {
+    const canonicalWorktreePath = await canonicalPath(worktreePath);
+    if (!managedRoots.some((managedRoot) => isInside(managedRoot, canonicalWorktreePath))) {
       continue;
     }
     const lease = await readLease(worktreePath);
