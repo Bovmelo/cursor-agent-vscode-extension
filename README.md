@@ -15,7 +15,7 @@ Run [Cursor](https://cursor.com) agents from the VS Code sidebar with your Curso
 - Image context (PNG, JPEG, GIF, WebP)
 - Project Skills and `.cursor/mcp.json` MCP servers
 - Permission modes (auto-review / full access)
-- `@` file search, drag-and-drop / paste file references
+- `@` file search, drag-and-drop (hold Shift while dragging) / paste file references
 - Active editor and selection context
 - Conversation history across restarts
 - Commit message generation from Source Control

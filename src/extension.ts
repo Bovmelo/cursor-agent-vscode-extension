@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer";
 import * as path from "node:path";
 import {
   Agent,
+  AgentBusyError,
   Cursor,
   CursorAgentError,
   type AgentDefinition,
@@ -273,7 +274,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         profile?: string;
         skills?: string[];
         approvalMode?: string;
-        sound?: string;
+        setting?: string;
         enabled?: boolean;
         path?: string;
         id?: string;
@@ -284,7 +285,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             this.webviewReady = true;
             this.post({ type: "modelSelected", id: this.selectedModel() });
             this.post({ type: "approvalModeSelected", mode: this.selectedApprovalMode() });
-            this.postRunningSoundSetting();
+            this.postNotificationAndSoundSettings();
             this.post({ type: "workspace", name: vscode.workspace.workspaceFolders?.[0]?.name });
             this.postView();
             await this.publishWorkspaceFileIndex();
@@ -426,23 +427,18 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               this.post({ type: "approvalModeSelected", mode: message.approvalMode });
             }
             break;
-          case "setSoundSetting":
+          case "setAlertSetting":
             if (
               typeof message.enabled === "boolean"
               && (
-                message.sound === "playSoundWhileRunning"
-                || message.sound === "playSoundOnComplete"
-                || message.sound === "playSoundOnError"
+                message.setting === "notifyOnComplete"
+                || message.setting === "playSoundWhileRunning"
+                || message.setting === "playSoundOnComplete"
+                || message.setting === "playSoundOnError"
               )
             ) {
-              await vscode.workspace
-                .getConfiguration("cursorSubscription")
-                .update(
-                  message.sound,
-                  message.enabled,
-                  vscode.ConfigurationTarget.Global,
-                );
-              this.postRunningSoundSetting();
+              await this.updateAlertSetting(message.setting, message.enabled);
+              this.postNotificationAndSoundSettings();
             }
             break;
           case "openFile":
@@ -481,11 +477,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       vscode.window.onDidChangeTextEditorSelection(() => this.postContextInfo()),
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (
-          event.affectsConfiguration("cursorSubscription.playSoundWhileRunning")
+          event.affectsConfiguration("cursorSubscription.notifyOnComplete")
+          || event.affectsConfiguration("cursorSubscription.playSoundWhileRunning")
           || event.affectsConfiguration("cursorSubscription.playSoundOnComplete")
           || event.affectsConfiguration("cursorSubscription.playSoundOnError")
         ) {
-          this.postRunningSoundSetting();
+          this.postNotificationAndSoundSettings();
         }
       }),
       fileWatcher,
@@ -1008,8 +1005,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.post({ type: "queueState", items });
   }
 
-  private postRunningSoundSetting(): void {
-    const configuration = vscode.workspace.getConfiguration("cursorSubscription");
+  private postNotificationAndSoundSettings(): void {
+    const configuration = this.alertConfiguration();
+    const notificationConfigured = configuration.get<boolean>("notifyOnComplete", true);
     const runningConfigured = configuration.get<boolean>("playSoundWhileRunning", true);
     const completionConfigured = configuration.get<boolean>("playSoundOnComplete", true);
     const errorConfigured = configuration.get<boolean>("playSoundOnError", true);
@@ -1017,14 +1015,34 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const completionEnabled = completionConfigured && process.platform !== "win32";
     const errorEnabled = errorConfigured && process.platform !== "win32";
     this.post({
-      type: "soundSettings",
+      type: "notificationAndSoundSettings",
+      notification: notificationConfigured,
       running: runningConfigured,
       completion: completionConfigured,
       error: errorConfigured,
+      webviewPlayback: process.platform !== "win32",
     });
     this.post({ type: "runningSoundSetting", enabled });
     this.post({ type: "completionSoundSetting", enabled: completionEnabled });
     this.post({ type: "errorSoundSetting", enabled: errorEnabled });
+  }
+
+  private alertConfiguration(): vscode.WorkspaceConfiguration {
+    return vscode.workspace.getConfiguration(
+      "cursorSubscription",
+      vscode.workspace.workspaceFolders?.[0]?.uri,
+    );
+  }
+
+  private async updateAlertSetting(setting: string, enabled: boolean): Promise<void> {
+    const configuration = this.alertConfiguration();
+    const inspected = configuration.inspect<boolean>(setting);
+    const target = inspected?.workspaceFolderValue !== undefined
+      ? vscode.ConfigurationTarget.WorkspaceFolder
+      : inspected?.workspaceValue !== undefined
+        ? vscode.ConfigurationTarget.Workspace
+        : vscode.ConfigurationTarget.Global;
+    await configuration.update(setting, enabled, target);
   }
 
   private async enqueueMessage(
@@ -1247,13 +1265,31 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         this.agentConversationId = conversationId;
       }
 
-      const run = await this.agent.send(
-        images.length > 0 ? { text: composed, images } : composed,
-        {
-          model: modelSelection ?? this.selectedModelSelection(),
-          mode: profile === "plan" ? "plan" : "agent",
-        },
-      );
+      const runMessage = images.length > 0 ? { text: composed, images } : composed;
+      const runOptions = {
+        model: modelSelection ?? this.selectedModelSelection(),
+        mode: profile === "plan" ? "plan" as const : "agent" as const,
+      };
+      let run: CursorRun;
+      try {
+        run = await this.agent.send(runMessage, runOptions);
+      } catch (error) {
+        if (!this.isAgentBusyError(error)) {
+          throw error;
+        }
+        this.output.appendLine(
+          `[${new Date().toISOString()}] Recovering stale active run for agent ${this.agent.agentId}.`,
+        );
+        await this.recoverBusyAgent(
+          apiKey,
+          agentRoots,
+          workspace.name,
+          conversation,
+          cwd,
+          rootsKey,
+        );
+        run = await this.agent.send(runMessage, runOptions);
+      }
       this.run = run;
       if (
         this.pendingCancelConversationId === conversationId
@@ -1263,7 +1299,37 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         await run.cancel();
       }
 
-      for await (const event of run.stream()) {
+      const eventStream = run.stream();
+      const resultPromise = run.wait();
+      const terminalSignal = resultPromise.then(async (result) => {
+        // Give the stream a short grace period to deliver its final message.
+        await new Promise<void>((resolve) => setTimeout(resolve, 500));
+        return { type: "result" as const, result };
+      });
+      let result: RunResult | undefined;
+      while (!result) {
+        const outcome = await Promise.race([
+          eventStream.next().then(
+            (next) => ({ type: "event" as const, next }),
+            (error: unknown) => ({ type: "streamError" as const, error }),
+          ),
+          terminalSignal,
+        ]);
+        if (outcome.type === "result") {
+          result = outcome.result;
+          this.output.appendLine(
+            `[${new Date().toISOString()}] Run ${run.id} reached ${result.status} before its event stream closed; finalizing from the run result.`,
+          );
+          void eventStream.return(undefined).catch(() => {});
+          break;
+        }
+        if (outcome.type === "streamError") {
+          throw outcome.error;
+        }
+        if (outcome.next.done) {
+          break;
+        }
+        const event = outcome.next.value;
         if (event.type === "assistant") {
           for (const block of event.message.content) {
             if (block.type === "text" && block.text) {
@@ -1276,7 +1342,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         }
       }
 
-      const result = await run.wait();
+      result ??= await resultPromise;
       if (result.usage) {
         conversation.tokenUsage = addTokenUsage(conversation.tokenUsage, result.usage);
       }
@@ -2399,6 +2465,53 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
   }
 
+  private isAgentBusyError(error: unknown): boolean {
+    return error instanceof AgentBusyError
+      || (error instanceof Error && /already has active run/i.test(error.message));
+  }
+
+  private async recoverBusyAgent(
+    apiKey: string,
+    agentRoots: string[],
+    workspaceName: string,
+    conversation: Conversation,
+    cwd: string,
+    rootsKey: string,
+  ): Promise<void> {
+    const agent = this.agent;
+    const agentId = agent?.agentId ?? conversation.agentId;
+    if (agent && agentId) {
+      try {
+        const runs = await Agent.listRuns(agentId, { runtime: "local", cwd });
+        const activeRun = [...runs.items].reverse().find(
+          (candidate) => candidate.status === "running",
+        );
+        if (activeRun) {
+          await Agent.cancelRun(activeRun.id, { runtime: "local", cwd });
+          await agent.reload();
+          return;
+        }
+      } catch (error) {
+        this.output.appendLine(
+          `[${new Date().toISOString()}] Could not cancel stale run for agent ${agentId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+
+    await this.disposeAgent();
+    conversation.agentId = undefined;
+    this.agent = await this.createOrResumeAgent(
+      apiKey,
+      agentRoots,
+      workspaceName,
+      conversation,
+    );
+    this.agentRootsKey = rootsKey;
+    this.agentConversationId = conversation.id;
+  }
+
   private async publishIntegrationIndex(): Promise<void> {
     const workspace = vscode.workspace.workspaceFolders?.[0];
     if (!workspace) {
@@ -2673,6 +2786,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           progressFailed: "処理中にエラーが発生しました",
           progressStep: "ステップ",
           dropFiles: "Shiftを押しながらドロップして添付",
+          dropHelp: "ファイルはShiftを押しながらドラッグ＆ドロップできます",
           dropFailed: "ドロップしたファイルを読み取れませんでした。Shiftを押しながらドロップしてください。",
           pasteFailed: "クリップボードの画像を読み取れませんでした。",
           approvalMode: "実行権限",
@@ -2686,7 +2800,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           copyCode: "コードをコピー",
           copyMessage: "メッセージをコピー",
           copied: "コピーしました",
-          soundSettings: "音の設定",
+          soundSettings: "通知と音の設定",
+          completionNotification: "処理完了の通知",
           soundWhileRunning: "処理中の音",
           soundOnComplete: "完了時の音",
           soundOnError: "エラー時の音",
@@ -2763,6 +2878,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           progressFailed: "Work failed",
           progressStep: "steps",
           dropFiles: "Hold Shift and drop files to attach",
+          dropHelp: "Hold Shift while dragging and dropping to attach files",
           dropFailed: "Could not read the dropped files. Hold Shift while dropping.",
           pasteFailed: "Could not read the image from the clipboard.",
           approvalMode: "Execution permissions",
@@ -2776,7 +2892,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           copyCode: "Copy code",
           copyMessage: "Copy message",
           copied: "Copied",
-          soundSettings: "Sound settings",
+          soundSettings: "Notification and sound settings",
+          completionNotification: "Run completion notifications",
           soundWhileRunning: "While running",
           soundOnComplete: "On completion",
           soundOnError: "On error",
@@ -2846,7 +2963,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       top: calc(100% + 4px);
       right: 0;
       z-index: 30;
-      width: 190px;
+      width: 220px;
       padding: 6px;
       color: var(--vscode-menu-foreground, var(--vscode-foreground));
       background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
@@ -3209,6 +3326,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       padding: 10px 12px 8px;
     }
     .card:focus-within { border-color: var(--vscode-focusBorder); }
+    .drop-help {
+      margin: -1px 4px 0;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.3;
+      text-align: right;
+    }
     #dropHint {
       position: absolute;
       inset: 5px;
@@ -3888,6 +4012,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       </button>
       <div id="soundMenu" role="group" aria-label="${ui.soundSettings}" hidden>
         <div class="sound-menu-title">${ui.soundSettings}</div>
+        <label class="sound-option"><input id="notificationToggle" type="checkbox"><span>${ui.completionNotification}</span></label>
         <label class="sound-option"><input id="runningSoundToggle" type="checkbox"><span>${ui.soundWhileRunning}</span></label>
         <label class="sound-option"><input id="completionSoundToggle" type="checkbox"><span>${ui.soundOnComplete}</span></label>
         <label class="sound-option"><input id="errorSoundToggle" type="checkbox"><span>${ui.soundOnError}</span></label>
@@ -4005,6 +4130,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         </button>
       </div>
     </div>
+    <div class="drop-help">${ui.dropHelp}</div>
   </div>
 
   <div class="footer">
@@ -4036,6 +4162,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const historyButton = document.getElementById("historyButton");
     const soundButton = document.getElementById("soundButton");
     const soundMenu = document.getElementById("soundMenu");
+    const notificationToggle = document.getElementById("notificationToggle");
     const runningSoundToggle = document.getElementById("runningSoundToggle");
     const completionSoundToggle = document.getElementById("completionSoundToggle");
     const errorSoundToggle = document.getElementById("errorSoundToggle");
@@ -4078,8 +4205,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     let runningSoundEnabled = false;
     let completionSoundEnabled = false;
     let errorSoundEnabled = false;
+    let webviewSoundPlayback = false;
     let runningSoundTimer;
     let runningAudioContext;
+    const runningSoundVoices = new Set();
     let sandboxUnavailable = false;
     let attach = false;
     let view = "home";
@@ -5449,6 +5578,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         const playTone = (frequency, start, duration, volume) => {
           const oscillator = audio.createOscillator();
           const gain = audio.createGain();
+          const voice = { oscillator, gain };
           oscillator.type = "sine";
           oscillator.frequency.setValueAtTime(frequency, start);
           gain.gain.setValueAtTime(0.0001, start);
@@ -5457,9 +5587,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           oscillator.connect(gain);
           gain.connect(audio.destination);
           oscillator.addEventListener("ended", () => {
+            runningSoundVoices.delete(voice);
             oscillator.disconnect();
             gain.disconnect();
           }, { once: true });
+          runningSoundVoices.add(voice);
           oscillator.start(start);
           oscillator.stop(start + duration + 0.01);
         };
@@ -5486,6 +5618,16 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         clearTimeout(runningSoundTimer);
         runningSoundTimer = undefined;
       }
+      for (const voice of runningSoundVoices) {
+        try {
+          voice.oscillator.stop();
+        } catch {
+          // The oscillator may already have ended between iteration and stop().
+        }
+        voice.oscillator.disconnect();
+        voice.gain.disconnect();
+      }
+      runningSoundVoices.clear();
     }
 
     function playCompletionSound() {
@@ -5615,24 +5757,47 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     newChatButton.addEventListener("click", () => vscode.postMessage({ type: "newChat" }));
     historyButton.addEventListener("click", () => vscode.postMessage({ type: "showHome" }));
     soundButton.addEventListener("click", () => setSoundMenuOpen(soundMenu.hidden));
-    runningSoundToggle.addEventListener("change", () => {
+    notificationToggle.addEventListener("change", () => {
       vscode.postMessage({
-        type: "setSoundSetting",
-        sound: "playSoundWhileRunning",
+        type: "setAlertSetting",
+        setting: "notifyOnComplete",
+        enabled: notificationToggle.checked,
+      });
+    });
+    runningSoundToggle.addEventListener("change", () => {
+      if (webviewSoundPlayback) {
+        runningSoundEnabled = runningSoundToggle.checked;
+        if (runningSoundEnabled && running) {
+          startRunningSound();
+        } else {
+          stopRunningSound();
+        }
+      }
+      vscode.postMessage({
+        type: "setAlertSetting",
+        setting: "playSoundWhileRunning",
         enabled: runningSoundToggle.checked,
       });
     });
     completionSoundToggle.addEventListener("change", () => {
+      if (webviewSoundPlayback) {
+        completionSoundEnabled = completionSoundToggle.checked;
+        if (completionSoundEnabled) primeRunningSound();
+      }
       vscode.postMessage({
-        type: "setSoundSetting",
-        sound: "playSoundOnComplete",
+        type: "setAlertSetting",
+        setting: "playSoundOnComplete",
         enabled: completionSoundToggle.checked,
       });
     });
     errorSoundToggle.addEventListener("change", () => {
+      if (webviewSoundPlayback) {
+        errorSoundEnabled = errorSoundToggle.checked;
+        if (errorSoundEnabled) primeRunningSound();
+      }
       vscode.postMessage({
-        type: "setSoundSetting",
-        sound: "playSoundOnError",
+        type: "setAlertSetting",
+        setting: "playSoundOnError",
         enabled: errorSoundToggle.checked,
       });
     });
@@ -5748,12 +5913,72 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     });
     window.addEventListener("dragend", () => setDragActive(false));
     window.addEventListener("blur", () => setDragActive(false));
+    let restorePromptOnWindowFocus = false;
+    let promptFocusRestoreGeneration = 0;
+
+    function schedulePromptFocusRestore() {
+      restorePromptOnWindowFocus = true;
+      const generation = ++promptFocusRestoreGeneration;
+      const restore = () => {
+        if (
+          generation !== promptFocusRestoreGeneration
+          || !restorePromptOnWindowFocus
+          || document.activeElement === prompt
+        ) {
+          return;
+        }
+        prompt.focus({ preventScroll: true });
+      };
+      requestAnimationFrame(restore);
+      // Typeless may return focus after its paste/input event has completed.
+      // Retry across that hand-off instead of relying on a single animation frame.
+      for (const delay of [50, 150, 350, 700, 1200, 2000]) {
+        setTimeout(restore, delay);
+      }
+    }
+
+    function cancelPromptFocusRestore() {
+      restorePromptOnWindowFocus = false;
+      promptFocusRestoreGeneration += 1;
+    }
+
+    // Dictation tools briefly move focus to a system-level voice bar. Remember
+    // that the prompt was the target and restore its caret when the webview
+    // becomes active again. Pointer interaction inside the webview cancels the
+    // restoration so an intentional click never has its focus stolen.
+    prompt.addEventListener("focus", () => {
+      restorePromptOnWindowFocus = true;
+    });
+    prompt.addEventListener("blur", (event) => {
+      if (event.relatedTarget instanceof Node && document.contains(event.relatedTarget)) {
+        cancelPromptFocusRestore();
+      } else {
+        // Typeless can move focus outside the webview after the text has already
+        // arrived, so start a fresh retry window from the actual focus loss.
+        schedulePromptFocusRestore();
+      }
+    });
+    document.addEventListener("pointerdown", (event) => {
+      if (event.target !== prompt) cancelPromptFocusRestore();
+    }, true);
+    window.addEventListener("blur", () => {
+      if (document.activeElement === prompt) restorePromptOnWindowFocus = true;
+    });
+    window.addEventListener("focus", () => {
+      if (restorePromptOnWindowFocus) schedulePromptFocusRestore();
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && restorePromptOnWindowFocus) schedulePromptFocusRestore();
+    });
     prompt.addEventListener("paste", (event) => {
       // Voice tools like Typeless paste polished text. Prefer that over file-drag
       // heuristics, which can otherwise swallow the paste when clipboard also
       // advertises file/URI payloads.
       const plain = event.clipboardData?.getData("text/plain") ?? "";
-      if (plain.length > 0) return;
+      if (plain.length > 0) {
+        schedulePromptFocusRestore();
+        return;
+      }
       if (!isFileDrag(event.clipboardData)) return;
       event.preventDefault();
       void resolveTransferredFiles(event.clipboardData, false, i18n.pasteFailed);
@@ -5761,6 +5986,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     prompt.addEventListener("input", () => {
       autoGrow();
       updateComposerSuggestions();
+      schedulePromptFocusRestore();
     });
     prompt.addEventListener("compositionend", () => {
       autoGrow();
@@ -5831,10 +6057,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           auth.style.display = "block";
           authChip.style.display = "inline-flex";
           break;
-        case "soundSettings":
+        case "notificationAndSoundSettings":
+          notificationToggle.checked = data.notification === true;
           runningSoundToggle.checked = data.running === true;
           completionSoundToggle.checked = data.completion === true;
           errorSoundToggle.checked = data.error === true;
+          webviewSoundPlayback = data.webviewPlayback === true;
           break;
         case "runningSoundSetting":
           runningSoundEnabled = data.enabled === true;

@@ -78,21 +78,22 @@ export class RunningSoundController implements vscode.Disposable {
   }
 
   private enabled(): boolean {
-    return vscode.workspace
-      .getConfiguration(CONFIG_SECTION)
-      .get<boolean>(CONFIG_KEY, true);
+    return this.configuration().get<boolean>(CONFIG_KEY, true);
   }
 
   private completionEnabled(): boolean {
-    return vscode.workspace
-      .getConfiguration(CONFIG_SECTION)
-      .get<boolean>(COMPLETION_CONFIG_KEY, true);
+    return this.configuration().get<boolean>(COMPLETION_CONFIG_KEY, true);
   }
 
   private errorEnabled(): boolean {
-    return vscode.workspace
-      .getConfiguration(CONFIG_SECTION)
-      .get<boolean>(ERROR_CONFIG_KEY, true);
+    return this.configuration().get<boolean>(ERROR_CONFIG_KEY, true);
+  }
+
+  private configuration(): vscode.WorkspaceConfiguration {
+    return vscode.workspace.getConfiguration(
+      CONFIG_SECTION,
+      vscode.workspace.workspaceFolders?.[0]?.uri,
+    );
   }
 
   private playOneShot(

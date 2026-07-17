@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+## 0.1.11
+
+- Restore the prompt caret after Typeless or another dictation tool temporarily takes focus
+- Add an in-chat setting for enabling or disabling run completion notifications
+- Apply sound setting changes immediately while an agent run is in progress
+- Finalize completed runs even when the SDK event stream is slow to close, and recover stale active runs
+- Keep the chat prompt focused when Typeless returns text after briefly taking system focus
+- Show a persistent hint that file drag-and-drop requires holding Shift
+- Restore the prompt even when Typeless moves focus outside the webview after inserting text
+
 ## 0.1.10
 
 - Add in-chat toggles for running, completion, and error sounds
