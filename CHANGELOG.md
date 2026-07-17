@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.1.13
+
+- Show token usage on the chat home view (today, last 7 days, chat vs Supervisor, conversation totals)
+- Track daily usage for chat and AI Supervisor runs in private workspace storage
+- Add conversation search, pin/unpin, and Markdown export from the history list
+- Load Cursor-style slash commands from `.cursor/commands/*.md` and `~/.cursor/commands/*.md`
+- Add a composer chip to include or exclude project memory for the next send
+- Add `/compare` best-of-N parallel runs with side-by-side comparison and winner selection
+- Show a pre-send context preview with a rough token estimate
+- Offer branch + pull request creation via `gh` after successful verification, plus **Cursor: Create Branch and Pull Request**
+- Resolve chat/Supervisor cwd from the active editor workspace folder when possible
+- Index files, Skills, MCP servers, and project commands across multi-root workspace folders
+- Add configurable `preEditCommands` / `postEditCommands` hooks around AI edit sessions
+- Make Supervisor safe auto-apply globs configurable
+- Add unit tests for usage, best-of-N, context estimate, multi-root path helpers, and pure utilities
+
 ## 0.1.12
 
 - Add an AI Supervisor inbox with Observe and Autonomous modes for saved diagnostics and manual goals

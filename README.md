@@ -23,6 +23,7 @@ Run [Cursor](https://cursor.com) agents from the VS Code sidebar with your Curso
 - AI Supervisor inbox with Observe and Autonomous modes
 - Concurrent normal-chat agents across separate conversations
 - Isolated Git worktree execution with conflict-safe, per-file apply/discard
+- Multi-root workspace support for chat cwd, file search, Skills, MCP, and commands
 - Preview-and-accept inline code generation instead of immediate edits
 - AI Quick Fix actions for editor diagnostics
 - Automatic validation with optional bounded self-repair
@@ -30,6 +31,9 @@ Run [Cursor](https://cursor.com) agents from the VS Code sidebar with your Curso
 - AI change-session history and revertible checkpoints, including dirty Git baselines
 - Project memory, debug-context analysis, and experimental inline completions
 - Japanese / English UI (follows VS Code display language)
+- Token usage dashboard, conversation search / pin / export
+- Cursor-style `.cursor/commands` slash templates and `/compare` best-of-N
+- Branch + PR creation via GitHub CLI after verified edits
 
 ## AI-native workflow
 
@@ -106,12 +110,16 @@ Anysphere / Cursor 非提携の**非公式**拡張機能です。公式 TypeScri
 - 監視・自律実行を切り替えられる AI Supervisor 受信箱
 - 別々の会話で通常チャットAgentを並列実行
 - 隔離Git worktreeでの実行と、競合を防ぐファイル単位の適用・破棄
+- マルチルートワークスペース対応（cwd、ファイル検索、Skills、MCP、コマンド）
 - 適用前に確認できるインライン生成コードの差分プレビュー
 - Problems の診断に対する AI Quick Fix と、行単位の AI コードレビュー
 - 編集後の自動検証と、回数制限付きの自動修正
 - 未コミット変更も保護するAI変更セッション履歴とチェックポイント
 - プロジェクト記憶、デバッグ状況の解析、実験的なインライン補完
 - VS Code の表示言語に連動した日英 UI
+- トークン使用量、会話検索 / ピン留め / 書き出し
+- Cursor 互換の `.cursor/commands` スラッシュテンプレートと `/compare` best-of-N
+- 検証後の GitHub CLI によるブランチと PR 作成
 
 ### AIネイティブ機能
 

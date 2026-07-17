@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { promisify } from "node:util";
 import * as vscode from "vscode";
 import { runVerification, type VerificationResult } from "./aiNative.js";
+import { configurationFor, resolveWorkspaceFolder } from "./workspaceFolder.js";
 
 const execFileAsync = promisify(execFileCallback);
 const TASKS_KEY = "cursorSubscription.supervisorTasks";
@@ -68,6 +69,14 @@ export interface SupervisorExecutionResult {
   error?: string;
   summary?: string;
   changeReasons?: Record<string, string>;
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    totalTokens: number;
+    reasoningTokens?: number;
+  };
 }
 
 export interface SupervisorTaskTarget {
@@ -998,10 +1007,7 @@ vscode.CodeLensProvider, vscode.Disposable {
   }
 
   private configuration(): vscode.WorkspaceConfiguration {
-    return vscode.workspace.getConfiguration(
-      "cursorSubscription",
-      vscode.workspace.workspaceFolders?.[0]?.uri,
-    );
+    return configurationFor("cursorSubscription");
   }
 
   private text(english: string, japanese: string): string {
@@ -1122,7 +1128,9 @@ vscode.CodeLensProvider, vscode.Disposable {
   }
 
   private async currentRepoRoot(): Promise<string | undefined> {
-    const workspace = vscode.workspace.workspaceFolders?.[0];
+    const workspace = resolveWorkspaceFolder(
+      vscode.window.activeTextEditor?.document.uri,
+    );
     if (!workspace) {
       void vscode.window.showWarningMessage(this.text(
         "Open a Git workspace before creating an AI Supervisor task.",
@@ -1479,13 +1487,19 @@ vscode.CodeLensProvider, vscode.Disposable {
     ) {
       return false;
     }
-    const safePatterns = [
-      "**/*.md",
-      "**/*.test.*",
-      "**/*.spec.*",
-      "**/test/**",
-      "**/tests/**",
-    ].map(globRegex);
+    const safePatterns = this.configuration()
+      .get<string[]>("supervisorAutoApplyGlobs", [
+        "**/*.md",
+        "**/*.test.*",
+        "**/*.spec.*",
+        "**/test/**",
+        "**/tests/**",
+      ])
+      .filter((pattern) => typeof pattern === "string" && pattern.trim().length > 0)
+      .map(globRegex);
+    if (safePatterns.length === 0) {
+      return false;
+    }
     return Boolean(task.changes?.length)
       && task.changes!.every((change) =>
         !change.excluded && safePatterns.some((pattern) => pattern.test(change.relative))

@@ -23,17 +23,42 @@ import {
   type ReviewFinding,
   type VerificationResult,
 } from "./aiNative.js";
+import {
+  createBestOfNExperiment,
+  experimentCandidates,
+  pickWinner,
+  type BestOfNExperiment,
+} from "./bestOfN.js";
+import { buildContextPreview } from "./contextEstimate.js";
 import { generateCommitMessage, resolveRootUri } from "./generateCommitMessage.js";
+import { createBranchCommitAndPullRequest } from "./gitWorkflow.js";
+import { runConfiguredHooks } from "./hooks.js";
 import {
   detectBlockedProxyEnvironment,
   type BlockedProxyEnvironment,
 } from "./networkEnvironment.js";
+import {
+  expandProjectCommand,
+  loadProjectCommands,
+  type ProjectCommand,
+} from "./projectCommands.js";
 import { RunningSoundController } from "./runningSound.js";
 import {
   AiSupervisorController,
   type SupervisorTaskTarget,
 } from "./supervisor.js";
 import { SupervisorAgentRunner } from "./supervisorRunner.js";
+import {
+  addTokenUsage,
+  recordUsage,
+  summarizeUsage,
+  USAGE_LEDGER_KEY,
+  type StoredTokenUsage,
+  type UsageLedger,
+  type UsageSource,
+  type UsageSummary,
+} from "./usageStats.js";
+import { pickWorkspaceFolder, resolveWorkspaceFolder, configurationFor, workspaceDisplayName, resolveAbsoluteInWorkspace } from "./workspaceFolder.js";
 
 const API_KEY_SECRET = "cursorSubscription.apiKey";
 const CONVERSATIONS_KEY = "cursorSubscription.conversations";
@@ -41,6 +66,7 @@ const MODEL_KEY = "cursorSubscription.model";
 const MODEL_PARAMS_KEY = "cursorSubscription.modelParams";
 const APPROVAL_MODE_KEY = "cursorSubscription.approvalMode";
 const PARALLEL_EDIT_WARNING_KEY = "cursorSubscription.parallelEditWarningShown";
+const BEST_OF_N_KEY = "cursorSubscription.bestOfNExperiments";
 const VIEW_ID = "cursorSubscription.chatView";
 const DEFAULT_MODEL = "auto";
 const TITLE_MAX_LENGTH = 40;
@@ -62,10 +88,7 @@ type AiFeatureSetting =
   | "enableInlineCompletions";
 
 function configuredAiFeatureEnabled(setting: AiFeatureSetting): boolean {
-  const configuration = vscode.workspace.getConfiguration(
-    "cursorSubscription",
-    vscode.workspace.workspaceFolders?.[0]?.uri,
-  );
+  const configuration = configurationFor("cursorSubscription");
   return configuration.get<boolean>("enableAiNativeFeatures", true)
     && configuration.get<boolean>(setting, setting !== "enableInlineCompletions");
 }
@@ -152,6 +175,8 @@ interface Conversation {
   updatedAt: number;
   agentId?: string;
   attachmentRoot?: string;
+  pinned?: boolean;
+  experimentGroupId?: string;
   tokenUsage?: TokenUsage;
   transcript: TranscriptEntry[];
 }
@@ -168,6 +193,8 @@ interface QueuedMessage {
   kind: "queued" | "interrupt";
   editorContext?: EditorContextSnapshot;
   internalRepair?: boolean;
+  commandId?: string;
+  includeProjectMemory?: boolean;
 }
 
 interface LiveChatRun {
@@ -188,18 +215,6 @@ interface ChatRuntime {
   overlappedMutation: boolean;
   changeSessionId?: string;
   live?: LiveChatRun;
-}
-
-function addTokenUsage(current: TokenUsage | undefined, usage: TokenUsage): TokenUsage {
-  const reasoningTokens = (current?.reasoningTokens ?? 0) + (usage.reasoningTokens ?? 0);
-  return {
-    inputTokens: (current?.inputTokens ?? 0) + usage.inputTokens,
-    outputTokens: (current?.outputTokens ?? 0) + usage.outputTokens,
-    cacheReadTokens: (current?.cacheReadTokens ?? 0) + usage.cacheReadTokens,
-    cacheWriteTokens: (current?.cacheWriteTokens ?? 0) + usage.cacheWriteTokens,
-    totalTokens: (current?.totalTokens ?? 0) + usage.totalTokens,
-    reasoningTokens: reasoningTokens > 0 ? reasoningTokens : undefined,
-  };
 }
 
 function makeTitle(prompt: string): string {
@@ -236,7 +251,13 @@ export function activate(context: vscode.ExtensionContext): void {
     reviewDiagnostics,
   );
   supervisor.setExecutor(
-    (task, worktreePath, prompt) => supervisorRunner.execute(task, worktreePath, prompt),
+    async (task, worktreePath, prompt) => {
+      const outcome = await supervisorRunner.execute(task, worktreePath, prompt);
+      if (outcome?.usage) {
+        await provider.recordUsage("supervisor", outcome.usage);
+      }
+      return outcome;
+    },
     () => supervisorRunner.isBusy(),
     () => supervisorRunner.cancel(),
   );
@@ -353,6 +374,8 @@ export function activate(context: vscode.ExtensionContext): void {
           () => runningSound.playCompletion(),
         ),
     ),
+    vscode.commands.registerCommand("cursorSubscription.createPullRequest", () =>
+      provider.createPullRequestFromWorkspace()),
     vscode.commands.registerCommand("cursorSubscription.runAutopilot", () =>
       provider.runAutopilot()),
     vscode.commands.registerCommand(
@@ -447,6 +470,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private activeId: string | undefined;
   private showingHome = true;
   private workspaceFileCache: PromiseLike<WorkspaceFileItem[]> | undefined;
+  private workspaceFileCacheKey: string | undefined;
   private sandboxFallbackApproved = false;
   private readonly messageQueue: QueuedMessage[] = [];
   private readonly drainingConversations = new Set<string>();
@@ -468,6 +492,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     | { key: string; value: vscode.InlineCompletionItem[] }
     | undefined;
   private readonly previewContents = new Map<string, string>();
+  private projectCommands: ProjectCommand[] = [];
+  private bestOfNExperiments: BestOfNExperiment[];
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -477,6 +503,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     private readonly reviewDiagnostics: vscode.DiagnosticCollection,
   ) {
     this.conversations = context.workspaceState.get<Conversation[]>(CONVERSATIONS_KEY, []);
+    this.bestOfNExperiments = context.workspaceState.get<BestOfNExperiment[]>(BEST_OF_N_KEY, []);
   }
 
   public async resolveWebviewView(view: vscode.WebviewView): Promise<void> {
@@ -507,12 +534,16 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         modelParams?: { id?: unknown; value?: unknown }[];
         profile?: string;
         skills?: string[];
+        commandId?: string;
+        includeProjectMemory?: boolean;
         approvalMode?: string;
         setting?: string;
         enabled?: boolean;
         path?: string;
         id?: string;
         uploads?: { name?: unknown; data?: unknown }[];
+        pinned?: boolean;
+        format?: string;
       }) => {
         switch (message.type) {
           case "ready":
@@ -520,8 +551,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             this.post({ type: "modelSelected", id: this.selectedModel() });
             this.post({ type: "approvalModeSelected", mode: this.selectedApprovalMode() });
             this.postNotificationAndSoundSettings();
-            this.post({ type: "workspace", name: vscode.workspace.workspaceFolders?.[0]?.name });
+            this.post({ type: "workspace", name: workspaceDisplayName() });
             this.postView();
+            this.postUsageStats();
             this.postParallelState();
             await this.publishWorkspaceFileIndex();
             await this.publishIntegrationIndex();
@@ -543,6 +575,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
                 Array.isArray(message.skills)
                   ? message.skills.filter((skill): skill is string => typeof skill === "string")
                   : [],
+                undefined,
+                undefined,
+                undefined,
+                false,
+                false,
+                typeof message.commandId === "string" ? message.commandId : undefined,
+                message.includeProjectMemory !== false,
               );
               await this.drainMessageQueue();
             }
@@ -564,6 +603,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
                   ? message.skills.filter((skill): skill is string => typeof skill === "string")
                   : [],
                 message.type === "interruptMessage",
+                undefined,
+                false,
+                undefined,
+                typeof message.commandId === "string" ? message.commandId : undefined,
+                message.includeProjectMemory !== false,
               );
             }
             break;
@@ -626,6 +670,77 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             if (typeof message.id === "string") {
               await this.deleteConversation(message.id);
             }
+            break;
+          case "pinConversation":
+            if (typeof message.id === "string") {
+              await this.pinConversation(
+                message.id,
+                typeof message.pinned === "boolean" ? message.pinned : undefined,
+              );
+            }
+            break;
+          case "exportConversation":
+            if (typeof message.id === "string") {
+              await this.exportConversation(
+                message.id,
+                message.format === "json" ? "json" : "markdown",
+              );
+            }
+            break;
+          case "searchConversations":
+            this.showingHome = true;
+            this.activeId = undefined;
+            this.postView(typeof message.query === "string" ? message.query : "");
+            break;
+          case "startBestOfN":
+            if (typeof message.prompt === "string") {
+              await this.startBestOfN(
+                message.prompt.trim(),
+                message.attachContext === true,
+                Array.isArray(message.files)
+                  ? message.files.filter((file): file is string => typeof file === "string")
+                  : [],
+                this.isRunProfile(message.profile) ? message.profile : "agent",
+                Array.isArray(message.skills)
+                  ? message.skills.filter((skill): skill is string => typeof skill === "string")
+                  : [],
+                message.includeProjectMemory !== false,
+              );
+            }
+            break;
+          case "pickBestOfNWinner":
+            if (typeof message.id === "string") {
+              await this.pickBestOfNWinner(message.id);
+            }
+            break;
+          case "compareBestOfN":
+            if (typeof message.id === "string") {
+              this.showingHome = true;
+              this.activeId = undefined;
+              this.postBestOfNCompare(message.id);
+            }
+            break;
+          case "estimateContext":
+            this.post({
+              type: "contextPreview",
+              ...buildContextPreview({
+                prompt: typeof message.prompt === "string" ? message.prompt : "",
+                profile: this.isRunProfile(message.profile) ? message.profile : "agent",
+                includeProjectMemory: message.includeProjectMemory !== false,
+                attachContext: message.attachContext === true,
+                contextLabel: typeof message.path === "string" ? message.path : undefined,
+                files: Array.isArray(message.files)
+                  ? message.files.filter((file): file is string => typeof file === "string")
+                  : [],
+                skills: Array.isArray(message.skills)
+                  ? message.skills.filter((skill): skill is string => typeof skill === "string")
+                  : [],
+                commandId: typeof message.commandId === "string" ? message.commandId : undefined,
+                commandBodyLength: this.projectCommands.find(
+                  (command) => command.id === message.commandId,
+                )?.body.length,
+              }),
+            });
             break;
           case "getContext":
             this.postContextInfo();
@@ -717,12 +832,18 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const fileWatcher = vscode.workspace.createFileSystemWatcher("**/*");
     const invalidateWorkspaceFiles = (): void => {
       this.workspaceFileCache = undefined;
+      this.workspaceFileCacheKey = undefined;
       void this.publishWorkspaceFileIndex();
       void this.publishIntegrationIndex();
+      this.post({ type: "workspace", name: workspaceDisplayName() });
     };
     this.disposables.push(
-      vscode.window.onDidChangeActiveTextEditor(() => this.postContextInfo()),
+      vscode.window.onDidChangeActiveTextEditor(() => {
+        this.postContextInfo();
+        this.post({ type: "workspace", name: workspaceDisplayName() });
+      }),
       vscode.window.onDidChangeTextEditorSelection(() => this.postContextInfo()),
+      vscode.workspace.onDidChangeWorkspaceFolders(() => invalidateWorkspaceFiles()),
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (
           event.affectsConfiguration("cursorSubscription.notifyOnComplete")
@@ -886,7 +1007,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (!this.ensureFeatureEnabled("enableAiReview", localize("AI review", "AIレビュー"))) {
       return;
     }
-    const workspace = vscode.workspace.workspaceFolders?.[0];
+    const workspace = resolveWorkspaceFolder(vscode.window.activeTextEditor?.document.uri)
+      ?? await pickWorkspaceFolder(
+        localize("Select a workspace to review", "レビューするワークスペースを選択"),
+      );
     if (!workspace || this.anyChatBusy()) {
       return;
     }
@@ -1004,7 +1128,16 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (!this.ensureFeatureEnabled("enableVerification", localize("Verification", "検証"))) {
       return undefined;
     }
-    const workspace = vscode.workspace.workspaceFolders?.[0];
+    const sessionRoot = sessionId
+      ? this.changeSessions.snapshot(sessionId)?.root
+      : this.changeSessions.snapshot()?.root;
+    const workspace = (sessionRoot
+      ? resolveWorkspaceFolder(vscode.Uri.file(sessionRoot))
+      : undefined)
+      ?? resolveWorkspaceFolder(vscode.window.activeTextEditor?.document.uri)
+      ?? await pickWorkspaceFolder(
+        localize("Select a workspace to verify", "検証するワークスペースを選択"),
+      );
     if (!workspace) {
       return undefined;
     }
@@ -1467,12 +1600,245 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     );
   }
 
+  public async createPullRequestFromWorkspace(): Promise<void> {
+    const workspace = await pickWorkspaceFolder(
+      localize("Select the repository for the pull request", "PRを作成するリポジトリを選択"),
+    );
+    if (!workspace) {
+      return;
+    }
+    const title = await vscode.window.showInputBox({
+      prompt: localize("Pull request title", "プルリクエストのタイトル"),
+      value: this.activeConversation()?.title || "Cursor agent changes",
+    });
+    if (!title?.trim()) {
+      return;
+    }
+    await this.offerCreatePullRequest(workspace.uri.fsPath, title.trim(), [], true);
+  }
+
+  private async offerCreatePullRequest(
+    root: string,
+    title: string,
+    files: string[],
+    force = false,
+  ): Promise<void> {
+    if (
+      !force
+      && !this.alertConfiguration().get<boolean>("offerPullRequestAfterVerify", true)
+    ) {
+      return;
+    }
+    const createLabel = localize("Create branch & PR", "ブランチとPRを作成");
+    const answer = await vscode.window.showInformationMessage(
+      localize(
+        "Create a branch, commit, and open a pull request with gh?",
+        "ブランチを切ってコミットし、gh でプルリクエストを作成しますか？",
+      ),
+      createLabel,
+    );
+    if (answer !== createLabel) {
+      return;
+    }
+    try {
+      const relativeFiles = files
+        .map((file) => path.relative(root, file).replaceAll("\\", "/"))
+        .filter((file) => file && !file.startsWith("..") && !path.isAbsolute(file));
+      const result = await createBranchCommitAndPullRequest({
+        root,
+        title,
+        files: relativeFiles.length > 0 ? relativeFiles : undefined,
+        japanese: IS_JAPANESE,
+      });
+      const openLabel = localize("Open pull request", "PRを開く");
+      const followUp = result.url
+        ? await vscode.window.showInformationMessage(
+          localize(
+            `Created ${result.branch}`,
+            `${result.branch} を作成しました`,
+          ),
+          openLabel,
+        )
+        : undefined;
+      if (followUp === openLabel && result.url) {
+        await vscode.env.openExternal(vscode.Uri.parse(result.url));
+      }
+    } catch (error) {
+      void vscode.window.showErrorMessage(
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
   public async newChat(): Promise<void> {
     this.dismissViewedParallelTaskWhenLeaving();
     this.activeId = undefined;
     this.showingHome = false;
     this.post({ type: "newChat" });
     this.postQueueState();
+  }
+
+  public async startBestOfN(
+    prompt: string,
+    attachContext: boolean,
+    files: string[],
+    profile: RunProfile,
+    skills: string[],
+    includeProjectMemory = true,
+  ): Promise<void> {
+    const trimmed = prompt.trim();
+    if (!trimmed) {
+      return;
+    }
+    const count = Math.max(
+      2,
+      Math.min(this.alertConfiguration().get<number>("bestOfNCount", 3), 5),
+    );
+    const maximumParallelAgents = Math.max(
+      1,
+      this.alertConfiguration().get<number>("maxParallelChatAgents", 3),
+    );
+    const availableSlots = maximumParallelAgents - this.activeRunCount();
+    if (availableSlots < 2) {
+      this.post({
+        type: "error",
+        text: localize(
+          "Need at least 2 free parallel slots for best-of-N. Wait for runs to finish or raise maxParallelChatAgents.",
+          "best-of-Nには空き並列スロットが2つ以上必要です。完了を待つか maxParallelChatAgents を増やしてください。",
+        ),
+      });
+      return;
+    }
+    const runCount = Math.min(count, availableSlots);
+    const conversationIds: string[] = [];
+    for (let index = 0; index < runCount; index += 1) {
+      const conversation: Conversation = {
+        id: randomUUID(),
+        title: makeTitle(`[B${index + 1}] ${trimmed}`),
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        transcript: [],
+      };
+      this.conversations.unshift(conversation);
+      conversationIds.push(conversation.id);
+    }
+    const experiment = createBestOfNExperiment(trimmed, conversationIds);
+    for (const conversationId of conversationIds) {
+      const conversation = this.conversations.find((item) => item.id === conversationId);
+      if (conversation) {
+        conversation.experimentGroupId = experiment.id;
+      }
+    }
+    this.bestOfNExperiments = [experiment, ...this.bestOfNExperiments].slice(0, 20);
+    await this.context.workspaceState.update(BEST_OF_N_KEY, this.bestOfNExperiments);
+    await this.saveConversations();
+
+    this.activeId = conversationIds[0];
+    this.showingHome = false;
+    this.postView();
+
+    for (const conversationId of conversationIds) {
+      await this.enqueueMessage(
+        trimmed,
+        attachContext,
+        files,
+        profile,
+        skills,
+        false,
+        undefined,
+        false,
+        conversationId,
+        undefined,
+        includeProjectMemory,
+      );
+    }
+    void vscode.window.showInformationMessage(
+      localize(
+        `Started best-of-${runCount}. Compare the parallel chats and pick a winner from history when ready.`,
+        `best-of-${runCount}を開始しました。並列チャットを比較し、履歴から勝者を選べます。`,
+      ),
+    );
+  }
+
+  private async pickBestOfNWinner(conversationId: string): Promise<void> {
+    const conversation = this.conversations.find((item) => item.id === conversationId);
+    if (!conversation?.experimentGroupId) {
+      return;
+    }
+    const index = this.bestOfNExperiments.findIndex(
+      (item) => item.id === conversation.experimentGroupId,
+    );
+    if (index < 0) {
+      return;
+    }
+    const experiment = pickWinner(this.bestOfNExperiments[index], conversationId);
+    this.bestOfNExperiments[index] = experiment;
+    conversation.pinned = true;
+    await this.context.workspaceState.update(BEST_OF_N_KEY, this.bestOfNExperiments);
+    await this.saveConversations();
+    const discardLabel = localize("Delete losing runs", "敗者の会話を削除");
+    const answer = await vscode.window.showInformationMessage(
+      localize(
+        `Pinned the winning conversation from best-of-N.`,
+        `best-of-Nの勝者会話をピン留めしました。`,
+      ),
+      discardLabel,
+    );
+    if (answer === discardLabel) {
+      for (const loserId of experiment.conversationIds) {
+        if (loserId !== conversationId) {
+          await this.deleteConversation(loserId);
+        }
+      }
+    }
+    if (this.showingHome && !this.activeId) {
+      this.postView();
+    }
+  }
+
+  private postBestOfNCompare(experimentId: string): void {
+    const experiment = this.bestOfNExperiments.find((item) => item.id === experimentId);
+    if (!experiment) {
+      return;
+    }
+    const runningIds = new Set(
+      this.conversations
+        .filter((conversation) => this.isConversationBusy(conversation.id))
+        .map((conversation) => conversation.id),
+    );
+    this.post({
+      type: "bestOfNCompare",
+      experiment: {
+        id: experiment.id,
+        prompt: experiment.prompt,
+        createdAt: experiment.createdAt,
+        winnerId: experiment.winnerId,
+        candidates: experimentCandidates(experiment, this.conversations, runningIds),
+      },
+    });
+  }
+
+  private postExperimentSummaries(): void {
+    const runningIds = new Set(
+      this.conversations
+        .filter((conversation) => this.isConversationBusy(conversation.id))
+        .map((conversation) => conversation.id),
+    );
+    const experiments = this.bestOfNExperiments
+      .filter((experiment) =>
+        experiment.conversationIds.some((id) =>
+          this.conversations.some((conversation) => conversation.id === id)
+        )
+      )
+      .slice(0, 10)
+      .map((experiment) => ({
+        id: experiment.id,
+        prompt: experiment.prompt,
+        createdAt: experiment.createdAt,
+        winnerId: experiment.winnerId,
+        candidateCount: experimentCandidates(experiment, this.conversations, runningIds).length,
+      }));
+    this.post({ type: "bestOfNExperiments", experiments });
   }
 
   public async addFilesToChat(uris: vscode.Uri[]): Promise<void> {
@@ -1788,29 +2154,73 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     return this.activeRunCount() > 0;
   }
 
-  private conversationSummaries(): Array<{
+  private conversationSummaries(query = ""): Array<{
     id: string;
     title: string;
     updatedAt: number;
     running: boolean;
     queued: boolean;
+    pinned: boolean;
+    totalTokens: number;
+    experimentGroupId?: string;
   }> {
+    const normalized = query.trim().toLowerCase();
     return [...this.conversations]
-      .sort((a, b) => b.updatedAt - a.updatedAt)
-      .map(({ id, title, updatedAt }) => ({
+      .filter((conversation) => {
+        if (!normalized) {
+          return true;
+        }
+        if (conversation.title.toLowerCase().includes(normalized)) {
+          return true;
+        }
+        return conversation.transcript.some((entry) =>
+          entry.text.toLowerCase().includes(normalized)
+        );
+      })
+      .sort((a, b) => {
+        if (Boolean(a.pinned) !== Boolean(b.pinned)) {
+          return a.pinned ? -1 : 1;
+        }
+        return b.updatedAt - a.updatedAt;
+      })
+      .map(({ id, title, updatedAt, pinned, tokenUsage, experimentGroupId }) => ({
         id,
         title,
         updatedAt,
         running: this.isConversationBusy(id),
         queued: this.messageQueue.some((item) => item.conversationId === id),
+        pinned: pinned === true,
+        totalTokens: tokenUsage?.totalTokens ?? 0,
+        experimentGroupId,
       }));
   }
 
   private async saveConversations(): Promise<void> {
     await this.context.workspaceState.update(CONVERSATIONS_KEY, this.conversations);
+    this.postUsageStats();
   }
 
-  private postView(): void {
+  public async recordUsage(source: UsageSource, usage: StoredTokenUsage): Promise<void> {
+    const ledger = this.context.workspaceState.get<UsageLedger>(USAGE_LEDGER_KEY);
+    await this.context.workspaceState.update(
+      USAGE_LEDGER_KEY,
+      recordUsage(ledger, source, usage),
+    );
+    this.postUsageStats();
+  }
+
+  private usageSummary(): UsageSummary {
+    return summarizeUsage(
+      this.conversations,
+      this.context.workspaceState.get<UsageLedger>(USAGE_LEDGER_KEY),
+    );
+  }
+
+  private postUsageStats(): void {
+    this.post({ type: "usageStats", summary: this.usageSummary() });
+  }
+
+  private postView(searchQuery = ""): void {
     const active = this.activeConversation();
     if (active) {
       const runtime = this.chatRuntimes.get(active.id);
@@ -1826,11 +2236,92 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }
       this.post({ type: "chat", entries, running: runtime?.busy === true });
     } else if (this.showingHome) {
-      this.post({ type: "home", conversations: this.conversationSummaries() });
+      this.post({
+        type: "home",
+        conversations: this.conversationSummaries(searchQuery),
+        searchQuery,
+      });
+      this.postUsageStats();
+      this.postExperimentSummaries();
     } else {
       this.post({ type: "newChat" });
     }
     this.postQueueState();
+  }
+
+  private async pinConversation(id: string, pinned?: boolean): Promise<void> {
+    const conversation = this.conversations.find((item) => item.id === id);
+    if (!conversation) {
+      return;
+    }
+    conversation.pinned = pinned ?? !conversation.pinned;
+    conversation.updatedAt = Date.now();
+    await this.saveConversations();
+    if (this.showingHome && !this.activeId) {
+      this.postView();
+    }
+  }
+
+  private async exportConversation(id: string, format: "markdown" | "json" = "markdown"): Promise<void> {
+    const conversation = this.conversations.find((item) => item.id === id);
+    if (!conversation) {
+      return;
+    }
+    const defaultName = conversation.title
+      .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "_")
+      .slice(0, 60) || "conversation";
+    const target = await vscode.window.showSaveDialog({
+      defaultUri: vscode.Uri.file(`${defaultName}.${format === "json" ? "json" : "md"}`),
+      filters: format === "json"
+        ? { JSON: ["json"] }
+        : { Markdown: ["md"] } satisfies Record<string, string[]>,
+    });
+    if (!target) {
+      return;
+    }
+    const body = format === "json"
+      ? Buffer.from(JSON.stringify({
+        id: conversation.id,
+        title: conversation.title,
+        createdAt: conversation.createdAt,
+        updatedAt: conversation.updatedAt,
+        pinned: conversation.pinned === true,
+        tokenUsage: conversation.tokenUsage,
+        transcript: conversation.transcript,
+      }, null, 2), "utf8")
+      : Buffer.from(this.conversationToMarkdown(conversation), "utf8");
+    await vscode.workspace.fs.writeFile(target, body);
+    void vscode.window.showInformationMessage(
+      localize(
+        `Exported conversation to ${target.fsPath}`,
+        `会話を書き出しました: ${target.fsPath}`,
+      ),
+    );
+  }
+
+  private conversationToMarkdown(conversation: Conversation): string {
+    const lines = [
+      `# ${conversation.title}`,
+      "",
+      `- Created: ${new Date(conversation.createdAt).toISOString()}`,
+      `- Updated: ${new Date(conversation.updatedAt).toISOString()}`,
+      `- Tokens: ${conversation.tokenUsage?.totalTokens ?? 0}`,
+      "",
+    ];
+    for (const entry of conversation.transcript) {
+      lines.push(`## ${entry.role === "user" ? "User" : "Assistant"}`);
+      lines.push("");
+      lines.push(entry.text);
+      lines.push("");
+      if (entry.files?.length) {
+        lines.push("Edited files:");
+        for (const file of entry.files) {
+          lines.push(`- ${file}`);
+        }
+        lines.push("");
+      }
+    }
+    return lines.join("\n");
   }
 
   private ensureConversation(prompt: string): Conversation {
@@ -1952,10 +2443,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private alertConfiguration(): vscode.WorkspaceConfiguration {
-    return vscode.workspace.getConfiguration(
-      "cursorSubscription",
-      vscode.workspace.workspaceFolders?.[0]?.uri,
-    );
+    return configurationFor("cursorSubscription");
   }
 
   private featureEnabled(setting: AiFeatureSetting): boolean {
@@ -2002,8 +2490,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     editorContext?: EditorContextSnapshot,
     internalRepair = false,
     targetConversationId?: string,
+    commandId?: string,
+    includeProjectMemory = true,
   ): Promise<void> {
-    if (!prompt) {
+    if (!prompt && !commandId) {
       return;
     }
 
@@ -2019,6 +2509,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         undefined,
         editorContext,
         internalRepair,
+        false,
+        commandId,
+        includeProjectMemory,
       );
       await this.drainMessageQueue();
       return;
@@ -2036,6 +2529,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       kind: interrupt ? "interrupt" : "queued",
       editorContext,
       internalRepair: internalRepair || undefined,
+      commandId,
+      includeProjectMemory,
     };
     if (interrupt) {
       this.messageQueue.unshift(item);
@@ -2111,6 +2606,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           item.model,
           item.editorContext,
           item.internalRepair === true,
+          false,
+          item.commandId,
+          item.includeProjectMemory !== false,
         );
       }
     } finally {
@@ -2129,12 +2627,22 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     editorContext?: EditorContextSnapshot,
     continueSession = false,
     reviewEdits = false,
+    commandId?: string,
+    includeProjectMemory = true,
   ): Promise<void> {
-    if (!prompt) {
+    const projectCommand = commandId
+      ? this.projectCommands.find((command) => command.id === commandId)
+      : undefined;
+    const effectivePrompt = projectCommand
+      ? expandProjectCommand(projectCommand, prompt)
+      : prompt;
+    if (!effectivePrompt) {
       return;
     }
 
-    const workspace = vscode.workspace.workspaceFolders?.[0];
+    const workspace = resolveWorkspaceFolder(
+      vscode.window.activeTextEditor?.document.uri,
+    ) ?? vscode.workspace.workspaceFolders?.[0];
     if (!workspace) {
       this.post({
         type: "error",
@@ -2155,7 +2663,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
     const conversation = targetConversationId
       ? this.conversations.find((candidate) => candidate.id === targetConversationId)
-      : this.ensureConversation(prompt);
+      : this.ensureConversation(effectivePrompt);
     if (!conversation) {
       return;
     }
@@ -2201,7 +2709,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
     this.postParallelState();
     let attachmentReferences: AttachedFileReference[] = [];
-    let composed = prompt;
+    let composed = effectivePrompt;
     let contextLabel: string | undefined;
     let images: SDKImage[] = [];
     let changeSessionId = continueSession ? runtime.changeSessionId : undefined;
@@ -2213,12 +2721,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         conversation,
       );
       ({ composed, contextLabel } = this.composePrompt(
-        prompt,
+        effectivePrompt,
         attachContext,
         attachmentReferences,
         profile,
         requestedSkills,
         editorContext,
+        includeProjectMemory,
       ));
       images = await this.loadAttachedImages(attachedFiles, workspace);
       if (
@@ -2226,7 +2735,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         && !continueSession
         && this.featureEnabled("enableChangeSessions")
       ) {
-        changeSessionId = (await this.changeSessions.begin(prompt, workspace.uri.fsPath)).id;
+        await runConfiguredHooks("preEdit", workspace.uri.fsPath, this.output);
+        changeSessionId = (await this.changeSessions.begin(effectivePrompt, workspace.uri.fsPath)).id;
         runtime.changeSessionId = changeSessionId;
         this.repairAttempts.set(conversationId, 0);
       }
@@ -2253,11 +2763,16 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       this.postIfActive(conversationId, { type: "contextAttached", label: contextLabel });
     }
 
+    const displayPrompt = projectCommand
+      ? (prompt.trim()
+        ? `/${projectCommand.id} ${prompt.trim()}`
+        : `/${projectCommand.id}`)
+      : prompt;
     const userEntry: TranscriptEntry = {
       role: "user",
       text: contextLabel
-        ? `${prompt}\n\n[${localize("Attached", "添付")}: ${contextLabel}]`
-        : prompt,
+        ? `${displayPrompt}\n\n[${localize("Attached", "添付")}: ${contextLabel}]`
+        : displayPrompt,
       attachments: attachmentReferences.length > 0
         ? attachmentReferences.map((reference) => ({
             path: reference.agentPath,
@@ -2417,6 +2932,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }
       if (result.usage) {
         conversation.tokenUsage = addTokenUsage(conversation.tokenUsage, result.usage);
+        await this.recordUsage("chat", result.usage);
       }
       if (result.status === "error") {
         failed = true;
@@ -2443,6 +2959,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         }
       } else {
         this.postIfActive(conversationId, { type: "finished" });
+      }
+
+      if (result.status === "finished" && editedFiles.size > 0 && profile !== "plan") {
+        try {
+          await runConfiguredHooks("postEdit", workspace.uri.fsPath, this.output);
+        } catch (error) {
+          const text = error instanceof Error ? error.message : String(error);
+          this.postIfActive(conversationId, { type: "error", text });
+        }
       }
 
       if (result.status === "finished" && reviewEdits && editedFiles.size > 0) {
@@ -2500,6 +3025,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           status: verificationStep.status,
         });
         assistantText = `${assistantText}\n\n${this.formatVerificationSummary(verificationResult)}`.trim();
+
+        if (verificationResult.success) {
+          void this.offerCreatePullRequest(
+            workspace.uri.fsPath,
+            conversation.title,
+            [...editedFiles],
+          );
+        }
 
         const autoRepair = this.featureEnabled("enableVerification")
           && this.alertConfiguration().get<boolean>("autoRepair", false);
@@ -2872,6 +3405,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     profile: RunProfile,
     requestedSkills: string[],
     editorContext?: EditorContextSnapshot,
+    includeProjectMemory = true,
   ): { composed: string; contextLabel?: string } {
     const profileInstruction: Partial<Record<RunProfile, string>> = {
       plan: "Create a concrete implementation plan. Do not edit files or run mutating commands.",
@@ -2880,7 +3414,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const skills = [...new Set(requestedSkills)]
       .filter((skill) => skill.length > 0 && skill.length <= 80)
       .slice(0, 10);
-    const memoryInstruction = this.featureEnabled("enableProjectMemory")
+    const memoryInstruction = includeProjectMemory
+      && this.featureEnabled("enableProjectMemory")
       && this.alertConfiguration().get<boolean>("includeProjectMemory", true)
       ? "If .cursor/rules.md or .cursor/project-memory.md exists, read and follow the relevant project guidance before acting. Never write secrets to project memory."
       : undefined;
@@ -2968,14 +3503,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private async searchWorkspaceFiles(query: string, requestId: number): Promise<void> {
-    const workspace = vscode.workspace.workspaceFolders?.[0];
-    if (!workspace) {
-      this.post({ type: "fileResults", requestId, files: [] });
-      return;
-    }
-
     const normalizedQuery = query.trim().toLowerCase().replaceAll("\\", "/");
-    const workspaceFiles = await this.getWorkspaceFiles(workspace);
+    const workspaceFiles = await this.getWorkspaceFiles();
     const files = workspaceFiles
       .filter((file) => !normalizedQuery || file.path.toLowerCase().includes(normalizedQuery))
       .sort((a, b) =>
@@ -2987,32 +3516,42 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.post({ type: "fileResults", requestId, files });
   }
 
-  private getWorkspaceFiles(workspace: vscode.WorkspaceFolder): PromiseLike<WorkspaceFileItem[]> {
-    if (!this.workspaceFileCache) {
-      this.workspaceFileCache = vscode.workspace.findFiles(
-        new vscode.RelativePattern(workspace, "**/*"),
-        "**/{.git,node_modules,out,dist,build,coverage}/**",
-        5000,
-      ).then((uris) => uris.map((uri): WorkspaceFileItem => {
-        const relative = path.relative(workspace.uri.fsPath, uri.fsPath).replaceAll("\\", "/");
-        const directory = path.posix.dirname(relative);
-        return {
-          path: relative,
-          label: path.posix.basename(relative),
-          description: directory === "." ? "" : directory,
-        };
-      }));
+  private getWorkspaceFiles(): PromiseLike<WorkspaceFileItem[]> {
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    const cacheKey = folders.map((folder) => folder.uri.toString()).join("|");
+    if (!this.workspaceFileCache || this.workspaceFileCacheKey !== cacheKey) {
+      this.workspaceFileCacheKey = cacheKey;
+      this.workspaceFileCache = (async () => {
+        const items: WorkspaceFileItem[] = [];
+        for (const workspace of folders) {
+          const uris = await vscode.workspace.findFiles(
+            new vscode.RelativePattern(workspace, "**/*"),
+            "**/{.git,node_modules,out,dist,build,coverage}/**",
+            5000,
+          );
+          for (const uri of uris) {
+            const relative = vscode.workspace.asRelativePath(uri, true).replaceAll("\\", "/");
+            const directory = path.posix.dirname(relative);
+            items.push({
+              path: relative,
+              label: path.posix.basename(relative),
+              description: directory === "." ? "" : directory,
+            });
+          }
+        }
+        return items;
+      })();
     }
     return this.workspaceFileCache!;
   }
 
   private async publishWorkspaceFileIndex(): Promise<void> {
-    const workspace = vscode.workspace.workspaceFolders?.[0];
-    if (!workspace) {
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    if (folders.length === 0) {
       this.post({ type: "workspaceFileIndex", files: [] });
       return;
     }
-    const files = await this.getWorkspaceFiles(workspace);
+    const files = await this.getWorkspaceFiles();
     this.post({ type: "workspaceFileIndex", files: files.map((file) => file.path) });
   }
 
@@ -3033,25 +3572,25 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     requestedFiles: string[],
     workspace: vscode.WorkspaceFolder,
   ): Promise<string[]> {
-    const root = path.resolve(workspace.uri.fsPath);
     const unique = [...new Set(requestedFiles)].slice(0, 20);
     const resolved: string[] = [];
 
     for (const requested of unique) {
-      const absolute = path.isAbsolute(requested)
-        ? path.resolve(requested)
-        : path.resolve(root, requested);
-      const relative = path.relative(root, absolute);
+      const absolute = resolveAbsoluteInWorkspace(requested, workspace);
+      if (!absolute) {
+        continue;
+      }
       try {
         const stat = await vscode.workspace.fs.stat(vscode.Uri.file(absolute));
-        if ((stat.type & vscode.FileType.File) !== 0) {
-          const isInWorkspace = relative
-            && !relative.startsWith("..")
-            && !path.isAbsolute(relative);
-          resolved.push(
-            (isInWorkspace ? relative : absolute).replaceAll("\\", "/"),
-          );
+        if ((stat.type & vscode.FileType.File) === 0) {
+          continue;
         }
+        const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(absolute));
+        resolved.push(
+          (folder
+            ? vscode.workspace.asRelativePath(vscode.Uri.file(absolute), true)
+            : absolute).replaceAll("\\", "/"),
+        );
       } catch {
         // Ignore stale or invalid file selections.
       }
@@ -3063,7 +3602,6 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     files: string[],
     workspace: vscode.WorkspaceFolder,
   ): Promise<SDKImage[]> {
-    const root = path.resolve(workspace.uri.fsPath);
     const images: SDKImage[] = [];
     let skippedLargeImages = 0;
     for (const file of files) {
@@ -3071,7 +3609,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       if (!format?.vision || images.length >= 8) {
         continue;
       }
-      const absolute = path.isAbsolute(file) ? path.resolve(file) : path.resolve(root, file);
+      const absolute = resolveAbsoluteInWorkspace(file, workspace);
+      if (!absolute) {
+        continue;
+      }
       try {
         const uri = vscode.Uri.file(absolute);
         const stat = await vscode.workspace.fs.stat(uri);
@@ -3250,8 +3791,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     requestId: number,
     uploads: DroppedFileUpload[] = [],
   ): Promise<void> {
-    const workspace = vscode.workspace.workspaceFolders?.[0];
-    if (!workspace) {
+    const workspace = resolveWorkspaceFolder() ?? vscode.workspace.workspaceFolders?.[0];
+    if (!workspace && (vscode.workspace.workspaceFolders?.length ?? 0) === 0) {
       this.post({ type: "resolvedAttachments", requestId, files: [] });
       void vscode.window.showWarningMessage(localize(
         "Open a workspace folder to attach dropped files.",
@@ -3260,8 +3801,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return;
     }
 
-    const root = path.resolve(workspace.uri.fsPath);
-    const workspaceFiles = await this.getWorkspaceFiles(workspace);
+    const preferred = workspace;
+    const workspaceFiles = await this.getWorkspaceFiles();
     const resolved = new Map<string, WorkspaceFileItem>();
     let rejected = 0;
 
@@ -3296,26 +3837,27 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
       const isAbsolute = path.isAbsolute(candidatePath);
       const hasDirectory = candidatePath.includes("/") || candidatePath.includes("\\");
-      const absolute = isAbsolute ? path.resolve(candidatePath) : path.resolve(root, candidatePath);
-      const relative = path.relative(root, absolute);
+      const absolute = resolveAbsoluteInWorkspace(candidatePath, preferred);
       let item: WorkspaceFileItem | undefined;
 
-      try {
-        const stat = await vscode.workspace.fs.stat(vscode.Uri.file(absolute));
-        if ((stat.type & vscode.FileType.File) !== 0) {
-          const isInWorkspace = relative
-            && !relative.startsWith("..")
-            && !path.isAbsolute(relative);
-          const normalized = (isInWorkspace ? relative : absolute).replaceAll("\\", "/");
-          const directory = path.posix.dirname(normalized);
-          item = {
-            path: normalized,
-            label: path.posix.basename(normalized),
-            description: directory === "." ? "" : directory,
-          };
+      if (absolute) {
+        try {
+          const stat = await vscode.workspace.fs.stat(vscode.Uri.file(absolute));
+          if ((stat.type & vscode.FileType.File) !== 0) {
+            const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(absolute));
+            const normalized = (folder
+              ? vscode.workspace.asRelativePath(vscode.Uri.file(absolute), true)
+              : absolute).replaceAll("\\", "/");
+            const directory = path.posix.dirname(normalized);
+            item = {
+              path: normalized,
+              label: path.posix.basename(normalized),
+              description: directory === "." ? "" : directory,
+            };
+          }
+        } catch {
+          // A name-only clipboard entry can still be resolved from the workspace index.
         }
-      } catch {
-        // A name-only clipboard entry can still be resolved from the workspace index.
       }
 
       if (!item && !isAbsolute && !hasDirectory) {
@@ -3567,14 +4109,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private async openFile(filePath: string): Promise<void> {
-    const workspace = vscode.workspace.workspaceFolders?.[0];
-    if (!workspace) {
+    const absolute = resolveAbsoluteInWorkspace(
+      filePath,
+      resolveWorkspaceFolder(),
+    );
+    if (!absolute) {
       return;
     }
-    const root = path.resolve(workspace.uri.fsPath);
-    const absolute = path.isAbsolute(filePath)
-      ? path.resolve(filePath)
-      : path.resolve(root, filePath);
     let uri = vscode.Uri.file(absolute);
     try {
       await vscode.workspace.fs.stat(uri);
@@ -3666,29 +4207,25 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private async openReferencedFile(reference: string): Promise<void> {
-    const workspace = vscode.workspace.workspaceFolders?.[0];
-    if (!workspace) {
+    if ((vscode.workspace.workspaceFolders?.length ?? 0) === 0) {
       return;
     }
 
     const match = /^(.*?)(?::(\d+)(?::\d+)?)?$/.exec(reference.trim());
     const requestedPath = (match?.[1] ?? reference).replaceAll("\\", "/");
     const line = match?.[2] ? Math.max(0, Number(match[2]) - 1) : undefined;
-    const root = path.resolve(workspace.uri.fsPath);
-    const exact = path.resolve(root, requestedPath);
-    const relativeExact = path.relative(root, exact);
     let candidates: vscode.Uri[] = [];
 
-    if (
-      relativeExact
-      && !relativeExact.startsWith("..")
-      && !path.isAbsolute(relativeExact)
-      && requestedPath.includes("/")
-    ) {
+    const exactAbsolute = resolveAbsoluteInWorkspace(
+      requestedPath,
+      resolveWorkspaceFolder(),
+    );
+    if (exactAbsolute && requestedPath.includes("/")) {
       try {
-        const stat = await vscode.workspace.fs.stat(vscode.Uri.file(exact));
+        const uri = vscode.Uri.file(exactAbsolute);
+        const stat = await vscode.workspace.fs.stat(uri);
         if ((stat.type & vscode.FileType.File) !== 0) {
-          candidates = [vscode.Uri.file(exact)];
+          candidates = [uri];
         }
       } catch {
         // Fall back to matching by the displayed file name.
@@ -3697,10 +4234,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
     if (candidates.length === 0) {
       const fileName = path.posix.basename(requestedPath).toLowerCase();
-      const files = await this.getWorkspaceFiles(workspace);
-      candidates = files
-        .filter((file) => file.label.toLowerCase() === fileName)
-        .map((file) => vscode.Uri.file(path.join(root, file.path)));
+      const files = await this.getWorkspaceFiles();
+      for (const file of files.filter((item) => item.label.toLowerCase() === fileName)) {
+        const absolute = resolveAbsoluteInWorkspace(file.path);
+        if (absolute) {
+          candidates.push(vscode.Uri.file(absolute));
+        }
+      }
     }
 
     if (candidates.length === 0) {
@@ -3715,7 +4255,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (candidates.length > 1) {
       const picked = await vscode.window.showQuickPick(
         candidates.map((uri) => {
-          const relative = path.relative(root, uri.fsPath).replaceAll("\\", "/");
+          const relative = vscode.workspace.asRelativePath(uri, true).replaceAll("\\", "/");
           return {
             label: path.posix.basename(relative),
             description: path.posix.dirname(relative),
@@ -3847,57 +4387,86 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private async publishIntegrationIndex(): Promise<void> {
-    const workspace = vscode.workspace.workspaceFolders?.[0];
-    if (!workspace) {
-      this.post({ type: "integrations", skills: [], mcpServers: [] });
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    if (folders.length === 0) {
+      this.projectCommands = await loadProjectCommands();
+      this.post({
+        type: "integrations",
+        skills: [],
+        mcpServers: [],
+        commands: this.projectCommands.map(({ id, label, description, source }) => ({
+          id,
+          label,
+          description,
+          source,
+        })),
+      });
       return;
     }
 
-    const skills: { name: string; description?: string }[] = [];
-    try {
-      const skillUris = await vscode.workspace.findFiles(
-        new vscode.RelativePattern(workspace, ".cursor/skills/**/SKILL.md"),
-        "**/node_modules/**",
-        100,
-      );
-      for (const uri of skillUris) {
-        const bytes = await vscode.workspace.fs.readFile(uri);
-        const source = Buffer.from(bytes).toString("utf8", 0, 8192);
-        const fallbackName = path.basename(path.dirname(uri.fsPath));
-        const name = /^name:\s*["']?([^"'\r\n]+)["']?\s*$/m.exec(source)?.[1]?.trim()
-          ?? fallbackName;
-        const description = /^description:\s*["']?([^"'\r\n]+)["']?\s*$/m
-          .exec(source)?.[1]?.trim();
-        skills.push({ name, description });
-      }
-    } catch {
-      // An unavailable skills folder is equivalent to an empty list.
-    }
-
-    const mcpServers: string[] = [];
-    const mcpUri = vscode.Uri.joinPath(workspace.uri, ".cursor", "mcp.json");
-    try {
-      const bytes = await vscode.workspace.fs.readFile(mcpUri);
-      const parsed = JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown;
-      if (parsed && typeof parsed === "object" && "mcpServers" in parsed) {
-        const servers = (parsed as { mcpServers?: unknown }).mcpServers;
-        if (servers && typeof servers === "object" && !Array.isArray(servers)) {
-          mcpServers.push(...Object.keys(servers));
+    const skillsByName = new Map<string, { name: string; description?: string }>();
+    for (const workspace of folders) {
+      try {
+        const skillUris = await vscode.workspace.findFiles(
+          new vscode.RelativePattern(workspace, ".cursor/skills/**/SKILL.md"),
+          "**/node_modules/**",
+          100,
+        );
+        for (const uri of skillUris) {
+          const bytes = await vscode.workspace.fs.readFile(uri);
+          const source = Buffer.from(bytes).toString("utf8", 0, 8192);
+          const fallbackName = path.basename(path.dirname(uri.fsPath));
+          const name = /^name:\s*["']?([^"'\r\n]+)["']?\s*$/m.exec(source)?.[1]?.trim()
+            ?? fallbackName;
+          const description = /^description:\s*["']?([^"'\r\n]+)["']?\s*$/m
+            .exec(source)?.[1]?.trim();
+          if (!skillsByName.has(name)) {
+            skillsByName.set(name, { name, description });
+          }
         }
+      } catch {
+        // An unavailable skills folder is equivalent to an empty list.
       }
-    } catch {
-      // Invalid JSON is left for the editor to surface when the user opens it.
     }
 
+    const mcpServers = new Set<string>();
+    for (const workspace of folders) {
+      const mcpUri = vscode.Uri.joinPath(workspace.uri, ".cursor", "mcp.json");
+      try {
+        const bytes = await vscode.workspace.fs.readFile(mcpUri);
+        const parsed = JSON.parse(Buffer.from(bytes).toString("utf8")) as unknown;
+        if (parsed && typeof parsed === "object" && "mcpServers" in parsed) {
+          const servers = (parsed as { mcpServers?: unknown }).mcpServers;
+          if (servers && typeof servers === "object" && !Array.isArray(servers)) {
+            for (const name of Object.keys(servers)) {
+              mcpServers.add(name);
+            }
+          }
+        }
+      } catch {
+        // Invalid JSON is left for the editor to surface when the user opens it.
+      }
+    }
+
+    this.projectCommands = await loadProjectCommands(folders);
     this.post({
       type: "integrations",
-      skills: skills.sort((a, b) => a.name.localeCompare(b.name)),
-      mcpServers: mcpServers.sort((a, b) => a.localeCompare(b)),
+      skills: [...skillsByName.values()].sort((a, b) => a.name.localeCompare(b.name)),
+      mcpServers: [...mcpServers].sort((a, b) => a.localeCompare(b)),
+      commands: this.projectCommands.map(({ id, label, description, source }) => ({
+        id,
+        label,
+        description,
+        source,
+      })),
     });
   }
 
   private async openSkillsFolder(): Promise<void> {
-    const workspace = vscode.workspace.workspaceFolders?.[0];
+    const workspace = resolveWorkspaceFolder()
+      ?? await pickWorkspaceFolder(
+        localize("Select a workspace for Skills", "Skills用のワークスペースを選択"),
+      );
     if (!workspace) {
       return;
     }
@@ -3907,7 +4476,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private async openMcpSettings(): Promise<void> {
-    const workspace = vscode.workspace.workspaceFolders?.[0];
+    const workspace = resolveWorkspaceFolder()
+      ?? await pickWorkspaceFolder(
+        localize("Select a workspace for MCP settings", "MCP設定用のワークスペースを選択"),
+      );
     if (!workspace) {
       return;
     }
@@ -4151,6 +4723,32 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           soundWhileRunning: "処理中の音",
           soundOnComplete: "完了時の音",
           soundOnError: "エラー時の音",
+          usageTitle: "使用量",
+          usageToday: "今日",
+          usageWeek: "直近7日",
+          usageChat: "チャット",
+          usageSupervisor: "Supervisor",
+          usageConversations: "会話合計",
+          searchConversations: "会話を検索",
+          pinConversation: "ピン留め",
+          unpinConversation: "ピン解除",
+          exportConversation: "書き出し",
+          tokensLabel: "トークン",
+          noMatchingConversations: "一致する会話がありません",
+          projectMemory: "プロジェクト記憶",
+          projectMemoryOn: "rules / project-memory を含める",
+          projectMemoryOff: "rules / project-memory を除外",
+          projectCommands: "プロジェクトコマンド",
+          userCommand: "ユーザー",
+          projectCommand: "プロジェクト",
+          bestOfNDescription: "同じ指示を複数会話で並列実行して比較",
+          pickWinner: "勝者にする",
+          compareRuns: "比較",
+          compareTitle: "best-of-N 比較",
+          contextPreview: "送信コンテキスト",
+          openCandidate: "開く",
+          experimentsTitle: "比較実験",
+          noAssistantYet: "まだ応答がありません",
         }
       : {
           history: "Conversation history",
@@ -4255,6 +4853,32 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           soundWhileRunning: "While running",
           soundOnComplete: "On completion",
           soundOnError: "On error",
+          usageTitle: "Usage",
+          usageToday: "Today",
+          usageWeek: "Last 7 days",
+          usageChat: "Chat",
+          usageSupervisor: "Supervisor",
+          usageConversations: "All conversations",
+          searchConversations: "Search conversations",
+          pinConversation: "Pin",
+          unpinConversation: "Unpin",
+          exportConversation: "Export",
+          tokensLabel: "tokens",
+          noMatchingConversations: "No matching conversations",
+          projectMemory: "Project memory",
+          projectMemoryOn: "Include rules / project-memory",
+          projectMemoryOff: "Exclude rules / project-memory",
+          projectCommands: "Project commands",
+          userCommand: "User",
+          projectCommand: "Project",
+          bestOfNDescription: "Run the same prompt in parallel chats to compare",
+          pickWinner: "Pick as winner",
+          compareRuns: "Compare",
+          compareTitle: "best-of-N compare",
+          contextPreview: "Send context",
+          openCandidate: "Open",
+          experimentsTitle: "Compare experiments",
+          noAssistantYet: "No assistant reply yet",
         };
 
     return /* html */ `<!doctype html>
@@ -4538,6 +5162,111 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       font-size: 12px;
       font-weight: 600;
     }
+    #usagePanel {
+      margin: 0 0 10px;
+      padding: 8px 10px;
+      border: 1px solid var(--vscode-widget-border, transparent);
+      border-radius: 10px;
+      background: color-mix(in srgb, var(--vscode-sideBar-background) 88%, var(--vscode-foreground) 12%);
+    }
+    #experimentsPanel,
+    #comparePanel {
+      margin: 0 0 10px;
+      padding: 8px 10px;
+      border: 1px solid var(--vscode-widget-border, transparent);
+      border-radius: 10px;
+    }
+    .compare-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .compare-prompt {
+      margin: 0 0 8px;
+      color: var(--muted);
+      font-size: 11px;
+      white-space: pre-wrap;
+    }
+    .compare-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+    .compare-card {
+      padding: 8px;
+      border: 1px solid var(--vscode-widget-border, transparent);
+      border-radius: 8px;
+      background: var(--vscode-editor-background);
+    }
+    .compare-card.winner {
+      border-color: var(--vscode-focusBorder);
+    }
+    .compare-card-title {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 6px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .compare-card-body {
+      max-height: 160px;
+      overflow: auto;
+      color: var(--muted);
+      font-size: 11px;
+      white-space: pre-wrap;
+    }
+    .compare-card-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    #contextPreviewRow {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin-bottom: 6px;
+    }
+    .preview-chip {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
+      font-size: 10px;
+    }
+    .usage-title {
+      margin-bottom: 6px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .usage-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px 10px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .usage-grid strong {
+      color: var(--vscode-foreground);
+      font-weight: 600;
+    }
+    #taskSearch {
+      width: 100%;
+      margin: 0 0 8px;
+      padding: 6px 8px;
+      border: 1px solid var(--vscode-input-border, transparent);
+      border-radius: 8px;
+      color: var(--vscode-input-foreground);
+      background: var(--vscode-input-background);
+      font: inherit;
+      outline: none;
+    }
+    #taskSearch:focus {
+      border-color: var(--vscode-focusBorder);
+    }
     .task-row {
       display: flex;
       align-items: center;
@@ -4547,25 +5276,40 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       cursor: pointer;
     }
     .task-row:hover { background: var(--vscode-list-hoverBackground); }
+    .task-row.pinned .task-title::before {
+      content: "📌 ";
+    }
     .task-title {
       flex: 1;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    .task-time {
+    .task-meta {
+      display: flex;
       flex: none;
+      align-items: center;
+      gap: 6px;
       font-size: 11px;
       color: var(--muted);
     }
-    .task-delete {
+    .task-tokens {
+      font-variant-numeric: tabular-nums;
+    }
+    .task-actions {
       display: none;
+      flex: none;
+      align-items: center;
+      gap: 2px;
+    }
+    .task-action {
+      display: inline-flex;
       align-items: center;
       justify-content: center;
       width: 18px;
       height: 18px;
       padding: 0;
-      font-size: 13px;
+      font-size: 12px;
       line-height: 1;
       color: var(--muted);
       background: transparent;
@@ -4573,9 +5317,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       border-radius: 4px;
       cursor: pointer;
     }
+    .task-action:hover { color: var(--vscode-foreground); }
     .task-delete:hover { color: var(--vscode-errorForeground); }
-    .task-row:hover .task-time { display: none; }
-    .task-row:hover .task-delete { display: inline-flex; }
+    .task-row:hover .task-meta { display: none; }
+    .task-row:hover .task-actions { display: inline-flex; }
+    #taskEmpty {
+      padding: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
     #viewAll {
       padding: 6px 8px;
       font-size: 12px;
@@ -5142,7 +5892,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       font-size: 11px;
       cursor: pointer;
     }
-    #contextRow { padding-bottom: 6px; }
+    #contextRow {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding-bottom: 6px;
+    }
     .ctx-chip {
       display: inline-flex;
       align-items: center;
@@ -5153,8 +5908,17 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       color: var(--muted);
       background: var(--vscode-toolbar-hoverBackground);
       border-radius: 8px;
+      border: 0;
     }
     .ctx-chip svg { width: 12px; height: 12px; flex: none; }
+    .memory-chip {
+      cursor: pointer;
+      opacity: .9;
+    }
+    .memory-chip[aria-pressed="false"] {
+      opacity: .5;
+      text-decoration: line-through;
+    }
     #ctxLabel {
       overflow: hidden;
       text-overflow: ellipsis;
@@ -5528,8 +6292,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     <span class="spacer"></span>
     <button id="featureSettingsButton" class="icon-btn" type="button" title="${ui.featureSettings}" aria-label="${ui.featureSettings}">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="8" cy="8" r="2.2"/>
-        <path d="M8 1.8v1.4M8 12.8v1.4M1.8 8h1.4M12.8 8h1.4M3.6 3.6l1 1M11.4 11.4l1 1M12.4 3.6l-1 1M4.6 11.4l-1 1"/>
+        <circle cx="8" cy="8" r="2"/>
+        <path d="M6.5 1.6h3l.45 1.9 1.55.9 1.9-.5 1.5 2.6-1.45 1.2v1.8l1.45 1.2-1.5 2.6-1.9-.5-1.55.9L9.5 14.4h-3l-.45-1.9-1.55-.9-1.9.5-1.5-2.6 1.45-1.2V7.8L1.6 6.6l1.5-2.6 1.9.5 1.55-.9z"/>
       </svg>
     </button>
     <div class="sound-control">
@@ -5590,9 +6354,33 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   <div id="scroller">
     <div id="messages" aria-live="polite" style="display: none;"></div>
     <div id="home">
+      <div id="usagePanel" hidden>
+        <div class="usage-title">${ui.usageTitle}</div>
+        <div class="usage-grid">
+          <div>${ui.usageToday}: <strong id="usageTodayTotal">0</strong></div>
+          <div>${ui.usageWeek}: <strong id="usageWeekTotal">0</strong></div>
+          <div>${ui.usageChat}: <strong id="usageChatTotal">0</strong></div>
+          <div>${ui.usageSupervisor}: <strong id="usageSupervisorTotal">0</strong></div>
+          <div>${ui.usageConversations}: <strong id="usageConversationTotal">0</strong></div>
+        </div>
+      </div>
+      <div id="experimentsPanel" hidden>
+        <div class="tasks-title">${ui.experimentsTitle}</div>
+        <div id="experimentList"></div>
+      </div>
+      <div id="comparePanel" hidden>
+        <div class="compare-header">
+          <div class="tasks-title">${ui.compareTitle}</div>
+          <button id="compareClose" class="task-action" type="button" title="${ui.back}">×</button>
+        </div>
+        <div id="comparePrompt" class="compare-prompt"></div>
+        <div id="compareGrid" class="compare-grid"></div>
+      </div>
       <div id="tasks" hidden>
         <div class="tasks-title">${ui.tasks}</div>
+        <input id="taskSearch" type="search" placeholder="${ui.searchConversations}" aria-label="${ui.searchConversations}">
         <div id="taskList"></div>
+        <div id="taskEmpty" hidden>${ui.noMatchingConversations}</div>
         <button id="viewAll" type="button" hidden></button>
       </div>
       <div class="ghost">
@@ -5610,8 +6398,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     </div>
     <div class="card">
       <div id="dropHint" aria-live="polite">${ui.dropFiles}</div>
-      <div id="contextRow" hidden>
-        <span class="ctx-chip">
+      <div id="contextPreviewRow" aria-label="${ui.contextPreview}" hidden></div>
+      <div id="contextRow">
+        <span id="editorChip" class="ctx-chip" hidden>
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
             <path d="M9.5 1.5H4.5a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V4.5l-3-3z"/>
             <path d="M9.5 1.5v3h3"/>
@@ -5619,6 +6408,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           <span id="ctxLabel"></span>
           <button id="ctxRemove" type="button" title="${ui.detach}">×</button>
         </span>
+        <button id="memoryChip" class="ctx-chip memory-chip" type="button" title="${ui.projectMemoryOn}" aria-pressed="true">
+          <span id="memoryChipLabel">${ui.projectMemory}</span>
+        </button>
       </div>
       <div id="mentionRow" aria-label="${ui.referencedFiles}" hidden></div>
       <div id="queueRow" aria-label="${ui.queuedMessages}" hidden></div>
@@ -5699,6 +6491,21 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const home = document.getElementById("home");
     const tasks = document.getElementById("tasks");
     const taskList = document.getElementById("taskList");
+    const taskEmpty = document.getElementById("taskEmpty");
+    const taskSearch = document.getElementById("taskSearch");
+    const usagePanel = document.getElementById("usagePanel");
+    const usageTodayTotal = document.getElementById("usageTodayTotal");
+    const usageWeekTotal = document.getElementById("usageWeekTotal");
+    const usageChatTotal = document.getElementById("usageChatTotal");
+    const usageSupervisorTotal = document.getElementById("usageSupervisorTotal");
+    const usageConversationTotal = document.getElementById("usageConversationTotal");
+    const experimentsPanel = document.getElementById("experimentsPanel");
+    const experimentList = document.getElementById("experimentList");
+    const comparePanel = document.getElementById("comparePanel");
+    const comparePrompt = document.getElementById("comparePrompt");
+    const compareGrid = document.getElementById("compareGrid");
+    const compareClose = document.getElementById("compareClose");
+    const contextPreviewRow = document.getElementById("contextPreviewRow");
     const viewAll = document.getElementById("viewAll");
     const parallelBar = document.getElementById("parallelBar");
     const parallelBarTitle = document.getElementById("parallelBarTitle");
@@ -5736,8 +6543,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const modelOptionsPane = document.getElementById("modelOptionsPane");
     const modelOptions = document.getElementById("modelOptions");
     const contextRow = document.getElementById("contextRow");
+    const editorChip = document.getElementById("editorChip");
     const ctxLabel = document.getElementById("ctxLabel");
     const ctxRemove = document.getElementById("ctxRemove");
+    const memoryChip = document.getElementById("memoryChip");
+    const memoryChipLabel = document.getElementById("memoryChipLabel");
     const mentionRow = document.getElementById("mentionRow");
     const queueRow = document.getElementById("queueRow");
     const runningActions = document.getElementById("runningActions");
@@ -5761,9 +6571,16 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const runningSoundVoices = new Set();
     let sandboxUnavailable = false;
     let attach = false;
+    let includeProjectMemory = true;
+    let projectCommands = [];
     let view = "home";
     let allConversations = [];
     let tasksExpanded = false;
+    let conversationSearchQuery = "";
+    let conversationSearchTimer;
+    let usageSummary = null;
+    let bestOfNExperiments = [];
+    let contextEstimateTimer;
     let selectedFiles = [];
     let fileResults = [];
     let selectedFileIndex = 0;
@@ -5850,10 +6667,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       runProfile = profile;
       updateProfileChip();
       closeAddMenu();
+      requestContextPreview();
     }
 
     function slashCommands() {
-      return [
+      const builtins = [
         {
           id: "agent",
           aliases: ["agent", "standard"],
@@ -5878,18 +6696,61 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           icon: "⑂",
           profile: "multitask",
         },
+        {
+          id: "compare",
+          aliases: ["compare", "bestofn"],
+          label: "/compare",
+          description: i18n.bestOfNDescription,
+          icon: "☰",
+          bestOfN: true,
+        },
       ];
+      const templates = projectCommands.map((command) => ({
+        id: command.id,
+        aliases: [command.id],
+        label: command.label,
+        description: command.description
+          + (command.source === "user" ? " · " + i18n.userCommand : " · " + i18n.projectCommand),
+        icon: "/",
+        commandId: command.id,
+      }));
+      return builtins.concat(templates);
     }
 
     function consumeLeadingSlashCommand(text) {
-      const match = /^\\/(agent|standard|plan|multitask)(?:\\s+|$)/i.exec(text);
-      if (!match) return { text, profile: undefined };
-      const command = match[1].toLowerCase();
-      const profile = command === "standard" || command === "agent" ? "agent" : command;
-      return {
-        text: text.slice(match[0].length).replace(/^\\s+/, ""),
-        profile,
-      };
+      const compareMatch = /^\\/(compare|bestofn)(?:\\s+|$)/i.exec(text);
+      if (compareMatch) {
+        return {
+          text: text.slice(compareMatch[0].length).replace(/^\\s+/, ""),
+          profile: undefined,
+          commandId: undefined,
+          bestOfN: true,
+        };
+      }
+      const profileMatch = /^\\/(agent|standard|plan|multitask)(?:\\s+|$)/i.exec(text);
+      if (profileMatch) {
+        const command = profileMatch[1].toLowerCase();
+        const profile = command === "standard" || command === "agent" ? "agent" : command;
+        return {
+          text: text.slice(profileMatch[0].length).replace(/^\\s+/, ""),
+          profile,
+          commandId: undefined,
+          bestOfN: false,
+        };
+      }
+      const templateMatch = /^\\/([a-z0-9][a-z0-9_-]{0,63})(?:\\s+|$)/i.exec(text);
+      if (templateMatch) {
+        const commandId = templateMatch[1].toLowerCase();
+        if (projectCommands.some((command) => command.id === commandId)) {
+          return {
+            text: text.slice(templateMatch[0].length).replace(/^\\s+/, ""),
+            profile: undefined,
+            commandId,
+            bestOfN: false,
+          };
+        }
+      }
+      return { text, profile: undefined, commandId: undefined, bestOfN: false };
     }
 
     function renderMainAddMenu() {
@@ -6236,19 +7097,164 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return new Date(ts).toLocaleDateString();
     }
 
+    function formatTokens(value) {
+      const amount = Number(value) || 0;
+      if (amount >= 1000000) {
+        return (amount / 1000000).toFixed(amount >= 10000000 ? 0 : 1) + "M";
+      }
+      if (amount >= 1000) {
+        return (amount / 1000).toFixed(amount >= 10000 ? 0 : 1) + "k";
+      }
+      return String(Math.round(amount));
+    }
+
+    function renderUsagePanel() {
+      if (!usageSummary) {
+        usagePanel.hidden = true;
+        return;
+      }
+      usagePanel.hidden = false;
+      usageTodayTotal.textContent = formatTokens(usageSummary.today.total);
+      usageWeekTotal.textContent = formatTokens(usageSummary.last7Days.total);
+      usageChatTotal.textContent = formatTokens(usageSummary.last7Days.chat);
+      usageSupervisorTotal.textContent = formatTokens(usageSummary.last7Days.supervisor);
+      usageConversationTotal.textContent = formatTokens(usageSummary.conversationTotal);
+    }
+
+    function renderExperiments() {
+      experimentList.innerHTML = "";
+      experimentsPanel.hidden = bestOfNExperiments.length === 0 || !comparePanel.hidden;
+      for (const experiment of bestOfNExperiments) {
+        const row = document.createElement("div");
+        row.className = "task-row";
+        const title = document.createElement("span");
+        title.className = "task-title";
+        title.textContent = experiment.prompt.split("\\n")[0] || experiment.id;
+        const meta = document.createElement("span");
+        meta.className = "task-meta";
+        meta.textContent = experiment.candidateCount + " · " + relTime(experiment.createdAt);
+        const actions = document.createElement("span");
+        actions.className = "task-actions";
+        const compare = document.createElement("button");
+        compare.className = "task-action";
+        compare.type = "button";
+        compare.textContent = "⇄";
+        compare.title = i18n.compareRuns;
+        compare.addEventListener("click", (event) => {
+          event.stopPropagation();
+          vscode.postMessage({ type: "compareBestOfN", id: experiment.id });
+        });
+        actions.appendChild(compare);
+        row.append(title, meta, actions);
+        row.addEventListener("click", () => {
+          vscode.postMessage({ type: "compareBestOfN", id: experiment.id });
+        });
+        experimentList.appendChild(row);
+      }
+    }
+
+    function renderCompare(experiment) {
+      if (!experiment) {
+        comparePanel.hidden = true;
+        renderExperiments();
+        return;
+      }
+      comparePanel.hidden = false;
+      experimentsPanel.hidden = true;
+      comparePrompt.textContent = experiment.prompt;
+      compareGrid.innerHTML = "";
+      for (const candidate of experiment.candidates || []) {
+        const card = document.createElement("div");
+        card.className = "compare-card" + (candidate.isWinner ? " winner" : "");
+        const heading = document.createElement("div");
+        heading.className = "compare-card-title";
+        heading.textContent = (candidate.isWinner ? "★ " : "") + candidate.title
+          + (candidate.running ? " · " + i18n.running : "")
+          + (candidate.totalTokens ? " · " + formatTokens(candidate.totalTokens) : "");
+        const body = document.createElement("div");
+        body.className = "compare-card-body";
+        body.textContent = candidate.lastAssistant || i18n.noAssistantYet;
+        const actions = document.createElement("div");
+        actions.className = "compare-card-actions";
+        const open = document.createElement("button");
+        open.type = "button";
+        open.textContent = i18n.openCandidate;
+        open.addEventListener("click", () => {
+          vscode.postMessage({ type: "openConversation", id: candidate.id });
+        });
+        actions.appendChild(open);
+        if (!candidate.running) {
+          const winner = document.createElement("button");
+          winner.type = "button";
+          winner.textContent = i18n.pickWinner;
+          winner.addEventListener("click", () => {
+            vscode.postMessage({ type: "pickBestOfNWinner", id: candidate.id });
+          });
+          actions.appendChild(winner);
+        }
+        card.append(heading, body, actions);
+        compareGrid.appendChild(card);
+      }
+    }
+
+    function requestContextPreview() {
+      clearTimeout(contextEstimateTimer);
+      contextEstimateTimer = setTimeout(() => {
+        const consumed = consumeLeadingSlashCommand(prompt.value.trim());
+        vscode.postMessage({
+          type: "estimateContext",
+          prompt: consumed.text || prompt.value,
+          profile: consumed.profile || runProfile,
+          includeProjectMemory,
+          attachContext: attach,
+          path: ctxLabel.textContent || undefined,
+          files: selectedFiles.map((file) => file.path),
+          skills: selectedSkills.slice(),
+          commandId: consumed.commandId,
+        });
+      }, 160);
+    }
+
+    function renderContextPreview(chips) {
+      contextPreviewRow.innerHTML = "";
+      if (!chips || chips.length === 0) {
+        contextPreviewRow.hidden = true;
+        return;
+      }
+      contextPreviewRow.hidden = false;
+      for (const chip of chips) {
+        const node = document.createElement("span");
+        node.className = "preview-chip";
+        node.textContent = chip.label;
+        contextPreviewRow.appendChild(node);
+      }
+    }
+
     function renderTasks() {
       taskList.innerHTML = "";
-      tasks.hidden = allConversations.length === 0;
+      const searching = conversationSearchQuery.trim().length > 0;
+      tasks.hidden = allConversations.length === 0 && !searching;
+      taskEmpty.hidden = allConversations.length > 0 || !searching;
       const items = tasksExpanded ? allConversations : allConversations.slice(0, 5);
       for (const conv of items) {
         const row = document.createElement("div");
-        row.className = "task-row" + (conv.running ? " running" : "");
+        row.className = "task-row"
+          + (conv.running ? " running" : "")
+          + (conv.pinned ? " pinned" : "");
         row.title = conv.title;
 
         const title = document.createElement("span");
         title.className = "task-title";
         title.textContent = conv.title;
 
+        const meta = document.createElement("span");
+        meta.className = "task-meta";
+        const tokens = document.createElement("span");
+        tokens.className = "task-tokens";
+        if (conv.totalTokens > 0) {
+          tokens.textContent = formatTokens(conv.totalTokens);
+          tokens.title = formatTokens(conv.totalTokens) + " " + i18n.tokensLabel;
+        }
         const time = document.createElement("span");
         time.className = "task-time";
         time.textContent = conv.running
@@ -6256,9 +7262,33 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           : conv.queued
             ? "◷ " + i18n.queuedTask
             : relTime(conv.updatedAt);
+        meta.append(tokens, time);
+
+        const actions = document.createElement("span");
+        actions.className = "task-actions";
+
+        const pin = document.createElement("button");
+        pin.className = "task-action";
+        pin.type = "button";
+        pin.textContent = conv.pinned ? "★" : "☆";
+        pin.title = conv.pinned ? i18n.unpinConversation : i18n.pinConversation;
+        pin.addEventListener("click", (event) => {
+          event.stopPropagation();
+          vscode.postMessage({ type: "pinConversation", id: conv.id, pinned: !conv.pinned });
+        });
+
+        const exp = document.createElement("button");
+        exp.className = "task-action";
+        exp.type = "button";
+        exp.textContent = "⇪";
+        exp.title = i18n.exportConversation;
+        exp.addEventListener("click", (event) => {
+          event.stopPropagation();
+          vscode.postMessage({ type: "exportConversation", id: conv.id, format: "markdown" });
+        });
 
         const del = document.createElement("button");
-        del.className = "task-delete";
+        del.className = "task-action task-delete";
         del.type = "button";
         del.textContent = "×";
         del.title = i18n.deleteConversation;
@@ -6267,7 +7297,20 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           vscode.postMessage({ type: "deleteConversation", id: conv.id });
         });
 
-        row.append(title, time, del);
+        if (conv.experimentGroupId && !conv.running) {
+          const winner = document.createElement("button");
+          winner.className = "task-action";
+          winner.type = "button";
+          winner.textContent = "✓";
+          winner.title = i18n.pickWinner;
+          winner.addEventListener("click", (event) => {
+            event.stopPropagation();
+            vscode.postMessage({ type: "pickBestOfNWinner", id: conv.id });
+          });
+          actions.appendChild(winner);
+        }
+        actions.append(pin, exp, del);
+        row.append(title, meta, actions);
         row.addEventListener("click", () => vscode.postMessage({ type: "openConversation", id: conv.id }));
         taskList.appendChild(row);
       }
@@ -6365,16 +7408,22 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       scroller.scrollTop = 0;
     }
 
-    function showHome(convs) {
+    function showHome(convs, query) {
       view = "home";
       setRunningState(false);
       if (convs) {
         allConversations = convs;
         tasksExpanded = false;
       }
+      if (typeof query === "string" && taskSearch.value !== query) {
+        conversationSearchQuery = query;
+        taskSearch.value = query;
+      }
       clearMessages();
       home.style.display = "flex";
       messages.style.display = "none";
+      renderUsagePanel();
+      renderExperiments();
       renderTasks();
     }
 
@@ -6407,8 +7456,16 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     function setAttach(value) {
       attach = value;
       updateProfileChip();
-      contextRow.hidden = !attach;
+      editorChip.hidden = !attach;
       if (attach) vscode.postMessage({ type: "getContext" });
+      requestContextPreview();
+    }
+
+    function setIncludeProjectMemory(value) {
+      includeProjectMemory = value;
+      memoryChip.setAttribute("aria-pressed", String(value));
+      memoryChip.title = value ? i18n.projectMemoryOn : i18n.projectMemoryOff;
+      memoryChipLabel.textContent = i18n.projectMemory;
     }
 
     function setApprovalMode(mode) {
@@ -6546,6 +7603,28 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
 
     function selectSlashCommand(command) {
+      if (command.bestOfN) {
+        const before = slashRange ? prompt.value.slice(0, slashRange.start) : "";
+        const after = slashRange ? prompt.value.slice(slashRange.end) : prompt.value;
+        prompt.value = before + "/compare " + after.replace(/^\\s+/, "");
+        const caret = before.length + "/compare ".length;
+        prompt.selectionStart = prompt.selectionEnd = caret;
+        closeSlashPicker();
+        autoGrow();
+        prompt.focus();
+        return;
+      }
+      if (command.commandId) {
+        const before = slashRange ? prompt.value.slice(0, slashRange.start) : "";
+        const after = slashRange ? prompt.value.slice(slashRange.end) : prompt.value;
+        prompt.value = before + "/" + command.commandId + " " + after.replace(/^\\s+/, "");
+        const caret = before.length + command.commandId.length + 2;
+        prompt.selectionStart = prompt.selectionEnd = caret;
+        closeSlashPicker();
+        autoGrow();
+        prompt.focus();
+        return;
+      }
       if (slashRange) {
         prompt.value = prompt.value.slice(0, slashRange.start) + prompt.value.slice(slashRange.end);
         prompt.selectionStart = prompt.selectionEnd = slashRange.start;
@@ -6642,6 +7721,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         chip.append(label, remove);
         mentionRow.appendChild(chip);
       }
+      requestContextPreview();
     }
 
     function addTransferValue(references, value) {
@@ -7175,7 +8255,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }
     }
 
-    function messagePayload(type, text, files) {
+    function messagePayload(type, text, files, commandId) {
       return {
         type,
         prompt: text,
@@ -7187,6 +8267,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           : [],
         profile: runProfile,
         skills: selectedSkills.slice(),
+        commandId,
+        includeProjectMemory,
       };
     }
 
@@ -7373,7 +8455,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         updateProfileChip();
       }
       const text = consumed.text;
-      if (!text) {
+      if (!text && !consumed.commandId) {
         if (consumed.profile) {
           prompt.value = "";
           closeSlashPicker();
@@ -7382,23 +8464,43 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         return;
       }
       const files = selectedFiles.slice();
+      const displayText = consumed.bestOfN
+        ? (text ? "/compare " + text : "/compare")
+        : consumed.commandId
+          ? (text ? "/" + consumed.commandId + " " + text : "/" + consumed.commandId)
+          : text;
+
+      if (consumed.bestOfN) {
+        if (!text) {
+          return;
+        }
+        showChat();
+        followOutput = true;
+        addUserMessage(displayText, files);
+        assistantRaw = "";
+        assistantNode = addAssistantMessage("");
+        clearComposerMessage();
+        primeRunningSound();
+        vscode.postMessage(messagePayload("startBestOfN", text, files));
+        return;
+      }
 
       if (running) {
         const type = action === "interrupt" ? "interruptMessage" : "queueMessage";
         clearComposerMessage();
-        vscode.postMessage(messagePayload(type, text, files));
+        vscode.postMessage(messagePayload(type, text, files, consumed.commandId));
         prompt.focus();
         return;
       }
 
       showChat();
       followOutput = true;
-      addUserMessage(text, files);
+      addUserMessage(displayText, files);
       assistantRaw = "";
       assistantNode = addAssistantMessage("");
       clearComposerMessage();
       primeRunningSound();
-      vscode.postMessage(messagePayload("send", text, files));
+      vscode.postMessage(messagePayload("send", text, files, consumed.commandId));
     }
 
     sendButton.addEventListener("click", () => {
@@ -7467,6 +8569,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       tasksExpanded = true;
       renderTasks();
     });
+    taskSearch.addEventListener("input", () => {
+      conversationSearchQuery = taskSearch.value;
+      clearTimeout(conversationSearchTimer);
+      conversationSearchTimer = setTimeout(() => {
+        vscode.postMessage({ type: "searchConversations", query: conversationSearchQuery });
+      }, 180);
+    });
     attachButton.addEventListener("click", () => {
       if (addMenu.hidden) {
         openAddMenu();
@@ -7476,6 +8585,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     });
     profileChip.addEventListener("click", openAddMenu);
     ctxRemove.addEventListener("click", () => setAttach(false));
+    compareClose.addEventListener("click", () => {
+      renderCompare(null);
+    });
+    memoryChip.addEventListener("click", () => {
+      setIncludeProjectMemory(!includeProjectMemory);
+      requestContextPreview();
+    });
+    setIncludeProjectMemory(true);
     approvalSelect.addEventListener("change", () => {
       setApprovalMode(approvalSelect.value);
       vscode.postMessage({ type: "selectApprovalMode", approvalMode: approvalSelect.value });
@@ -7650,10 +8767,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       autoGrow();
       updateComposerSuggestions();
       schedulePromptFocusRestore();
+      requestContextPreview();
     });
     prompt.addEventListener("compositionend", () => {
       autoGrow();
       updateComposerSuggestions();
+      requestContextPreview();
     });
     prompt.addEventListener("click", updateComposerSuggestions);
     prompt.addEventListener("keydown", (event) => {
@@ -7773,6 +8892,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         case "integrations":
           availableSkills = data.skills || [];
           availableMcpServers = data.mcpServers || [];
+          projectCommands = data.commands || [];
           selectedSkills = selectedSkills.filter((name) =>
             availableSkills.some((skill) => skill.name === name));
           updateProfileChip();
@@ -7801,7 +8921,30 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           status.textContent = i18n.sandboxUnavailable;
           break;
         case "home":
-          showHome(data.conversations);
+          showHome(data.conversations, data.searchQuery);
+          break;
+        case "usageStats":
+          usageSummary = data.summary || null;
+          renderUsagePanel();
+          if (view === "home") {
+            renderTasks();
+          }
+          break;
+        case "bestOfNExperiments":
+          bestOfNExperiments = data.experiments || [];
+          if (view === "home") {
+            renderExperiments();
+          }
+          break;
+        case "bestOfNCompare":
+          view = "home";
+          home.style.display = "flex";
+          messages.style.display = "none";
+          setRunningState(false);
+          renderCompare(data.experiment);
+          break;
+        case "contextPreview":
+          renderContextPreview(data.chips || []);
           break;
         case "newChat":
           setRunningState(false);

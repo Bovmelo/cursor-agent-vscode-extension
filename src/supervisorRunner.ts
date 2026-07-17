@@ -160,13 +160,18 @@ export class SupervisorAgentRunner implements vscode.Disposable {
         };
       }
       if (result.status === "finished") {
-        return { status: "finished", ...this.completionMetadata(assistantText) };
+        return {
+          status: "finished",
+          usage: result.usage,
+          ...this.completionMetadata(assistantText),
+        };
       }
       if (result.status === "cancelled") {
-        return { status: "cancelled" };
+        return { status: "cancelled", usage: result.usage };
       }
       return {
         status: "error",
+        usage: result.usage,
         error: result.error?.message
           || assistantText
           || this.text("The Supervisor run failed.", "Supervisor実行に失敗しました。"),

@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { spawn, type ChildProcess } from "node:child_process";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { configurationFor } from "./workspaceFolder.js";
 
 const CONFIG_SECTION = "cursorSubscription";
 const CONFIG_KEY = "playSoundWhileRunning";
@@ -90,10 +91,7 @@ export class RunningSoundController implements vscode.Disposable {
   }
 
   private configuration(): vscode.WorkspaceConfiguration {
-    return vscode.workspace.getConfiguration(
-      CONFIG_SECTION,
-      vscode.workspace.workspaceFolders?.[0]?.uri,
-    );
+    return configurationFor(CONFIG_SECTION);
   }
 
   private playOneShot(

@@ -2,7 +2,7 @@
   "name": "cursor-subscription-for-vscode",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "publisher": "ark4ez",
   "license": "MIT",
   "type": "module",
@@ -53,7 +53,8 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "validate:webview": "node scripts/validate-webview.mjs",
-    "validate": "npm run compile && npm run validate:webview",
+    "test": "npm run compile && node --test test/*.test.mjs",
+    "validate": "npm run compile && npm run validate:webview && node --test test/*.test.mjs",
     "vscode:prepublish": "npm run validate",
     "package": "vsce package",
     "publish": "vsce publish"
@@ -85,6 +86,10 @@
         "command": "cursorSubscription.generateCommitMessage",
         "title": "%command.generateCommitMessage%",
         "icon": "$(sparkle)"
+      },
+      {
+        "command": "cursorSubscription.createPullRequest",
+        "title": "%command.createPullRequest%"
       },
       {
         "command": "cursorSubscription.generateCode",
@@ -340,6 +345,40 @@
           "order": 2,
           "description": "%config.maxParallelChatAgents.description%"
         },
+        "cursorSubscription.bestOfNCount": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 2,
+          "maximum": 5,
+          "order": 2,
+          "description": "%config.bestOfNCount.description%"
+        },
+        "cursorSubscription.offerPullRequestAfterVerify": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.offerPullRequestAfterVerify.description%"
+        },
+        "cursorSubscription.defaultBaseBranch": {
+          "type": "string",
+          "default": "main",
+          "description": "%config.defaultBaseBranch.description%"
+        },
+        "cursorSubscription.preEditCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "%config.preEditCommands.description%"
+        },
+        "cursorSubscription.postEditCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "%config.postEditCommands.description%"
+        },
         "cursorSubscription.enableAiSupervisor": {
           "type": "boolean",
           "default": true,
@@ -418,6 +457,20 @@
           "type": "boolean",
           "default": false,
           "description": "%config.supervisorAutoApplySafeChanges.description%"
+        },
+        "cursorSubscription.supervisorAutoApplyGlobs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/*.md",
+            "**/*.test.*",
+            "**/*.spec.*",
+            "**/test/**",
+            "**/tests/**"
+          ],
+          "description": "%config.supervisorAutoApplyGlobs.description%"
         },
         "cursorSubscription.enableAutopilot": {
           "type": "boolean",
