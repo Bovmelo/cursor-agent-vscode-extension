@@ -10,19 +10,19 @@ Run [Cursor](https://cursor.com) agents from the VS Code sidebar with your Curso
 
 ### Run independent agents in parallel
 
-![Parallel agents running in the VS Code sidebar](media/marketplace-parallel-agents.png)
+![Parallel agents running in the VS Code sidebar](media/marketplace-parallel-agents.jpg)
 
 Start another conversation while the current agent keeps working, then switch between live runs from the parallel-agent bar.
 
 ### Let Supervisor work in isolation, then review the diff
 
-![AI Supervisor isolated worktree, diff review, and apply flow](media/marketplace-supervisor-review.png)
+![AI Supervisor isolated worktree, diff review, and apply flow](media/marketplace-supervisor-review.jpg)
 
 Supervisor runs in a detached Git worktree and returns per-file diffs, reasons, and apply/discard controls.
 
 ### Restore checkpoints without losing a dirty baseline
 
-![Checkpoint restore preserving pre-existing dirty files](media/marketplace-checkpoint-restore.png)
+![Checkpoint restore preserving pre-existing dirty files](media/marketplace-checkpoint-restore.jpg)
 
 Change sessions distinguish your pre-existing uncommitted work from AI edits, so restore removes only the agent's changes.
 
