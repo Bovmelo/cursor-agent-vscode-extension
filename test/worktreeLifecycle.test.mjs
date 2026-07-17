@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import {
   access,
   lstat,
@@ -83,9 +85,16 @@ test("managed worktrees clean up preparation failures and dead-process orphans",
       "a live extension-host lease must protect another window's worktree",
     );
 
+    const exitedProcess = spawn(process.execPath, ["-e", ""], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    assert.ok(exitedProcess.pid);
+    const exitedPid = exitedProcess.pid;
+    await once(exitedProcess, "exit");
     await writeFile(
       worktreeLeasePath(orphanPath),
-      JSON.stringify({ pid: 2_147_483_647, root: repository, createdAt: Date.now() }),
+      JSON.stringify({ pid: exitedPid, root: repository, createdAt: Date.now() }),
       "utf8",
     );
     const removed = await cleanupOrphanedManagedWorktrees(repository, [homeSegment]);
