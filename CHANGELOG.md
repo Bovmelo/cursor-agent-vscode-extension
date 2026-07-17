@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.1.16 - 2026-07-17
+
+- Add Supervisor TODO(ai) and failed-test triggers, task priority ordering, and an optional AI review gate before apply
+- Add **Cursor: Run Task Pipeline** (GitHub Issue / TODO(ai) / free text → Autopilot → verify → optional auto PR)
+- Add `/orchestrate` planning, parallel subtask fan-out, and synthesis
+- Add daily token budget warnings, AI audit-log export, Workspace Trust restrictions, and a Rules/Skills/MCP management view
+- Promote inline completions to a production-ready path with configurable limits, in-flight deduplication, project rules, token/cost guards, and acceptance metrics
+- Run dependency-aware Supervisor tasks concurrently in isolated worktrees, reserve file ownership, and serialize safe automatic apply
+- Detect failed GitHub CI checks and actionable PR feedback through `gh`, with optional trusted-workspace polling
+- Show build/lint/test/E2E verification gates, compare change-session file sets, and support configurable Keep-all/Restore-all review policies
+- Turn Plan-profile artifacts into sequential executable steps with an independent change-session checkpoint for every step
+- Keep `/compare` candidates isolated, then apply only the selected winner or create a PR from it
+- Add monthly token and user-priced estimated-cost guardrails alongside the daily budget
+- Add explicit file ownership and a FIFO merge queue for normal parallel chat agents
+- Add detached background agents that survive VS Code restarts, keep edits isolated, and expose apply/cancel/discard controls
+- Persist repair budgets in change sessions and visualize repairing, success, and exhaustion states
+- Persist per-session result content and open real file diffs between adjacent sessions
+- Add an interactive AI audit timeline and an optional team-shared workspace JSONL log
+
 ## 0.1.15
 
 - Recover orphaned Safe/parallel chat worktrees after crashes and clean up partially prepared worktrees

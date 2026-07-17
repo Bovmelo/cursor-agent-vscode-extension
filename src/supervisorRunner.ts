@@ -20,11 +20,14 @@ const SUPPORTS_LOCAL_SANDBOX = process.platform !== "win32";
 type CursorAgent = Awaited<ReturnType<typeof Agent.create>>;
 type CursorRun = Awaited<ReturnType<CursorAgent["send"]>>;
 
+interface ActiveSupervisorRun {
+  agent?: CursorAgent;
+  run?: CursorRun;
+  cancelRequested: boolean;
+}
+
 export class SupervisorAgentRunner implements vscode.Disposable {
-  private agent: CursorAgent | undefined;
-  private run: CursorRun | undefined;
-  private busy = false;
-  private cancelRequested = false;
+  private readonly activeRuns = new Map<string, ActiveSupervisorRun>();
 
   public constructor(
     private readonly context: vscode.ExtensionContext,
@@ -32,22 +35,60 @@ export class SupervisorAgentRunner implements vscode.Disposable {
   ) {}
 
   public isBusy(): boolean {
-    return this.busy;
+    return this.activeRuns.size > 0;
   }
 
-  public async cancel(): Promise<void> {
-    this.cancelRequested = true;
-    const run = this.run;
-    if (run?.supports("cancel")) {
-      await run.cancel();
-    }
+  public isAtCapacity(): boolean {
+    const maximum = Math.max(
+      1,
+      vscode.workspace.getConfiguration("cursorSubscription")
+        .get<number>("supervisorMaxParallelTasks", 2),
+    );
+    return this.activeRuns.size >= maximum;
+  }
+
+  public async cancel(taskId?: string): Promise<void> {
+    const runs = taskId
+      ? [[taskId, this.activeRuns.get(taskId)] as const]
+      : [...this.activeRuns.entries()];
+    await Promise.all(runs.map(async ([, active]) => {
+      if (!active) {
+        return;
+      }
+      active.cancelRequested = true;
+      if (active.run?.supports("cancel")) {
+        await active.run.cancel();
+      }
+    }));
+  }
+
+  public activeTaskIds(): string[] {
+    return [...this.activeRuns.keys()];
   }
 
   public dispose(): void {
+    const active = [...this.activeRuns.values()];
     void this.cancel()
       .catch(() => {})
-      .then(() => this.disposeAgent())
+      .then(() => Promise.all(active.map((entry) => this.disposeAgent(entry.agent))))
       .catch(() => {});
+  }
+
+  private maximumParallelTasks(): number {
+    return Math.max(
+      1,
+      vscode.workspace.getConfiguration("cursorSubscription")
+        .get<number>("supervisorMaxParallelTasks", 2),
+    );
+  }
+
+  private reserve(taskId: string): ActiveSupervisorRun | undefined {
+    if (this.activeRuns.has(taskId) || this.activeRuns.size >= this.maximumParallelTasks()) {
+      return undefined;
+    }
+    const active: ActiveSupervisorRun = { cancelRequested: false };
+    this.activeRuns.set(taskId, active);
+    return active;
   }
 
   public async execute(
@@ -55,9 +96,6 @@ export class SupervisorAgentRunner implements vscode.Disposable {
     worktreePath: string,
     prompt: string,
   ): Promise<SupervisorExecutionResult | undefined> {
-    if (this.busy) {
-      return undefined;
-    }
     const apiKey = await this.context.secrets.get(API_KEY_SECRET);
     if (!apiKey) {
       return {
@@ -79,19 +117,22 @@ export class SupervisorAgentRunner implements vscode.Disposable {
       };
     }
 
-    this.busy = true;
-    this.cancelRequested = false;
+    const active = this.reserve(task.id);
+    if (!active) {
+      return undefined;
+    }
+
     let executionTimedOut = false;
     let executionTimer: ReturnType<typeof setTimeout> | undefined;
     let assistantText = "";
     try {
-      this.agent = await this.createAgent(apiKey, worktreePath, task.title);
-      const run = await this.agent.send(prompt, {
+      active.agent = await this.createAgent(apiKey, worktreePath, task.title);
+      const run = await active.agent.send(prompt, {
         model: this.selectedModelSelection(),
         mode: "agent",
       });
-      this.run = run;
-      if (this.cancelRequested && run.supports("cancel")) {
+      active.run = run;
+      if (active.cancelRequested && run.supports("cancel")) {
         await run.cancel();
       }
       const maximumMinutes = vscode.workspace
@@ -163,6 +204,7 @@ export class SupervisorAgentRunner implements vscode.Disposable {
         return {
           status: "finished",
           usage: result.usage,
+          assistantText,
           ...this.completionMetadata(assistantText),
         };
       }
@@ -186,10 +228,10 @@ export class SupervisorAgentRunner implements vscode.Disposable {
       if (executionTimer) {
         clearTimeout(executionTimer);
       }
-      this.run = undefined;
-      await this.disposeAgent();
-      this.busy = false;
-      this.cancelRequested = false;
+      active.run = undefined;
+      await this.disposeAgent(active.agent);
+      active.agent = undefined;
+      this.activeRuns.delete(task.id);
     }
   }
 
@@ -310,9 +352,7 @@ export class SupervisorAgentRunner implements vscode.Disposable {
     };
   }
 
-  private async disposeAgent(): Promise<void> {
-    const agent = this.agent;
-    this.agent = undefined;
+  private async disposeAgent(agent: CursorAgent | undefined): Promise<void> {
     if (agent) {
       await agent[Symbol.asyncDispose]();
     }

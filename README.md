@@ -49,17 +49,19 @@ Change sessions distinguish your pre-existing uncommitted work from AI edits, so
 - Automatic validation with optional bounded self-repair
 - AI review findings published into the Problems panel
 - AI change-session history and revertible checkpoints, including dirty Git baselines
-- Project memory, debug-context analysis, and experimental inline completions
+- Project memory, debug-context analysis, and production-ready opt-in inline completions
 - Japanese / English UI (follows VS Code display language)
 - Token usage dashboard, conversation search / pin / export
 - Cursor-style `.cursor/commands` slash templates and `/compare` best-of-N
 - Branch + PR creation via GitHub CLI after verified edits
+- Detached background agents that continue after VS Code closes and return isolated changes for review
+- Interactive audit timeline with optional team-shared JSONL logging
 
 ## AI-native workflow
 
 ### Parallel chat agents
 
-Each conversation owns an independent Cursor agent and run. Start a task, click the prominent **Start parallel agent** button in the parallel-agent bar, and send another task to run both at the same time. The button is disabled with a limit indicator when every parallel slot is occupied. The bar lists running and queued conversations, switches to any task with one click, and stops only the selected agent. Completed, failed, and stopped parallel tasks remain as review-pending chips until you open that conversation and then leave it. Returning to history also shows **Running** or **Queued** badges and restores live output. Messages inside one conversation still run in order. Configure `cursorSubscription.maxParallelChatAgents` (default: 3, maximum: 8) to set the limit. Concurrent calls may consume Cursor plan quota simultaneously. Parallel edits to the same file use a three-way merge when their changed hunks do not overlap. For overlapping text edits, a confirmation dialog can send the conflict back to AI to infer both sides' intent and resolve it; the result is applied only after marker and concurrent-change safety checks.
+Each conversation owns an independent Cursor agent and run. Start a task, click the prominent **Start parallel agent** button in the parallel-agent bar, and send another task to run both at the same time. The button is disabled with a limit indicator when every parallel slot is occupied. The bar lists running and queued conversations, switches to any task with one click, and stops only the selected agent. Completed, failed, and stopped parallel tasks remain as review-pending chips until you open that conversation and then leave it. Returning to history also shows **Running** or **Queued** badges and restores live output. Messages inside one conversation still run in order. Configure `cursorSubscription.maxParallelChatAgents` (default: 3, maximum: 8) to set the limit. Concurrent calls may consume Cursor plan quota simultaneously. Explicitly attached target files are owned by one run at a time; conflicting runs are moved to isolated worktrees. Completed isolated edits pass through a FIFO apply queue and reacquire ownership for their actual changed files. Parallel edits to the same file use a three-way merge when their changed hunks do not overlap. For overlapping text edits, a confirmation dialog can send the conflict back to AI to infer both sides' intent and resolve it; the result is applied only after marker and concurrent-change safety checks.
 
 ### AI Supervisor
 
@@ -69,9 +71,19 @@ Each Supervisor task runs with its own agent in a detached Git worktree. The nor
 
 The current mode is always shown in the Supervisor inbox header, the first inbox row, and the status bar. Click the mode row or status-bar control, or run **Cursor: Choose AI Supervisor Mode**, to switch modes. Autonomous agent calls consume Cursor plan quota; if chat and Supervisor run together, both calls may consume quota concurrently. Local diagnostics, Git comparisons, and verification commands do not.
 
+Manual Supervisor tasks can depend on earlier tasks. Autonomous mode runs up to `cursorSubscription.supervisorMaxParallelTasks` independent tasks in separate worktrees, reserves discovered file ownership, and queues automatic apply until overlapping owners finish. Run **Cursor: Scan GitHub CI and PR Feedback**, or enable `cursorSubscription.supervisorGitHubTrigger`, to create tasks from failed checks, requested-change reviews, inline review comments, and explicitly marked `/cursor`, `[cursor]`, or `TODO(ai)` PR comments through `gh`.
+
 Run **Cursor: Run Autopilot Change** to give Cursor an outcome instead of an individual edit. After the agent finishes editing, review each file diff and choose whether to keep or restore it. Automatic verification waits until every proposed file has been decided. The **AI Change Session** view keeps the latest 20 sessions with edited files, decisions, verification results, and revert actions.
 
 At session start, the extension stores a private workspace checkpoint. This protects pre-existing uncommitted files as well as clean Git baselines, so an individual AI edit or the full session can be restored without discarding earlier work. After changes are accepted, the extension detects `validate`, `compile`, `lint`, or `test` npm scripts and runs the best available verification automatically. Configure `cursorSubscription.verificationCommands` to override detection. Automatic repair is available through `cursorSubscription.autoRepair` and is disabled by default because it can consume additional plan quota.
+
+Verification appears as build/lint/test/E2E gates in the change-session and Supervisor views. The same view shows the persisted automatic-repair budget and whether repair is active, successful, or exhausted. Sessions can be compared with the previous session at both the file-set and saved-content levels, and `cursorSubscription.changeSessionReviewPolicy` can prompt, keep all, or safely restore all pending edits. Plan-profile responses include an executable step artifact; **Cursor: Execute Last Plan with Checkpoints** runs those steps sequentially with a new change-session checkpoint for each. `/compare` keeps every candidate in its own worktree and applies only the selected winner, with an **Apply and create PR** action.
+
+Use **Cursor: Start Background Agent** for long tasks. A detached local worker continues if the VS Code window or extension host closes, writes its durable status into extension-private storage, and restores the job in the **Background Agents** view after restart. Its edits stay in a dedicated Git worktree until you apply or discard them. API-key material is passed to the worker only through its standard input and is not written into the job file.
+
+The **AI Audit Timeline** view makes apply, restore, PR, and plan actions inspectable without exporting Markdown. Enable `cursorSubscription.auditSharedLogEnabled` to append JSONL events to `.cursor/ai-audit-log.jsonl` (or another safe workspace-relative path) for team review.
+
+Usage guardrails support daily and monthly token limits plus an estimated monthly USD limit. Cost estimates use only the blended rate you provide in `cursorSubscription.estimatedCostPerMillionTokensUsd`; they are an approximation, not billing data.
 
 Additional commands:
 
@@ -79,7 +91,7 @@ Additional commands:
 - **Cursor: Analyze Debug Context** sends the active editor, diagnostics, breakpoints, and debug-session metadata to the agent.
 - **Cursor: Refresh Project Memory** creates or updates `.cursor/project-memory.md`.
 - AI Quick Fix actions appear alongside diagnostics in the editor.
-- Experimental inline completions can be enabled with `cursorSubscription.enableInlineCompletions`.
+- Opt-in inline completions can be enabled with `cursorSubscription.enableInlineCompletions`. They include configurable debounce and output limits, LRU caching, in-flight request deduplication, project-rule context, token/cost guards, and acceptance-rate reporting in Usage.
 
 Open **Cursor: Open AI Feature Settings** or use the gear button in the chat header to enable or disable these features. `cursorSubscription.enableAiNativeFeatures` is the master switch; core chat remains available when it is off. Each AI-native feature can also be controlled individually.
 
@@ -94,7 +106,7 @@ Safe worktree mode requires the workspace to be a Git repository. Plan mode is r
 - Prompts and the context you explicitly include—such as selected code, referenced files, images, diagnostics, debug metadata, project memory, Skills, and MCP results—are sent to Cursor through the public Cursor SDK under your account and plan. Agent tools may read additional workspace files when needed for the task.
 - The Cursor API key is stored in VS Code SecretStorage. This extension does not read the Cursor desktop login session and does not add its own telemetry or analytics.
 - Conversation transcripts and aggregate token usage are stored in VS Code workspace state. Copies of external attachments, dirty-file checkpoints, isolated-run baselines, and Supervisor task data are stored in VS Code extension-private storage. Deleting a conversation removes its transcript and managed external-attachment copies; change-session history and checkpoint data are limited to the latest 20 sessions, while Supervisor data remains until its task is dismissed or extension storage is removed.
-- Project MCP servers and configured pre-edit, post-edit, and verification commands run locally with the permissions of the VS Code extension host or spawned process. Review workspace configuration before enabling tools or opening an untrusted repository.
+- Project MCP servers, detached background agents, and configured pre-edit, post-edit, and verification commands run locally with the permissions of the VS Code extension host or spawned process. Review workspace configuration before enabling tools or opening an untrusted repository.
 - Uninstalling the extension does not guarantee immediate deletion of VS Code extension storage. Use VS Code's profile/application-data controls when you need to remove all retained local data.
 
 ## Requirements
@@ -152,7 +164,7 @@ Anysphere / Cursor 非提携の**非公式**拡張機能です。公式 TypeScri
 - Problems の診断に対する AI Quick Fix と、行単位の AI コードレビュー
 - 編集後の自動検証と、回数制限付きの自動修正
 - 未コミット変更も保護するAI変更セッション履歴とチェックポイント
-- プロジェクト記憶、デバッグ状況の解析、実験的なインライン補完
+- プロジェクト記憶、デバッグ状況の解析、実用向けのオプトイン・インライン補完
 - VS Code の表示言語に連動した日英 UI
 - トークン使用量、会話検索 / ピン留め / 書き出し
 - Cursor 互換の `.cursor/commands` スラッシュテンプレートと `/compare` best-of-N
@@ -168,9 +180,19 @@ Anysphere / Cursor 非提携の**非公式**拡張機能です。公式 TypeScri
 
 現在のモードはSupervisor受信箱の見出し、受信箱の先頭行、ステータスバーへ常時表示されます。モード行またはステータスバーをクリックするか、**Cursor: AI Supervisorモードを選択** で切り替えられます。自律実行のAI呼び出しはCursorの利用枠を使い、チャットとSupervisorを同時実行すると両方の呼び出しが並行して利用枠を消費する場合があります。診断検出、Git比較、検証コマンドはローカル処理です。
 
+手動Supervisorタスクには先行タスクへの依存関係を設定できます。自律実行では、独立したタスクを `cursorSubscription.supervisorMaxParallelTasks` の上限まで別々のworktreeで並列実行し、検出したファイル所有権が重なる場合は先行タスクの完了まで自動適用を待機します。**Cursor: GitHub CIとPRフィードバックを検出**を実行するか `cursorSubscription.supervisorGitHubTrigger` を有効にすると、`gh` 経由でCI失敗、変更要求レビュー、インラインレビューコメント、明示的な `/cursor`・`[cursor]`・`TODO(ai)` コメントをタスク化できます。
+
 **Cursor: Autopilot変更を実行**では、個別の編集内容ではなく達成したい結果を指示できます。エージェントの編集後、ファイルごとの差分を確認して保持または復元できます。すべてのファイルを確定するまで自動検証は保留されます。**AI変更セッション**ビューには直近20件の履歴、編集ファイル、判断結果、検証結果が表示されます。
 
 セッション開始時にワークスペース専用のチェックポイントを保存するため、開始前から未コミットだったファイルも保護したまま、個別のAI編集またはセッション全体を復元できます。変更確定後、検証コマンドを npm の `validate`、`compile`、`lint`、`test` から自動検出します。`cursorSubscription.verificationCommands` で上書きできます。検証失敗時の自動修正は追加の利用枠を消費する場合があるため、初期状態では無効です。
+
+検証結果は変更セッションとSupervisorビューで build / lint / test / E2E のゲートとして表示されます。変更セッションは直前のセッションと比較でき、`cursorSubscription.changeSessionReviewPolicy` でファイルごとの確認、すべて保持、安全なすべて復元を選べます。Planプロファイルの応答は実行可能なステップ成果物を含み、**Cursor: チェックポイント付きで直前のPlanを実行**から各ステップ前に別々の変更セッション・チェックポイントを作りながら順番に実行できます。`/compare` の各候補は別worktreeに保持され、選択した勝者だけを適用またはPR化します。
+
+通常の並列チャットでは対象ファイルの所有権を予約し、競合する実行を隔離worktreeへ移します。完了した変更はFIFO適用キューを通り、実際の変更ファイルの所有権を取得してから安全にマージされます。**Cursor: バックグラウンドAgentを開始**では、VS Code終了後も継続する分離ワーカーへ長時間タスクを渡せます。結果は再起動後に復元され、専用ビューから適用・中止・破棄できます。
+
+変更セッションには修復バジェットの状態と、セッション間の実ファイル内容差分が表示されます。**AI監査タイムライン**では操作履歴を対話的に確認でき、`cursorSubscription.auditSharedLogEnabled` を有効にするとチーム向けJSONLログも残せます。インライン補完はデバウンス、重複排除、LRU、予算ガード、プロジェクトルール、採用率表示に対応しています。
+
+使用量ガードには日次・月次トークン上限と推定月間USD上限があります。コスト推定は `cursorSubscription.estimatedCostPerMillionTokensUsd` にユーザーが設定した概算単価だけを使い、実際の請求額ではありません。
 
 チャット上部の歯車ボタン、または **Cursor: AI機能の設定を開く** から機能別にオン・オフできます。マスタースイッチを無効にしても基本チャットは引き続き利用できます。
 

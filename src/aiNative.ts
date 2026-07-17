@@ -28,10 +28,13 @@ export type ChangeSessionPhase =
 
 export interface VerificationStep {
   command: string;
+  stage?: VerificationStage;
   success: boolean;
   output: string;
   durationMs: number;
 }
+
+export type VerificationStage = "build" | "lint" | "test" | "e2e" | "other";
 
 export interface VerificationResult {
   success: boolean;
@@ -55,6 +58,22 @@ export interface ChangeSessionSnapshot {
   proposedFiles?: Record<string, ProposedFileSnapshot>;
   nonRestorableFiles?: string[];
   verification?: VerificationResult;
+  repair?: RepairBudgetSnapshot;
+}
+
+export interface RepairBudgetSnapshot {
+  attempts: number;
+  maxAttempts: number;
+  status: "idle" | "repairing" | "succeeded" | "exhausted";
+  lastFailure?: string;
+}
+
+export interface SessionContentComparison {
+  relative: string;
+  currentSessionId: string;
+  previousSessionId: string;
+  currentFile: string;
+  previousFile: string;
 }
 
 interface BaselineFileSnapshot {
@@ -71,10 +90,12 @@ interface ProposedFileSnapshot {
   worktreeHash?: string;
   indexMode?: string;
   indexOid?: string;
+  contentCaptured?: boolean;
+  contentBackupName?: string;
 }
 
 interface SessionNode {
-  kind: "session" | "phase" | "file" | "verification" | "action";
+  kind: "session" | "phase" | "file" | "verification" | "verificationStep" | "repair" | "repairDetail" | "action";
   label: string;
   description?: string;
   sessionId?: string;
@@ -191,6 +212,63 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     return this.sessions;
   }
 
+  public comparisonMarkdown(sessionId: string): string | undefined {
+    const index = this.sessions.findIndex((session) => session.id === sessionId);
+    const current = this.sessions[index];
+    const previous = index >= 0 ? this.sessions[index + 1] : undefined;
+    if (!current || !previous) {
+      return undefined;
+    }
+    return formatSessionComparison(current, previous);
+  }
+
+  public contentComparisons(sessionId: string): SessionContentComparison[] {
+    const index = this.sessions.findIndex((session) => session.id === sessionId);
+    const current = this.sessions[index];
+    const previous = index >= 0 ? this.sessions[index + 1] : undefined;
+    if (!current || !previous) {
+      return [];
+    }
+    const previousByRelative = new Map(
+      previous.files.map((file) => [
+        path.relative(previous.root, file).replaceAll("\\", "/"),
+        file,
+      ]),
+    );
+    return current.files.flatMap((currentFile) => {
+      const relative = path.relative(current.root, currentFile).replaceAll("\\", "/");
+      const previousFile = previousByRelative.get(relative);
+      const currentSnapshot = current.proposedFiles?.[currentFile];
+      const previousSnapshot = previousFile ? previous.proposedFiles?.[previousFile] : undefined;
+      return previousFile && currentSnapshot?.contentCaptured && previousSnapshot?.contentCaptured
+        ? [{
+            relative,
+            currentSessionId: current.id,
+            previousSessionId: previous.id,
+            currentFile,
+            previousFile,
+          }]
+        : [];
+    });
+  }
+
+  public async proposedContent(sessionId: string, file: string): Promise<string> {
+    const session = this.session(sessionId);
+    const snapshot = session?.proposedFiles?.[file];
+    if (!session || !snapshot?.contentCaptured || !snapshot.contentBackupName) {
+      return "";
+    }
+    const bytes = await vscode.workspace.fs.readFile(
+      vscode.Uri.joinPath(
+        this.storageRoot,
+        "change-sessions",
+        session.id,
+        snapshot.contentBackupName,
+      ),
+    );
+    return new TextDecoder().decode(bytes);
+  }
+
   public async begin(goal: string, root: string): Promise<ChangeSessionSnapshot> {
     const firstLine = goal.split(/\r?\n/).find((line) => line.trim().length > 0)?.trim()
       ?? (this.japanese ? "AI変更セッション" : "AI change session");
@@ -274,6 +352,15 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     void this.persist();
   }
 
+  public setRepairBudget(repair: RepairBudgetSnapshot, sessionId?: string): void {
+    const current = this.snapshot(sessionId);
+    if (!current) {
+      return;
+    }
+    current.repair = { ...repair };
+    void this.persist();
+  }
+
   public async markPending(filePaths: readonly string[], sessionId?: string): Promise<void> {
     const current = this.snapshot(sessionId);
     if (!current) {
@@ -297,6 +384,7 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
           worktreeHash: worktree.hash,
           indexMode: indexEntry?.mode,
           indexOid: indexEntry?.oid,
+          ...(await this.captureProposedContent(current, worktree)),
         };
       }
     }
@@ -376,6 +464,7 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
         worktreeHash: worktree.hash,
         indexMode: indexEntry?.mode,
         indexOid: indexEntry?.oid,
+        ...(await this.captureProposedContent(session, worktree)),
       };
       if (
         !session.baselineFiles?.[baselineKey(relative)]
@@ -590,6 +679,12 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       ? element.sessionId === this.snapshot()?.id
         ? vscode.TreeItemCollapsibleState.Expanded
         : vscode.TreeItemCollapsibleState.Collapsed
+      : element.kind === "verification"
+        ? vscode.TreeItemCollapsibleState.Expanded
+        : element.kind === "repair"
+          ? this.session(element.sessionId)?.repair?.lastFailure
+            ? vscode.TreeItemCollapsibleState.Collapsed
+            : vscode.TreeItemCollapsibleState.None
       : vscode.TreeItemCollapsibleState.None;
     const item = new vscode.TreeItem(element.label, collapsibleState);
     item.description = element.description;
@@ -610,6 +705,27 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
         description: new Date(session.startedAt).toLocaleString(),
         sessionId: session.id,
       }));
+    }
+    if (element.kind === "verification") {
+      const session = this.session(element.sessionId);
+      return (session?.verification?.steps ?? []).map((step) => ({
+        kind: "verificationStep",
+        label: `${step.success ? "✓" : "✗"} ${verificationStageLabel(step.stage ?? verificationStage(step.command), this.japanese)}`,
+        description: `${Math.max(0, step.durationMs / 1_000).toFixed(1)}s · ${step.command}`,
+        sessionId: session?.id,
+      }));
+    }
+    if (element.kind === "repair") {
+      const session = this.session(element.sessionId);
+      const failure = session?.repair?.lastFailure?.trim();
+      return failure
+        ? [{
+            kind: "repairDetail",
+            label: failure.split(/\r?\n/u)[0].slice(0, 180),
+            description: this.japanese ? "直近の検証失敗" : "latest verification failure",
+            sessionId: session?.id,
+          }]
+        : [];
     }
     if (element.kind !== "session") {
       return [];
@@ -644,6 +760,15 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
           : session.verification.success
             ? (this.japanese ? "成功" : "passed")
             : (this.japanese ? "失敗" : "failed"),
+        sessionId: session.id,
+      });
+    }
+    if (session.repair) {
+      nodes.push({
+        kind: "repair",
+        label: this.japanese ? "修復バジェット" : "Repair budget",
+        description: `${session.repair.attempts}/${session.repair.maxAttempts} · ${this.repairLabel(session.repair.status)}`,
+        sessionId: session.id,
       });
     }
     for (const file of session.files) {
@@ -704,6 +829,30 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
         },
       });
     }
+    if (this.comparisonMarkdown(session.id)) {
+      nodes.push({
+        kind: "action",
+        label: this.japanese ? "前のセッションと比較" : "Compare with previous session",
+        sessionId: session.id,
+        command: {
+          command: "cursorSubscription.compareChangeSessions",
+          title: this.japanese ? "セッションを比較" : "Compare sessions",
+          arguments: [session.id],
+        },
+      });
+    }
+    if (this.contentComparisons(session.id).length > 0) {
+      nodes.push({
+        kind: "action",
+        label: this.japanese ? "セッション間の内容差分を開く" : "Open content diff between sessions",
+        sessionId: session.id,
+        command: {
+          command: "cursorSubscription.compareSessionContents",
+          title: this.japanese ? "内容差分を比較" : "Compare session contents",
+          arguments: [session.id],
+        },
+      });
+    }
     return nodes;
   }
 
@@ -714,7 +863,11 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       case "file":
         return new vscode.ThemeIcon("diff");
       case "verification":
+      case "verificationStep":
         return new vscode.ThemeIcon("beaker");
+      case "repair":
+      case "repairDetail":
+        return new vscode.ThemeIcon("wrench");
       case "action":
         return new vscode.ThemeIcon("discard");
       default:
@@ -735,6 +888,16 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       reverted: ["Reverted", "復元済み"],
     };
     return labels[phase][this.japanese ? 1 : 0];
+  }
+
+  private repairLabel(status: RepairBudgetSnapshot["status"]): string {
+    const labels: Record<RepairBudgetSnapshot["status"], [string, string]> = {
+      idle: ["available", "待機"],
+      repairing: ["repairing", "修復中"],
+      succeeded: ["succeeded", "成功"],
+      exhausted: ["exhausted", "上限到達"],
+    };
+    return labels[status][this.japanese ? 1 : 0];
   }
 
   private async persist(): Promise<void> {
@@ -813,6 +976,23 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       );
       return false;
     }
+  }
+
+  private async captureProposedContent(
+    session: ChangeSessionSnapshot,
+    worktree: { existed: boolean; bytes?: Uint8Array },
+  ): Promise<Pick<ProposedFileSnapshot, "contentCaptured" | "contentBackupName">> {
+    if (!worktree.existed || !worktree.bytes) {
+      return { contentCaptured: true };
+    }
+    const checkpointFolder = vscode.Uri.joinPath(this.storageRoot, "change-sessions", session.id);
+    await vscode.workspace.fs.createDirectory(checkpointFolder);
+    const contentBackupName = `proposed-${randomUUID()}.bin`;
+    await vscode.workspace.fs.writeFile(
+      vscode.Uri.joinPath(checkpointFolder, contentBackupName),
+      worktree.bytes,
+    );
+    return { contentCaptured: true, contentBackupName };
   }
 
   private async restoreBaselineFile(
@@ -1022,6 +1202,7 @@ export async function runVerification(
       });
       steps.push({
         command,
+        stage: verificationStage(command),
         success: true,
         output: compactOutput(`${stdout}${stderr ? `\n${stderr}` : ""}`),
         durationMs: Date.now() - startedAt,
@@ -1030,6 +1211,7 @@ export async function runVerification(
       const failure = error as Error & { stdout?: string; stderr?: string };
       steps.push({
         command,
+        stage: verificationStage(command),
         success: false,
         output: compactOutput(
           `${failure.stdout ?? ""}${failure.stderr ? `\n${failure.stderr}` : ""}\n${failure.message}`,
@@ -1044,6 +1226,67 @@ export async function runVerification(
     skipped: false,
     steps,
   };
+}
+
+export function verificationStage(command: string): VerificationStage {
+  const normalized = command.toLowerCase();
+  if (/\be2e\b|playwright|cypress|selenium/.test(normalized)) {
+    return "e2e";
+  }
+  if (/\btest\b|vitest|jest|mocha|pytest|phpunit|cargo test|go test/.test(normalized)) {
+    return "test";
+  }
+  if (/\blint\b|eslint|ruff|clippy|golangci/.test(normalized)) {
+    return "lint";
+  }
+  if (/\bbuild\b|\bcompile\b|\btsc\b|cargo check/.test(normalized)) {
+    return "build";
+  }
+  return "other";
+}
+
+function verificationStageLabel(stage: VerificationStage, japanese: boolean): string {
+  const labels: Record<VerificationStage, [string, string]> = {
+    build: ["Build", "ビルド"],
+    lint: ["Lint", "Lint"],
+    test: ["Test", "テスト"],
+    e2e: ["E2E", "E2E"],
+    other: ["Check", "チェック"],
+  };
+  return labels[stage][japanese ? 1 : 0];
+}
+
+export function formatSessionComparison(
+  current: ChangeSessionSnapshot,
+  previous: ChangeSessionSnapshot,
+): string {
+  const relative = (session: ChangeSessionSnapshot, file: string) =>
+    path.relative(session.root, file).replaceAll("\\", "/");
+  const currentFiles = new Set(current.files.map((file) => relative(current, file)));
+  const previousFiles = new Set(previous.files.map((file) => relative(previous, file)));
+  const added = [...currentFiles].filter((file) => !previousFiles.has(file)).sort();
+  const removed = [...previousFiles].filter((file) => !currentFiles.has(file)).sort();
+  const shared = [...currentFiles].filter((file) => previousFiles.has(file)).sort();
+  const lines = [
+    `# Change session comparison`,
+    "",
+    `- Current: ${current.goal} (${new Date(current.startedAt).toISOString()})`,
+    `- Previous: ${previous.goal} (${new Date(previous.startedAt).toISOString()})`,
+    `- Verification: ${current.verification?.success ? "passed" : current.verification ? "failed" : "not run"} / ${previous.verification?.success ? "passed" : previous.verification ? "failed" : "not run"}`,
+    "",
+    `## Added to current (${added.length})`,
+    "",
+    ...(added.length ? added.map((file) => `- \`${file}\``) : ["_None._"]),
+    "",
+    `## Shared (${shared.length})`,
+    "",
+    ...(shared.length ? shared.map((file) => `- \`${file}\``) : ["_None._"]),
+    "",
+    `## Only in previous (${removed.length})`,
+    "",
+    ...(removed.length ? removed.map((file) => `- \`${file}\``) : ["_None._"]),
+  ];
+  return lines.join("\n");
 }
 
 export async function listWorkspaceChanges(root: string): Promise<string[]> {

@@ -6,6 +6,8 @@ export interface BestOfNExperiment {
   createdAt: number;
   conversationIds: string[];
   winnerId?: string;
+  appliedWinnerId?: string;
+  pullRequestCreated?: boolean;
 }
 
 export interface BestOfNCandidateSummary {

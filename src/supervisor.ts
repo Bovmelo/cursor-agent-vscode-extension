@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { runVerification, type VerificationResult } from "./aiNative.js";
+import { runVerification, verificationStage, type VerificationResult } from "./aiNative.js";
+import type { AuditAction } from "./auditLog.js";
 import {
   applyIsolatedChange,
   cleanupIsolatedWorktree,
@@ -14,13 +15,27 @@ import {
   type IsolatedBaselineFile,
   type IsolatedWorktreeSession,
 } from "./isolatedWorktree.js";
+import { parseSupervisorReviewVerdict, scanTodoAiComments } from "./todoScanner.js";
+import { scanCurrentGitHubPullRequest } from "./githubTriggers.js";
+import {
+  dependencyReadiness,
+  overlappingTaskIds,
+  selectRunnableSupervisorTasks,
+} from "./supervisorScheduling.js";
 import { runGit } from "./worktreeLifecycle.js";
 import { configurationFor, resolveWorkspaceFolder } from "./workspaceFolder.js";
 
 const TASKS_KEY = "cursorSubscription.supervisorTasks";
 const MAX_TASKS = 50;
-
 export type SupervisorMode = "off" | "observe" | "autonomous";
+export type SupervisorPriority = "high" | "normal" | "low";
+export type SupervisorTaskSource =
+  | "diagnostics"
+  | "manual"
+  | "todo"
+  | "test-failure"
+  | "ci"
+  | "pr-comment";
 export type SupervisorTaskStatus =
   | "detected"
   | "queued"
@@ -49,7 +64,12 @@ export interface SupervisorTask {
   title: string;
   detail: string;
   root: string;
-  source: "diagnostics" | "manual";
+  source: SupervisorTaskSource;
+  priority?: SupervisorPriority;
+  dependencyIds?: string[];
+  ownedFiles?: string[];
+  ownershipBlockedBy?: string[];
+  ownershipBlockedReason?: string;
   file?: string;
   fingerprint: string;
   createdAt: number;
@@ -62,16 +82,26 @@ export interface SupervisorTask {
   initialChangedFiles?: string[];
   changes?: SupervisorChange[];
   verification?: VerificationResult;
+  reviewVerdict?: "approve" | "reject";
   blockedReasons?: string[];
   runStartedAt?: number;
   runFinishedAt?: number;
   error?: string;
 }
 
+export interface SupervisorAuditEvent {
+  action: AuditAction;
+  summary: string;
+  details?: string;
+  files?: string[];
+  taskId?: string;
+}
+
 export interface SupervisorExecutionResult {
   status: "finished" | "cancelled" | "error";
   error?: string;
   summary?: string;
+  assistantText?: string;
   changeReasons?: Record<string, string>;
   usage?: {
     inputTokens: number;
@@ -139,9 +169,12 @@ vscode.CodeLensProvider, vscode.Disposable {
   private readonly repoRoots = new Map<string, string>();
   private executor: SupervisorExecutor | undefined;
   private busyCheck: (() => boolean) | undefined;
-  private cancelActiveRun: (() => Promise<void>) | undefined;
+  private cancelActiveRun: ((taskId?: string) => Promise<void>) | undefined;
+  private onAudit: ((event: SupervisorAuditEvent) => void) | undefined;
   private scheduler: ReturnType<typeof setTimeout> | undefined;
-  private autoRunActive = false;
+  private githubScheduler: ReturnType<typeof setTimeout> | undefined;
+  private readonly activeRunIds = new Set<string>();
+  private applyQueue: Promise<void> = Promise.resolve();
   private readonly statusBar: vscode.StatusBarItem;
   private treeView: vscode.TreeView<SupervisorNode> | undefined;
 
@@ -181,25 +214,49 @@ vscode.CodeLensProvider, vscode.Disposable {
 
     this.disposables.push(
       this.statusBar,
-      vscode.workspace.onDidSaveTextDocument((document) => void this.observeDocument(document)),
+      vscode.workspace.onDidSaveTextDocument((document) => {
+        void this.observeDocument(document);
+        void this.observeTodoComments(document);
+      }),
+      vscode.tasks.onDidEndTaskProcess((event) => void this.observeTaskFailure(event)),
+      vscode.workspace.onDidGrantWorkspaceTrust(() => {
+        this.updateStatusBar();
+        this.refresh();
+        this.scheduleAutoRun();
+      }),
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (
           event.affectsConfiguration("cursorSubscription.enableAiNativeFeatures")
           || event.affectsConfiguration("cursorSubscription.enableAiSupervisor")
           || event.affectsConfiguration("cursorSubscription.supervisorMode")
+          || event.affectsConfiguration("cursorSubscription.supervisorTodoTrigger")
+          || event.affectsConfiguration("cursorSubscription.supervisorTestFailureTrigger")
+          || event.affectsConfiguration("cursorSubscription.supervisorReviewGate")
+          || event.affectsConfiguration("cursorSubscription.supervisorMaxParallelTasks")
+          || event.affectsConfiguration("cursorSubscription.supervisorGitHubTrigger")
         ) {
           this.updateStatusBar();
           this.refresh();
           this.scheduleAutoRun();
+          this.scheduleGitHubScan();
         }
       }),
     );
+    this.scheduleGitHubScan();
+  }
+
+  public setAuditSink(onAudit: (event: SupervisorAuditEvent) => void): void {
+    this.onAudit = onAudit;
   }
 
   public dispose(): void {
     if (this.scheduler) {
       clearTimeout(this.scheduler);
       this.scheduler = undefined;
+    }
+    if (this.githubScheduler) {
+      clearTimeout(this.githubScheduler);
+      this.githubScheduler = undefined;
     }
     for (const disposable of this.disposables) {
       disposable.dispose();
@@ -211,7 +268,7 @@ vscode.CodeLensProvider, vscode.Disposable {
   public setExecutor(
     executor: SupervisorExecutor,
     busyCheck: () => boolean,
-    cancelActiveRun?: () => Promise<void>,
+    cancelActiveRun?: (taskId?: string) => Promise<void>,
   ): void {
     this.executor = executor;
     this.busyCheck = busyCheck;
@@ -232,7 +289,15 @@ vscode.CodeLensProvider, vscode.Disposable {
     if (!this.enabled()) {
       return "off";
     }
-    return this.configuration().get<SupervisorMode>("supervisorMode", "observe");
+    const configured = this.configuration().get<SupervisorMode>("supervisorMode", "observe");
+    if (!vscode.workspace.isTrusted && configured === "autonomous") {
+      return "observe";
+    }
+    return configured;
+  }
+
+  public effectiveAutonomousAllowed(): boolean {
+    return vscode.workspace.isTrusted;
   }
 
   public getTreeItem(node: SupervisorNode): vscode.TreeItem {
@@ -344,6 +409,27 @@ vscode.CodeLensProvider, vscode.Disposable {
         label: reason,
       })));
     }
+    if (task.dependencyIds?.length) {
+      children.push({
+        kind: "detail",
+        taskId: task.id,
+        label: this.text(
+          `Dependencies: ${task.dependencyIds.map((id) => this.findTask(id)?.title ?? id.slice(0, 8)).join(", ")}`,
+          `依存: ${task.dependencyIds.map((id) => this.findTask(id)?.title ?? id.slice(0, 8)).join("、")}`,
+        ),
+      });
+    }
+    if (task.ownedFiles?.length) {
+      children.push({
+        kind: "detail",
+        taskId: task.id,
+        label: this.text(
+          `File ownership: ${task.ownedFiles.length} file(s)`,
+          `ファイル所有権: ${task.ownedFiles.length}件`,
+        ),
+        description: task.ownedFiles.slice(0, 3).join(", "),
+      });
+    }
     if (task.verification) {
       children.push({
         kind: "detail",
@@ -353,6 +439,12 @@ vscode.CodeLensProvider, vscode.Disposable {
           : this.text("Verification failed", "検証失敗"),
         description: `${task.verification.steps.length} step(s)`,
       });
+      children.push(...task.verification.steps.map((step) => ({
+        kind: "detail" as const,
+        taskId: task.id,
+        label: `${step.success ? "✓" : "✗"} ${String(step.stage ?? verificationStage(step.command)).toUpperCase()}: ${step.command}`,
+        description: `${Math.max(0, step.durationMs / 1_000).toFixed(1)}s`,
+      })));
     }
     children.push(...(task.changes ?? []).map((change) => ({
       kind: "change" as const,
@@ -451,27 +543,94 @@ vscode.CodeLensProvider, vscode.Disposable {
     if (!goal?.trim()) {
       return;
     }
+    const priorityPick = await vscode.window.showQuickPick(
+      [
+        {
+          label: this.text("Normal priority", "通常優先度"),
+          priority: "normal" as const,
+        },
+        {
+          label: this.text("High priority", "高優先度"),
+          priority: "high" as const,
+        },
+        {
+          label: this.text("Low priority", "低優先度"),
+          priority: "low" as const,
+        },
+      ],
+      { title: this.text("Task priority", "タスク優先度") },
+    );
     const root = await this.currentRepoRoot();
     if (!root) {
       return;
     }
-    const now = Date.now();
-    const task: SupervisorTask = {
-      id: randomUUID(),
+    const dependencyPick = await vscode.window.showQuickPick(
+      this.tasks
+        .filter((task) => task.root === root && task.status !== "dismissed" && task.status !== "failed")
+        .map((task) => ({
+          label: task.title,
+          description: `${this.statusLabel(task.status)} · ${task.id.slice(0, 8)}`,
+          task,
+        })),
+      {
+        title: this.text("Dependencies (optional)", "依存タスク（任意）"),
+        placeHolder: this.text(
+          "Run this task only after the selected tasks complete",
+          "選択したタスクの完了後にのみ実行します",
+        ),
+        canPickMany: true,
+      },
+    );
+    await this.createTask({
+      source: "manual",
       title: goal.trim().split(/\r?\n/, 1)[0].slice(0, 80),
       detail: goal.trim(),
       root,
-      source: "manual",
       fingerprint: createHash("sha256").update(goal.trim()).digest("hex"),
+      priority: priorityPick?.priority ?? "normal",
+      dependencyIds: dependencyPick?.map((item) => item.task.id),
+    });
+  }
+
+  public async createTask(options: {
+    source: SupervisorTaskSource;
+    title: string;
+    detail: string;
+    root: string;
+    fingerprint: string;
+    file?: string;
+    diagnostics?: string[];
+    priority?: SupervisorPriority;
+    dependencyIds?: string[];
+  }): Promise<SupervisorTask | undefined> {
+    if (!this.enabled() || this.mode() === "off") {
+      return undefined;
+    }
+    if (this.tasks.some((task) => task.fingerprint === options.fingerprint && task.status !== "dismissed")) {
+      return undefined;
+    }
+    const now = Date.now();
+    const task: SupervisorTask = {
+      id: randomUUID(),
+      title: options.title,
+      detail: options.detail,
+      root: options.root,
+      source: options.source,
+      priority: options.priority ?? "normal",
+      dependencyIds: [...new Set(options.dependencyIds ?? [])],
+      file: options.file,
+      fingerprint: options.fingerprint,
       createdAt: now,
       updatedAt: now,
       status: this.mode() === "autonomous" ? "queued" : "detected",
+      diagnostics: options.diagnostics,
     };
     this.tasks.unshift(task);
     this.trimTasks();
     await this.persist();
     this.refresh();
     this.scheduleAutoRun();
+    return task;
   }
 
   public async scanDiagnostics(): Promise<void> {
@@ -490,6 +649,84 @@ vscode.CodeLensProvider, vscode.Disposable {
       } catch {
         // Ignore diagnostics for documents that disappeared during the scan.
       }
+    }
+  }
+
+  public async scanTodos(): Promise<void> {
+    if (!this.enabled() || this.mode() === "off") {
+      this.showDisabledMessage();
+      return;
+    }
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    for (const folder of folders) {
+      const files = await vscode.workspace.findFiles(
+        new vscode.RelativePattern(folder, "**/*.{ts,tsx,js,jsx,mjs,cjs,py,go,rs,java,kt,cs,md}"),
+        "**/{node_modules,dist,out,.git}/**",
+        200,
+      );
+      for (const uri of files) {
+        try {
+          const document = await vscode.workspace.openTextDocument(uri);
+          await this.observeTodoComments(document, true);
+        } catch {
+          // Skip unreadable files.
+        }
+      }
+    }
+  }
+
+  public async scanGitHubSignals(force = true): Promise<void> {
+    if (!this.enabled() || this.mode() === "off") {
+      if (force) {
+        this.showDisabledMessage();
+      }
+      return;
+    }
+    if (!force && (
+      !vscode.workspace.isTrusted
+      || !this.configuration().get<boolean>("supervisorGitHubTrigger", false)
+    )) {
+      return;
+    }
+    const workspace = resolveWorkspaceFolder(vscode.window.activeTextEditor?.document.uri)
+      ?? vscode.workspace.workspaceFolders?.[0];
+    const root = workspace ? await this.repoRootFor(workspace.uri.fsPath) : undefined;
+    if (!root) {
+      return;
+    }
+    try {
+      const signals = await scanCurrentGitHubPullRequest(root);
+      let created = 0;
+      for (const signal of signals) {
+        const task = await this.createTask({
+          ...signal,
+          root,
+        });
+        if (task) {
+          created += 1;
+        }
+      }
+      if (force) {
+        void vscode.window.showInformationMessage(this.text(
+          created > 0
+            ? `Added ${created} GitHub CI/review task(s) to Supervisor.`
+            : "No new failed CI checks or actionable PR review comments were found.",
+          created > 0
+            ? `GitHub CI/レビューから${created}件のSupervisorタスクを追加しました。`
+            : "新しいCI失敗または対応可能なPRレビューコメントはありませんでした。",
+        ));
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[${new Date().toISOString()}] GitHub Supervisor scan failed: ${message}`);
+      if (force) {
+        void vscode.window.showWarningMessage(this.text(
+          "Could not scan the current GitHub PR. Install/authenticate gh and open a branch with a PR.",
+          "現在のGitHub PRを取得できませんでした。ghをインストール・認証し、PRのあるブランチを開いてください。",
+        ));
+      }
+    } finally {
+      this.scheduleGitHubScan();
     }
   }
 
@@ -513,7 +750,7 @@ vscode.CodeLensProvider, vscode.Disposable {
       runningTask.updatedAt = Date.now();
       await this.persist();
       this.refresh();
-      await this.cancelActiveRun?.();
+      await this.cancelActiveRun?.(runningTask.id);
       return;
     }
     const errors = vscode.languages.getDiagnostics(document.uri)
@@ -528,9 +765,6 @@ vscode.CodeLensProvider, vscode.Disposable {
     const fingerprint = createHash("sha256")
       .update(`${relative}\n${details.join("\n")}`)
       .digest("hex");
-    if (this.tasks.some((task) => task.fingerprint === fingerprint && task.status !== "dismissed")) {
-      return;
-    }
     for (const task of this.tasks) {
       if (
         task.source === "diagnostics"
@@ -541,27 +775,103 @@ vscode.CodeLensProvider, vscode.Disposable {
         task.updatedAt = Date.now();
       }
     }
-    const now = Date.now();
-    this.tasks.unshift({
-      id: randomUUID(),
+    await this.createTask({
+      source: "diagnostics",
       title: this.text(
         `Fix ${errors.length} error(s) in ${relative}`,
         `${relative} のエラー${errors.length}件を修正`,
       ),
       detail: details.join("\n"),
       root,
-      source: "diagnostics",
       file: relative,
       fingerprint,
-      createdAt: now,
-      updatedAt: now,
-      status: this.mode() === "autonomous" ? "queued" : "detected",
       diagnostics: details,
+      priority: "high",
     });
-    this.trimTasks();
-    await this.persist();
-    this.refresh();
-    this.scheduleAutoRun();
+  }
+
+  public async observeTodoComments(
+    document: vscode.TextDocument,
+    force = false,
+  ): Promise<void> {
+    if (
+      !this.enabled()
+      || this.mode() === "off"
+      || document.uri.scheme !== "file"
+      || (!force && !this.configuration().get<boolean>("supervisorTodoTrigger", false))
+    ) {
+      return;
+    }
+    const root = await this.repoRootFor(document.uri.fsPath);
+    if (!root || !isInside(root, document.uri.fsPath)) {
+      return;
+    }
+    const relative = normalizedRelative(path.relative(root, document.uri.fsPath));
+    const matches = scanTodoAiComments(document.getText());
+    for (const match of matches) {
+      const fingerprint = createHash("sha256")
+        .update(`todo:${relative}:${match.line}:${match.text}`)
+        .digest("hex");
+      await this.createTask({
+        source: "todo",
+        title: this.text(
+          `TODO(ai) in ${relative}:${match.line}`,
+          `${relative}:${match.line} の TODO(ai)`,
+        ),
+        detail: [
+          `Resolve the TODO(ai) comment in ${relative} at line ${match.line}.`,
+          match.text,
+        ].join("\n"),
+        root,
+        file: relative,
+        fingerprint,
+        diagnostics: [match.detail],
+        priority: "normal",
+      });
+    }
+  }
+
+  public async observeTaskFailure(
+    event: vscode.TaskProcessEndEvent,
+  ): Promise<void> {
+    if (
+      !this.enabled()
+      || this.mode() === "off"
+      || !this.configuration().get<boolean>("supervisorTestFailureTrigger", false)
+      || event.exitCode === 0
+      || event.exitCode === undefined
+    ) {
+      return;
+    }
+    const taskName = event.execution.task.name;
+    const isTestLike = /test|spec|jest|mocha|vitest|pytest|phpunit/i.test(
+      `${taskName} ${event.execution.task.source}`,
+    );
+    if (!isTestLike) {
+      return;
+    }
+    const root = await this.currentRepoRoot();
+    if (!root) {
+      return;
+    }
+    const detail = [
+      `The task "${taskName}" exited with code ${event.exitCode}.`,
+      "Investigate the failure, fix the smallest coherent cause, and keep related tests green.",
+    ].join("\n");
+    const fingerprint = createHash("sha256")
+      .update(`test-failure:${taskName}:${event.exitCode}:${Math.floor(Date.now() / 60_000)}`)
+      .digest("hex");
+    await this.createTask({
+      source: "test-failure",
+      title: this.text(
+        `Fix failed task: ${taskName}`,
+        `失敗タスクを修正: ${taskName}`,
+      ),
+      detail,
+      root,
+      fingerprint,
+      priority: "high",
+    });
   }
 
   public async runTask(target: SupervisorTaskTarget | string | undefined, automatic = false): Promise<void> {
@@ -580,7 +890,33 @@ vscode.CodeLensProvider, vscode.Disposable {
     if (!task || !this.executor) {
       return;
     }
-    if (this.busyCheck?.() || this.autoRunActive) {
+    const readiness = dependencyReadiness(task, this.tasks);
+    if (!readiness.ready) {
+      task.status = readiness.failed.length > 0 || readiness.missing.length > 0 ? "blocked" : "queued";
+      task.error = readiness.failed.length > 0
+        ? this.text("A dependency failed or is blocked.", "依存タスクが失敗またはブロックされています。")
+        : readiness.missing.length > 0
+          ? this.text("A dependency is missing or dismissed.", "依存タスクが見つからないか破棄されています。")
+          : this.text("Waiting for dependencies to complete.", "依存タスクの完了を待っています。");
+      task.updatedAt = Date.now();
+      await this.persist();
+      this.refresh();
+      return;
+    }
+    const ownershipConflicts = overlappingTaskIds(task, this.tasks);
+    if (ownershipConflicts.length > 0) {
+      task.status = "queued";
+      task.error = this.text(
+        `Waiting for file ownership held by ${ownershipConflicts.length} task(s).`,
+        `${ownershipConflicts.length}件のタスクが保持するファイル所有権を待っています。`,
+      );
+      task.updatedAt = Date.now();
+      await this.persist();
+      this.refresh();
+      this.scheduleAutoRun(5_000);
+      return;
+    }
+    if (this.busyCheck?.() || this.activeRunIds.has(task.id)) {
       task.status = "queued";
       task.updatedAt = Date.now();
       await this.persist();
@@ -603,7 +939,7 @@ vscode.CodeLensProvider, vscode.Disposable {
       return;
     }
 
-    this.autoRunActive = true;
+    this.activeRunIds.add(task.id);
     task.status = "running";
     task.runStartedAt = Date.now();
     task.updatedAt = Date.now();
@@ -630,6 +966,7 @@ vscode.CodeLensProvider, vscode.Disposable {
       }
 
       task.changes = await this.collectChanges(task);
+      task.ownedFiles = task.changes.map((change) => change.relative);
       this.attachChangeReasons(task, outcome);
       task.runFinishedAt = Date.now();
       const totalLines = task.changes.reduce(
@@ -639,6 +976,18 @@ vscode.CodeLensProvider, vscode.Disposable {
       const maximumFiles = this.configuration().get<number>("supervisorMaxFiles", 5);
       const maximumLines = this.configuration().get<number>("supervisorMaxChangedLines", 300);
       const reasons: string[] = [];
+      const concurrentOwners = overlappingTaskIds(task, this.tasks);
+      if (concurrentOwners.length > 0) {
+        task.ownershipBlockedBy = concurrentOwners;
+        task.ownershipBlockedReason = this.text(
+          `File ownership overlaps ${concurrentOwners.length} active task(s); automatic apply is queued.`,
+          `ファイル所有権が${concurrentOwners.length}件の実行中タスクと重複するため、自動適用を待機します。`,
+        );
+        reasons.push(task.ownershipBlockedReason);
+      } else {
+        task.ownershipBlockedBy = undefined;
+        task.ownershipBlockedReason = undefined;
+      }
       if (task.changes.length > maximumFiles) {
         reasons.push(this.text(
           `Changed ${task.changes.length} files; budget is ${maximumFiles}`,
@@ -657,6 +1006,37 @@ vscode.CodeLensProvider, vscode.Disposable {
           `Touched ${excluded.length} excluded file(s)`,
           `除外対象の${excluded.length}ファイルを変更`,
         ));
+      }
+      if (
+        task.changes.length > 0
+        && this.configuration().get<boolean>("supervisorReviewGate", false)
+        && this.executor
+      ) {
+        const review = await this.executor(task, worktree, this.reviewPrompt(task));
+        const verdict = parseSupervisorReviewVerdict(
+          review?.assistantText ?? review?.summary ?? "",
+        );
+        if (verdict) {
+          task.reviewVerdict = verdict.verdict;
+          if (verdict.verdict === "reject") {
+            reasons.push(
+              ...verdict.reasons.map((reason) =>
+                this.text(`Review rejected: ${reason}`, `レビュー却下: ${reason}`)
+              ),
+            );
+            if (verdict.reasons.length === 0) {
+              reasons.push(this.text(
+                "AI review gate rejected these changes.",
+                "AIレビューゲートが変更を却下しました。",
+              ));
+            }
+          }
+        } else if (review?.status === "finished") {
+          reasons.push(this.text(
+            "AI review gate did not return a usable verdict.",
+            "AIレビューゲートが有効な判定を返しませんでした。",
+          ));
+        }
       }
       task.blockedReasons = reasons.length > 0 ? reasons : undefined;
 
@@ -678,7 +1058,7 @@ vscode.CodeLensProvider, vscode.Disposable {
       this.refresh();
 
       if (this.shouldAutoApply(task)) {
-        await this.applyAll({ taskId: task.id }, true);
+        await this.enqueueAutomaticApply(task.id);
       } else {
         const openLabel = this.text("Open inbox", "受信箱を開く");
         const answer = await vscode.window.showInformationMessage(
@@ -703,7 +1083,7 @@ vscode.CodeLensProvider, vscode.Disposable {
       if (!task.runFinishedAt && (task.status === "failed" || task.status === "completed")) {
         task.runFinishedAt = Date.now();
       }
-      this.autoRunActive = false;
+      this.activeRunIds.delete(task.id);
       await this.persist();
       this.refresh();
       this.scheduleAutoRun();
@@ -790,6 +1170,12 @@ vscode.CodeLensProvider, vscode.Disposable {
     try {
       await this.applyOne(task, change);
       change.decision = "applied";
+      this.emitAudit({
+        action: "supervisor.apply",
+        summary: `Applied ${change.relative}`,
+        files: [change.relative],
+        taskId: task.id,
+      });
       await this.finishDecisions(task);
     } catch (error) {
       task.status = task.blockedReasons?.length ? "blocked" : "review";
@@ -810,6 +1196,12 @@ vscode.CodeLensProvider, vscode.Disposable {
     }
     change.decision = "discarded";
     task.updatedAt = Date.now();
+    this.emitAudit({
+      action: "supervisor.discard",
+      summary: `Discarded ${change.relative}`,
+      files: [change.relative],
+      taskId: task.id,
+    });
     await this.finishDecisions(task);
     await this.persist();
     this.refresh();
@@ -859,6 +1251,13 @@ vscode.CodeLensProvider, vscode.Disposable {
         `${conflicts.length} file(s) changed while AI was running and were not applied.`,
         `${conflicts.length}ファイルがAI実行中に更新されたため適用しませんでした。`,
       ));
+    } else {
+      this.emitAudit({
+        action: "supervisor.applyAll",
+        summary: `Applied all changes for ${task.title}`,
+        files: task.changes.filter((change) => change.decision === "applied").map((change) => change.relative),
+        taskId: task.id,
+      });
     }
     await this.finishDecisions(task);
     task.updatedAt = Date.now();
@@ -887,6 +1286,12 @@ vscode.CodeLensProvider, vscode.Disposable {
     for (const change of task.changes) {
       change.decision ??= "discarded";
     }
+    this.emitAudit({
+      action: "supervisor.discardAll",
+      summary: `Discarded all changes for ${task.title}`,
+      files: task.changes.map((change) => change.relative),
+      taskId: task.id,
+    });
     await this.finishDecisions(task);
     task.updatedAt = Date.now();
     await this.persist();
@@ -1088,19 +1493,60 @@ vscode.CodeLensProvider, vscode.Disposable {
   private async runNextAutomatic(): Promise<void> {
     if (
       this.mode() !== "autonomous"
-      || this.autoRunActive
       || this.busyCheck?.()
       || !this.withinHourlyBudget()
     ) {
       this.scheduleAutoRun(10_000);
       return;
     }
-    const task = this.tasks.find((candidate) =>
-      candidate.status === "queued" || candidate.status === "detected"
-    );
-    if (task) {
-      await this.runTask(task.id, true);
+    for (const task of this.tasks) {
+      if (task.status === "blocked" && task.dependencyIds?.length) {
+        const readiness = dependencyReadiness(task, this.tasks);
+        if (readiness.ready && !(task.changes?.length)) {
+          task.status = "queued";
+          task.error = undefined;
+        }
+      }
     }
+    const maximumParallel = Math.max(
+      1,
+      this.configuration().get<number>("supervisorMaxParallelTasks", 2),
+    );
+    const available = Math.max(0, maximumParallel - this.activeRunIds.size);
+    const tasks = selectRunnableSupervisorTasks(this.tasks, available);
+    if (tasks.length === 0) {
+      this.scheduleAutoRun(10_000);
+      return;
+    }
+    await this.persist();
+    this.refresh();
+    await Promise.all(tasks.map((task) => this.runTask(task.id, true)));
+  }
+
+  private scheduleGitHubScan(delay = 5 * 60 * 1000): void {
+    if (this.githubScheduler) {
+      clearTimeout(this.githubScheduler);
+      this.githubScheduler = undefined;
+    }
+    if (
+      !vscode.workspace.isTrusted
+      || !this.configuration().get<boolean>("supervisorGitHubTrigger", false)
+      || this.mode() === "off"
+    ) {
+      return;
+    }
+    this.githubScheduler = setTimeout(() => {
+      this.githubScheduler = undefined;
+      void this.scanGitHubSignals(false);
+    }, Math.max(30_000, delay));
+  }
+
+  private async enqueueAutomaticApply(taskId: string): Promise<void> {
+    const operation = this.applyQueue
+      .catch(() => {})
+      .then(() => this.applyAll({ taskId }, true));
+    this.applyQueue = operation;
+    await operation;
   }
 
   private withinHourlyBudget(): boolean {
@@ -1128,6 +1574,9 @@ vscode.CodeLensProvider, vscode.Disposable {
     const exclusions = this.configuration().get<string[]>("supervisorExcludedGlobs", []);
     return [
       task.detail,
+      task.dependencyIds?.length
+        ? `This task started after ${task.dependencyIds.length} prerequisite task(s) completed.`
+        : undefined,
       "",
       "You are executing an isolated AI Supervisor task.",
       "Investigate the issue, make the smallest coherent fix, and add or update focused tests when useful.",
@@ -1145,6 +1594,33 @@ vscode.CodeLensProvider, vscode.Disposable {
       "</SUPERVISOR_CHANGE_REASONS>",
       "Include every changed file exactly once. Write reasons in the same language as the task when practical.",
     ].filter((line): line is string => typeof line === "string").join("\n");
+  }
+
+  private reviewPrompt(task: SupervisorTask): string {
+    const files = (task.changes ?? [])
+      .map((change) => `- ${change.relative} (${change.kind}, +${change.added}/-${change.deleted}): ${
+        change.reason ?? "no reason"
+      }`)
+      .join("\n");
+    return [
+      "You are reviewing an isolated AI Supervisor change set.",
+      "Do not edit any files. Do not run destructive commands.",
+      "Reject changes that look unsafe, overscoped, secret-touching, or unrelated to the task.",
+      `Task: ${task.title}`,
+      task.detail,
+      "",
+      "Proposed changes:",
+      files || "(none)",
+      "",
+      "End your response with exactly this machine-readable block:",
+      "<SUPERVISOR_REVIEW_VERDICT>",
+      '{"verdict":"approve"|"reject","reasons":["concise reason"]}',
+      "</SUPERVISOR_REVIEW_VERDICT>",
+    ].join("\n");
+  }
+
+  private emitAudit(event: SupervisorAuditEvent): void {
+    this.onAudit?.(event);
   }
 
   private taskSession(task: SupervisorTask): IsolatedWorktreeSession | undefined {
@@ -1253,13 +1729,48 @@ vscode.CodeLensProvider, vscode.Disposable {
     task.status = "completed";
     task.runFinishedAt ??= Date.now();
     await this.cleanupWorktree(task);
+    this.refreshOwnershipBlocks();
+    this.scheduleAutoRun(0);
+  }
+
+  private refreshOwnershipBlocks(): void {
+    for (const candidate of this.tasks) {
+      if (!candidate.ownershipBlockedReason || !candidate.changes?.length) {
+        continue;
+      }
+      const overlaps = overlappingTaskIds(candidate, this.tasks);
+      const priorReason = candidate.ownershipBlockedReason;
+      candidate.blockedReasons = (candidate.blockedReasons ?? [])
+        .filter((reason) => reason !== priorReason);
+      if (overlaps.length > 0) {
+        candidate.ownershipBlockedBy = overlaps;
+        candidate.ownershipBlockedReason = this.text(
+          `File ownership overlaps ${overlaps.length} active task(s); automatic apply is queued.`,
+          `ファイル所有権が${overlaps.length}件の実行中タスクと重複するため、自動適用を待機します。`,
+        );
+        candidate.blockedReasons.push(candidate.ownershipBlockedReason);
+        candidate.status = "blocked";
+        continue;
+      }
+      candidate.ownershipBlockedBy = undefined;
+      candidate.ownershipBlockedReason = undefined;
+      candidate.blockedReasons = candidate.blockedReasons.length > 0
+        ? candidate.blockedReasons
+        : undefined;
+      candidate.status = candidate.blockedReasons?.length ? "blocked" : "review";
+      if (this.shouldAutoApply(candidate)) {
+        void this.enqueueAutomaticApply(candidate.id);
+      }
+    }
   }
 
   private shouldAutoApply(task: SupervisorTask): boolean {
     if (
       this.mode() !== "autonomous"
+      || !vscode.workspace.isTrusted
       || !this.configuration().get<boolean>("supervisorAutoApplySafeChanges", false)
       || task.blockedReasons?.length
+      || task.reviewVerdict === "reject"
       || task.verification?.success !== true
       || task.verification.skipped
     ) {

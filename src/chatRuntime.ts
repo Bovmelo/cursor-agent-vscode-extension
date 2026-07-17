@@ -1,6 +1,7 @@
 import { Agent } from "@cursor/sdk";
 import type { IsolatedWorktreeSession } from "./isolatedWorktree.js";
 import type { LiveChatRun } from "./chatTypes.js";
+import type { FileOwnershipLease } from "./parallelOwnership.js";
 
 export type CursorAgent = Awaited<ReturnType<typeof Agent.create>>;
 export type CursorRun = Awaited<ReturnType<CursorAgent["send"]>>;
@@ -18,4 +19,5 @@ export class ChatRuntime {
   public live?: LiveChatRun;
   public isolatedWorktree?: IsolatedWorktreeSession;
   public isolationKind?: "parallel" | "windows-safe";
+  public ownershipLease?: FileOwnershipLease;
 }

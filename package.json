@@ -2,7 +2,7 @@
   "name": "cursor-subscription-for-vscode",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "publisher": "ark4ez",
   "license": "MIT",
   "type": "module",
@@ -39,13 +39,17 @@
     "onView:cursorSubscription.chatView",
     "onView:cursorSubscription.changeSessions",
     "onView:cursorSubscription.supervisorTasks",
+    "onView:cursorSubscription.backgroundJobs",
+    "onView:cursorSubscription.auditTimeline",
     "onCommand:cursorSubscription.generateCommitMessage",
     "onCommand:cursorSubscription.generateCode",
     "onCommand:cursorSubscription.explainSelection",
     "onCommand:cursorSubscription.addFileToChat",
     "onCommand:cursorSubscription.runAutopilot",
     "onCommand:cursorSubscription.reviewChanges",
-    "onCommand:cursorSubscription.debugContext"
+    "onCommand:cursorSubscription.debugContext",
+    "onCommand:cursorSubscription.executeLastPlan",
+    "onCommand:cursorSubscription.scanSupervisorGitHub"
   ],
   "main": "./out/extension.js",
   "scripts": {
@@ -195,6 +199,85 @@
         "command": "cursorSubscription.dismissSupervisorTask",
         "title": "%command.dismissSupervisorTask%",
         "icon": "$(close)"
+      },
+      {
+        "command": "cursorSubscription.runTaskPipeline",
+        "title": "%command.runTaskPipeline%"
+      },
+      {
+        "command": "cursorSubscription.exportAuditLog",
+        "title": "%command.exportAuditLog%"
+      },
+      {
+        "command": "cursorSubscription.refreshIntegrations",
+        "title": "%command.refreshIntegrations%",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "cursorSubscription.previewIntegration",
+        "title": "%command.previewIntegration%"
+      },
+      {
+        "command": "cursorSubscription.enableIntegration",
+        "title": "%command.enableIntegration%"
+      },
+      {
+        "command": "cursorSubscription.disableIntegration",
+        "title": "%command.disableIntegration%"
+      },
+      {
+        "command": "cursorSubscription.openIntegration",
+        "title": "%command.openIntegration%"
+      },
+      {
+        "command": "cursorSubscription.scanSupervisorTodos",
+        "title": "%command.scanSupervisorTodos%"
+      },
+      {
+        "command": "cursorSubscription.scanSupervisorGitHub",
+        "title": "%command.scanSupervisorGitHub%"
+      },
+      {
+        "command": "cursorSubscription.compareChangeSessions",
+        "title": "%command.compareChangeSessions%"
+      },
+      {
+        "command": "cursorSubscription.executeLastPlan",
+        "title": "%command.executeLastPlan%"
+      },
+      {
+        "command": "cursorSubscription.compareSessionContents",
+        "title": "%command.compareSessionContents%"
+      },
+      {
+        "command": "cursorSubscription.startBackgroundJob",
+        "title": "%command.startBackgroundJob%",
+        "icon": "$(add)"
+      },
+      {
+        "command": "cursorSubscription.refreshBackgroundJobs",
+        "title": "%command.refreshBackgroundJobs%",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "cursorSubscription.applyBackgroundJob",
+        "title": "%command.applyBackgroundJob%",
+        "icon": "$(check)"
+      },
+      {
+        "command": "cursorSubscription.cancelBackgroundJob",
+        "title": "%command.cancelBackgroundJob%",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "cursorSubscription.discardBackgroundJob",
+        "title": "%command.discardBackgroundJob%",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "cursorSubscription.refreshAuditTimeline",
+        "title": "%command.refreshAuditTimeline%",
+        "icon": "$(refresh)"
       }
     ],
     "menus": {
@@ -281,6 +364,36 @@
           "command": "cursorSubscription.discardSupervisorChange",
           "when": "view == cursorSubscription.supervisorTasks && (viewItem == cursorSupervisor.change.pending || viewItem == cursorSupervisor.change.excluded)",
           "group": "inline@2"
+        },
+        {
+          "command": "cursorSubscription.enableIntegration",
+          "when": "view == cursorSubscription.integrations && viewItem == cursorIntegration.item.disabled",
+          "group": "inline@1"
+        },
+        {
+          "command": "cursorSubscription.disableIntegration",
+          "when": "view == cursorSubscription.integrations && viewItem == cursorIntegration.item.enabled",
+          "group": "inline@1"
+        },
+        {
+          "command": "cursorSubscription.openIntegration",
+          "when": "view == cursorSubscription.integrations && viewItem =~ /cursorIntegration\\.item\\./",
+          "group": "inline@2"
+        },
+        {
+          "command": "cursorSubscription.applyBackgroundJob",
+          "when": "view == cursorSubscription.backgroundJobs && viewItem == cursorBackground.job.completed",
+          "group": "inline@1"
+        },
+        {
+          "command": "cursorSubscription.cancelBackgroundJob",
+          "when": "view == cursorSubscription.backgroundJobs && (viewItem == cursorBackground.job.starting || viewItem == cursorBackground.job.running)",
+          "group": "inline@1"
+        },
+        {
+          "command": "cursorSubscription.discardBackgroundJob",
+          "when": "view == cursorSubscription.backgroundJobs && (viewItem == cursorBackground.job.completed || viewItem == cursorBackground.job.error || viewItem == cursorBackground.job.cancelled)",
+          "group": "inline@2"
         }
       ],
       "view/title": [
@@ -298,6 +411,41 @@
           "command": "cursorSubscription.chooseSupervisorMode",
           "when": "view == cursorSubscription.supervisorTasks",
           "group": "navigation@3"
+        },
+        {
+          "command": "cursorSubscription.scanSupervisorTodos",
+          "when": "view == cursorSubscription.supervisorTasks",
+          "group": "navigation@4"
+        },
+        {
+          "command": "cursorSubscription.scanSupervisorGitHub",
+          "when": "view == cursorSubscription.supervisorTasks",
+          "group": "navigation@5"
+        },
+        {
+          "command": "cursorSubscription.refreshIntegrations",
+          "when": "view == cursorSubscription.integrations",
+          "group": "navigation@1"
+        },
+        {
+          "command": "cursorSubscription.startBackgroundJob",
+          "when": "view == cursorSubscription.backgroundJobs",
+          "group": "navigation@1"
+        },
+        {
+          "command": "cursorSubscription.refreshBackgroundJobs",
+          "when": "view == cursorSubscription.backgroundJobs",
+          "group": "navigation@2"
+        },
+        {
+          "command": "cursorSubscription.refreshAuditTimeline",
+          "when": "view == cursorSubscription.auditTimeline",
+          "group": "navigation@1"
+        },
+        {
+          "command": "cursorSubscription.exportAuditLog",
+          "when": "view == cursorSubscription.auditTimeline",
+          "group": "navigation@2"
         }
       ]
     },
@@ -324,6 +472,18 @@
         {
           "id": "cursorSubscription.supervisorTasks",
           "name": "%view.supervisorTasks%"
+        },
+        {
+          "id": "cursorSubscription.integrations",
+          "name": "%view.integrations%"
+        },
+        {
+          "id": "cursorSubscription.backgroundJobs",
+          "name": "%view.backgroundJobs%"
+        },
+        {
+          "id": "cursorSubscription.auditTimeline",
+          "name": "%view.auditTimeline%"
         }
       ]
     },
@@ -471,6 +631,77 @@
           ],
           "description": "%config.supervisorAutoApplyGlobs.description%"
         },
+        "cursorSubscription.supervisorTodoTrigger": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.supervisorTodoTrigger.description%"
+        },
+        "cursorSubscription.supervisorTestFailureTrigger": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.supervisorTestFailureTrigger.description%"
+        },
+        "cursorSubscription.supervisorReviewGate": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.supervisorReviewGate.description%"
+        },
+        "cursorSubscription.supervisorMaxParallelTasks": {
+          "type": "integer",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 8,
+          "description": "%config.supervisorMaxParallelTasks.description%"
+        },
+        "cursorSubscription.supervisorGitHubTrigger": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.supervisorGitHubTrigger.description%"
+        },
+        "cursorSubscription.pipelineAutoKeep": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.pipelineAutoKeep.description%"
+        },
+        "cursorSubscription.dailyTokenBudget": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "description": "%config.dailyTokenBudget.description%"
+        },
+        "cursorSubscription.monthlyTokenBudget": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "description": "%config.monthlyTokenBudget.description%"
+        },
+        "cursorSubscription.monthlyCostLimitUsd": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "%config.monthlyCostLimitUsd.description%"
+        },
+        "cursorSubscription.estimatedCostPerMillionTokensUsd": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "%config.estimatedCostPerMillionTokensUsd.description%"
+        },
+        "cursorSubscription.changeSessionReviewPolicy": {
+          "type": "string",
+          "enum": [
+            "prompt",
+            "keep-all",
+            "restore-all"
+          ],
+          "enumDescriptions": [
+            "%config.changeSessionReviewPolicy.prompt%",
+            "%config.changeSessionReviewPolicy.keepAll%",
+            "%config.changeSessionReviewPolicy.restoreAll%"
+          ],
+          "default": "prompt",
+          "description": "%config.changeSessionReviewPolicy.description%"
+        },
         "cursorSubscription.enableAutopilot": {
           "type": "boolean",
           "default": true,
@@ -568,6 +799,68 @@
           "type": "boolean",
           "default": false,
           "description": "%config.enableInlineCompletions.description%"
+        },
+        "cursorSubscription.inlineCompletionDebounceMs": {
+          "type": "integer",
+          "default": 350,
+          "minimum": 0,
+          "maximum": 3000,
+          "description": "%config.inlineCompletionDebounceMs.description%"
+        },
+        "cursorSubscription.inlineCompletionMinPrefixCharacters": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 40,
+          "description": "%config.inlineCompletionMinPrefixCharacters.description%"
+        },
+        "cursorSubscription.inlineCompletionMaxCharacters": {
+          "type": "integer",
+          "default": 1200,
+          "minimum": 40,
+          "maximum": 10000,
+          "description": "%config.inlineCompletionMaxCharacters.description%"
+        },
+        "cursorSubscription.inlineCompletionMaxLines": {
+          "type": "integer",
+          "default": 24,
+          "minimum": 1,
+          "maximum": 200,
+          "description": "%config.inlineCompletionMaxLines.description%"
+        },
+        "cursorSubscription.inlineCompletionPauseDuringAgentRuns": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.inlineCompletionPauseDuringAgentRuns.description%"
+        },
+        "cursorSubscription.inlineCompletionIncludeProjectRules": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.inlineCompletionIncludeProjectRules.description%"
+        },
+        "cursorSubscription.maxBackgroundJobs": {
+          "type": "integer",
+          "default": 2,
+          "minimum": 1,
+          "maximum": 8,
+          "description": "%config.maxBackgroundJobs.description%"
+        },
+        "cursorSubscription.backgroundMaxRunMinutes": {
+          "type": "integer",
+          "default": 240,
+          "minimum": 1,
+          "maximum": 1440,
+          "description": "%config.backgroundMaxRunMinutes.description%"
+        },
+        "cursorSubscription.auditSharedLogEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.auditSharedLogEnabled.description%"
+        },
+        "cursorSubscription.auditSharedLogPath": {
+          "type": "string",
+          "default": ".cursor/ai-audit-log.jsonl",
+          "description": "%config.auditSharedLogPath.description%"
         },
         "cursorSubscription.includeProjectMemory": {
           "type": "boolean",

@@ -175,9 +175,11 @@ export class WebviewController {
           usageTitle: "使用量",
           usageToday: "今日",
           usageWeek: "直近7日",
+          usageMonth: "今月",
           usageChat: "チャット",
           usageSupervisor: "Supervisor",
           usageConversations: "会話合計",
+          usageInlineAcceptance: "インライン補完採用率",
           searchConversations: "会話を検索",
           pinConversation: "ピン留め",
           unpinConversation: "ピン解除",
@@ -194,6 +196,10 @@ export class WebviewController {
           pickWinner: "勝者にする",
           compareRuns: "比較",
           compareTitle: "best-of-N 比較",
+          orchestrateDescription: "計画してサブタスクを並列実行し、結果を統合",
+          budgetLabel: "予算",
+          monthlyBudgetLabel: "月間予算",
+          estimatedCostLabel: "推定コスト",
           contextPreview: "送信コンテキスト",
           openCandidate: "開く",
           experimentsTitle: "比較実験",
@@ -313,9 +319,11 @@ export class WebviewController {
           usageTitle: "Usage",
           usageToday: "Today",
           usageWeek: "Last 7 days",
+          usageMonth: "This month",
           usageChat: "Chat",
           usageSupervisor: "Supervisor",
           usageConversations: "All conversations",
+          usageInlineAcceptance: "Inline completion acceptance",
           searchConversations: "Search conversations",
           pinConversation: "Pin",
           unpinConversation: "Unpin",
@@ -332,6 +340,10 @@ export class WebviewController {
           pickWinner: "Pick as winner",
           compareRuns: "Compare",
           compareTitle: "best-of-N compare",
+          orchestrateDescription: "Plan, run subtasks in parallel, then synthesize",
+          budgetLabel: "Budget",
+          monthlyBudgetLabel: "Monthly budget",
+          estimatedCostLabel: "Estimated cost",
           contextPreview: "Send context",
           openCandidate: "Open",
           experimentsTitle: "Compare experiments",
@@ -1886,9 +1898,14 @@ export class WebviewController {
         <div class="usage-grid">
           <div>${ui.usageToday}: <strong id="usageTodayTotal">0</strong></div>
           <div>${ui.usageWeek}: <strong id="usageWeekTotal">0</strong></div>
+          <div>${ui.usageMonth}: <strong id="usageMonthTotal">0</strong></div>
           <div>${ui.usageChat}: <strong id="usageChatTotal">0</strong></div>
           <div>${ui.usageSupervisor}: <strong id="usageSupervisorTotal">0</strong></div>
           <div>${ui.usageConversations}: <strong id="usageConversationTotal">0</strong></div>
+          <div>${ui.usageInlineAcceptance}: <strong id="usageInlineAcceptance">—</strong></div>
+          <div>${ui.budgetLabel}: <strong id="usageBudgetTotal">—</strong></div>
+          <div>${ui.monthlyBudgetLabel}: <strong id="usageMonthlyBudgetTotal">—</strong></div>
+          <div>${ui.estimatedCostLabel}: <strong id="usageEstimatedCostTotal">—</strong></div>
         </div>
       </div>
       <div id="experimentsPanel" hidden>
@@ -2024,9 +2041,14 @@ export class WebviewController {
     const usagePanel = document.getElementById("usagePanel");
     const usageTodayTotal = document.getElementById("usageTodayTotal");
     const usageWeekTotal = document.getElementById("usageWeekTotal");
+    const usageMonthTotal = document.getElementById("usageMonthTotal");
     const usageChatTotal = document.getElementById("usageChatTotal");
     const usageSupervisorTotal = document.getElementById("usageSupervisorTotal");
     const usageConversationTotal = document.getElementById("usageConversationTotal");
+    const usageInlineAcceptance = document.getElementById("usageInlineAcceptance");
+    const usageBudgetTotal = document.getElementById("usageBudgetTotal");
+    const usageMonthlyBudgetTotal = document.getElementById("usageMonthlyBudgetTotal");
+    const usageEstimatedCostTotal = document.getElementById("usageEstimatedCostTotal");
     const experimentsPanel = document.getElementById("experimentsPanel");
     const experimentList = document.getElementById("experimentList");
     const comparePanel = document.getElementById("comparePanel");
@@ -2111,6 +2133,10 @@ export class WebviewController {
     let conversationSearchQuery = "";
     let conversationSearchTimer;
     let usageSummary = null;
+    let usageBudget = null;
+    let usageMonthlyBudget = null;
+    let usageEstimatedCost = null;
+    let usageInlineCompletion = null;
     let bestOfNExperiments = [];
     let contextEstimateTimer;
     let selectedFiles = [];
@@ -2236,6 +2262,14 @@ export class WebviewController {
           icon: "☰",
           bestOfN: true,
         },
+        {
+          id: "orchestrate",
+          aliases: ["orchestrate"],
+          label: "/orchestrate",
+          description: i18n.orchestrateDescription,
+          icon: "⧉",
+          orchestrate: true,
+        },
       ];
       const templates = projectCommands.map((command) => ({
         id: command.id,
@@ -2257,6 +2291,17 @@ export class WebviewController {
           profile: undefined,
           commandId: undefined,
           bestOfN: true,
+          orchestrate: false,
+        };
+      }
+      const orchestrateMatch = /^\\/(orchestrate)(?:\\s+|$)/i.exec(text);
+      if (orchestrateMatch) {
+        return {
+          text: text.slice(orchestrateMatch[0].length).replace(/^\\s+/, ""),
+          profile: undefined,
+          commandId: undefined,
+          bestOfN: false,
+          orchestrate: true,
         };
       }
       const profileMatch = /^\\/(agent|standard|plan|multitask)(?:\\s+|$)/i.exec(text);
@@ -2268,6 +2313,7 @@ export class WebviewController {
           profile,
           commandId: undefined,
           bestOfN: false,
+          orchestrate: false,
         };
       }
       const templateMatch = /^\\/([a-z0-9][a-z0-9_-]{0,63})(?:\\s+|$)/i.exec(text);
@@ -2279,10 +2325,11 @@ export class WebviewController {
             profile: undefined,
             commandId,
             bestOfN: false,
+            orchestrate: false,
           };
         }
       }
-      return { text, profile: undefined, commandId: undefined, bestOfN: false };
+      return { text, profile: undefined, commandId: undefined, bestOfN: false, orchestrate: false };
     }
 
     function renderMainAddMenu() {
@@ -2648,9 +2695,33 @@ export class WebviewController {
       usagePanel.hidden = false;
       usageTodayTotal.textContent = formatTokens(usageSummary.today.total);
       usageWeekTotal.textContent = formatTokens(usageSummary.last7Days.total);
+      usageMonthTotal.textContent = formatTokens(usageSummary.thisMonth?.total || 0);
       usageChatTotal.textContent = formatTokens(usageSummary.last7Days.chat);
       usageSupervisorTotal.textContent = formatTokens(usageSummary.last7Days.supervisor);
       usageConversationTotal.textContent = formatTokens(usageSummary.conversationTotal);
+      usageInlineAcceptance.textContent = usageInlineCompletion && usageInlineCompletion.suggested > 0
+        ? (Number(usageInlineCompletion.acceptanceRate || 0) * 100).toFixed(1) + "% ("
+          + usageInlineCompletion.accepted + "/" + usageInlineCompletion.suggested + ")"
+        : "—";
+      if (usageBudget && usageBudget.budget > 0) {
+        usageBudgetTotal.textContent =
+          formatTokens(usageBudget.used) + "/" + formatTokens(usageBudget.budget);
+      } else {
+        usageBudgetTotal.textContent = "—";
+      }
+      if (usageMonthlyBudget && usageMonthlyBudget.budget > 0) {
+        usageMonthlyBudgetTotal.textContent =
+          formatTokens(usageMonthlyBudget.used) + "/" + formatTokens(usageMonthlyBudget.budget);
+      } else {
+        usageMonthlyBudgetTotal.textContent = "—";
+      }
+      if (usageEstimatedCost && usageEstimatedCost.limitUsd > 0) {
+        usageEstimatedCostTotal.textContent =
+          "$" + Number(usageEstimatedCost.estimatedUsd || 0).toFixed(2)
+          + "/$" + Number(usageEstimatedCost.limitUsd).toFixed(2);
+      } else {
+        usageEstimatedCostTotal.textContent = "—";
+      }
     }
 
     function renderExperiments() {
@@ -3164,6 +3235,17 @@ export class WebviewController {
         const after = slashRange ? prompt.value.slice(slashRange.end) : prompt.value;
         prompt.value = before + "/compare " + after.replace(/^\\s+/, "");
         const caret = before.length + "/compare ".length;
+        prompt.selectionStart = prompt.selectionEnd = caret;
+        closeSlashPicker();
+        autoGrow();
+        prompt.focus();
+        return;
+      }
+      if (command.orchestrate) {
+        const before = slashRange ? prompt.value.slice(0, slashRange.start) : "";
+        const after = slashRange ? prompt.value.slice(slashRange.end) : prompt.value;
+        prompt.value = before + "/orchestrate " + after.replace(/^\\s+/, "");
+        const caret = before.length + "/orchestrate ".length;
         prompt.selectionStart = prompt.selectionEnd = caret;
         closeSlashPicker();
         autoGrow();
@@ -4022,6 +4104,8 @@ export class WebviewController {
       const files = selectedFiles.slice();
       const displayText = consumed.bestOfN
         ? (text ? "/compare " + text : "/compare")
+        : consumed.orchestrate
+          ? (text ? "/orchestrate " + text : "/orchestrate")
         : consumed.commandId
           ? (text ? "/" + consumed.commandId + " " + text : "/" + consumed.commandId)
           : text;
@@ -4038,6 +4122,21 @@ export class WebviewController {
         clearComposerMessage();
         primeRunningSound();
         vscode.postMessage(messagePayload("startBestOfN", text, files));
+        return;
+      }
+
+      if (consumed.orchestrate) {
+        if (!text) {
+          return;
+        }
+        showChat();
+        followOutput = true;
+        addUserMessage(displayText, files);
+        assistantRaw = "";
+        assistantNode = addAssistantMessage("");
+        clearComposerMessage();
+        primeRunningSound();
+        vscode.postMessage(messagePayload("startOrchestrate", text, files));
         return;
       }
 
@@ -4508,6 +4607,10 @@ export class WebviewController {
           break;
         case "usageStats":
           usageSummary = data.summary || null;
+          usageBudget = data.budget || null;
+          usageMonthlyBudget = data.monthlyBudget || null;
+          usageEstimatedCost = data.estimatedCost || null;
+          usageInlineCompletion = data.inlineCompletion || null;
           renderUsagePanel();
           if (view === "home") {
             renderTasks();

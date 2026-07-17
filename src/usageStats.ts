@@ -29,6 +29,11 @@ export interface UsageSummary {
     supervisor: number;
     total: number;
   };
+  thisMonth: {
+    chat: number;
+    supervisor: number;
+    total: number;
+  };
   conversations: number;
   conversationTotal: number;
 }
@@ -85,7 +90,7 @@ export function recordUsage(
     ...bucket,
     [source]: addTokenUsage(bucket[source], usage),
   };
-  pruneOldDays(next, 30);
+  pruneOldDays(next, 120);
   return next;
 }
 
@@ -111,6 +116,88 @@ export function formatTokenCount(value: number): string {
   return String(Math.max(0, Math.round(value)));
 }
 
+export type BudgetStatus = "ok" | "warning" | "exceeded";
+
+export interface BudgetSnapshot {
+  budget: number;
+  used: number;
+  remaining: number;
+  ratio: number;
+  status: BudgetStatus;
+}
+
+export function budgetSnapshot(
+  ledger: UsageLedger | undefined,
+  dailyTokenBudget: number,
+): BudgetSnapshot | undefined {
+  const budget = Math.max(0, Math.floor(dailyTokenBudget));
+  if (budget <= 0) {
+    return undefined;
+  }
+  const used = summarizeUsage([], ledger).today.total;
+  const remaining = Math.max(0, budget - used);
+  const ratio = used / budget;
+  const status: BudgetStatus = ratio >= 1 ? "exceeded" : ratio >= 0.8 ? "warning" : "ok";
+  return { budget, used, remaining, ratio, status };
+}
+
+export function monthKey(date = new Date()): string {
+  return dayKey(date).slice(0, 7);
+}
+
+export function monthlyBudgetSnapshot(
+  ledger: UsageLedger | undefined,
+  monthlyTokenBudget: number,
+  at = new Date(),
+): BudgetSnapshot | undefined {
+  const budget = Math.max(0, Math.floor(monthlyTokenBudget));
+  if (budget <= 0) {
+    return undefined;
+  }
+  const prefix = `${monthKey(at)}-`;
+  let used = 0;
+  for (const [key, bucket] of Object.entries(ledger?.days ?? {})) {
+    if (key.startsWith(prefix)) {
+      used += bucket.chat.totalTokens + bucket.supervisor.totalTokens;
+    }
+  }
+  const remaining = Math.max(0, budget - used);
+  const ratio = used / budget;
+  const status: BudgetStatus = ratio >= 1 ? "exceeded" : ratio >= 0.8 ? "warning" : "ok";
+  return { budget, used, remaining, ratio, status };
+}
+
+export interface EstimatedCostSnapshot extends BudgetSnapshot {
+  /** Approximation based on the user-configured blended USD/token rate. */
+  estimatedUsd: number;
+  limitUsd: number;
+  usdPerMillionTokens: number;
+}
+
+export function estimatedMonthlyCostSnapshot(
+  ledger: UsageLedger | undefined,
+  limitUsd: number,
+  usdPerMillionTokens: number,
+  at = new Date(),
+): EstimatedCostSnapshot | undefined {
+  if (limitUsd <= 0 || usdPerMillionTokens <= 0) {
+    return undefined;
+  }
+  const tokenSnapshot = monthlyBudgetSnapshot(ledger, Number.MAX_SAFE_INTEGER, at)!;
+  const estimatedUsd = tokenSnapshot.used / 1_000_000 * usdPerMillionTokens;
+  const ratio = estimatedUsd / limitUsd;
+  return {
+    budget: limitUsd,
+    used: estimatedUsd,
+    remaining: Math.max(0, limitUsd - estimatedUsd),
+    ratio,
+    status: ratio >= 1 ? "exceeded" : ratio >= 0.8 ? "warning" : "ok",
+    estimatedUsd,
+    limitUsd,
+    usdPerMillionTokens,
+  };
+}
+
 export function summarizeUsage(
   conversations: ReadonlyArray<{ tokenUsage?: StoredTokenUsage }>,
   ledger: UsageLedger | undefined,
@@ -122,11 +209,17 @@ export function summarizeUsage(
 
   let weekChat = 0;
   let weekSupervisor = 0;
+  let monthChat = 0;
+  let monthSupervisor = 0;
   const weekStart = new Date();
   weekStart.setHours(0, 0, 0, 0);
   weekStart.setDate(weekStart.getDate() - 6);
   const weekStartKey = dayKey(weekStart);
   for (const [key, bucket] of Object.entries(ledger?.days ?? {})) {
+    if (key.startsWith(`${monthKey()}-`)) {
+      monthChat += bucket.chat.totalTokens;
+      monthSupervisor += bucket.supervisor.totalTokens;
+    }
     if (key < weekStartKey) {
       continue;
     }
@@ -149,6 +242,11 @@ export function summarizeUsage(
       chat: weekChat,
       supervisor: weekSupervisor,
       total: weekChat + weekSupervisor,
+    },
+    thisMonth: {
+      chat: monthChat,
+      supervisor: monthSupervisor,
+      total: monthChat + monthSupervisor,
     },
     conversations: conversations.length,
     conversationTotal,

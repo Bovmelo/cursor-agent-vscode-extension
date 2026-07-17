@@ -1,5 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { execFile as execFileCallback } from "node:child_process";
+import { promisify } from "node:util";
 import { Buffer } from "node:buffer";
+import { appendFile, mkdir } from "node:fs/promises";
 import * as path from "node:path";
 import {
   Agent,
@@ -54,6 +57,7 @@ import {
   prepareAiConflictResolution,
   prepareIsolatedWorktree,
   type PreparedAiConflict,
+  type IsolatedChange,
   type IsolatedWorktreeSession,
 } from "./isolatedWorktree.js";
 import {
@@ -72,9 +76,38 @@ import {
 } from "./supervisor.js";
 import { SupervisorAgentRunner } from "./supervisorRunner.js";
 import {
+  AUDIT_LOG_KEY,
+  appendAuditEntry,
+  formatAuditLogMarkdown,
+  type AuditAction,
+  type AuditEntry,
+} from "./auditLog.js";
+import { IntegrationCatalogController } from "./integrationCatalogView.js";
+import {
+  attachSubtasks,
+  buildSynthesisPrompt,
+  createOrchestratorExperiment,
+  markSubtaskConversation,
+  markSubtaskStatus,
+  parseOrchestratorSubtasks,
+  type OrchestratorExperiment,
+} from "./orchestrator.js";
+import { scanTodoAiComments } from "./todoScanner.js";
+import {
+  createExecutionPlan,
+  parseExecutionPlanSteps,
+  type ExecutionPlan,
+} from "./executionPlan.js";
+import {
   addTokenUsage,
+  budgetSnapshot,
+  estimatedMonthlyCostSnapshot,
+  formatTokenCount,
+  monthlyBudgetSnapshot,
+  monthKey,
   recordUsage,
   summarizeUsage,
+  dayKey,
   USAGE_LEDGER_KEY,
   type StoredTokenUsage,
   type UsageLedger,
@@ -84,6 +117,16 @@ import {
 import { pickWorkspaceFolder, resolveWorkspaceFolder, configurationFor, workspaceDisplayName, resolveAbsoluteInWorkspace, workspaceFolderFromUri, defaultWorkspaceFolder } from "./workspaceFolder.js";
 import { WebviewController } from "./webviewController.js";
 import { cleanupOrphanedManagedWorktrees } from "./worktreeLifecycle.js";
+import { ApplyQueue, FileOwnershipCoordinator } from "./parallelOwnership.js";
+import { AuditTimelineController } from "./auditTimeline.js";
+import { BackgroundJobsController } from "./backgroundJobs.js";
+import type { BackgroundJob } from "./backgroundJobTypes.js";
+import {
+  inlineCompletionAcceptanceRate,
+  sanitizeInlineCompletion,
+  shouldRequestInlineCompletion,
+  type InlineCompletionStats,
+} from "./inlineCompletion.js";
 import {
   canStartAnotherParallelAgent,
   computeOverlappedMutationFlags,
@@ -109,7 +152,14 @@ const SANDBOX_WARNING_ACK_KEY = "cursorSubscription.sandboxWarningAcknowledged";
 const WINDOWS_SAFE_MODE_MIGRATION_KEY = "cursorSubscription.windowsSafeModeDefaultAppliedV1";
 const PARALLEL_EDIT_WARNING_KEY = "cursorSubscription.parallelEditWarningShown";
 const BEST_OF_N_KEY = "cursorSubscription.bestOfNExperiments";
+const ORCHESTRATOR_KEY = "cursorSubscription.orchestratorExperiments";
+const EXECUTION_PLANS_KEY = "cursorSubscription.executionPlans";
+const UNTRUSTED_WORKSPACE_WARNING_KEY = "cursorSubscription.untrustedWorkspaceWarningShown";
+const BUDGET_WARNED_KEY_PREFIX = "cursorSubscription.budgetWarned";
+const MAX_INLINE_COMPLETION_CACHE = 32;
+const INLINE_COMPLETION_STATS_KEY = "cursorSubscription.inlineCompletionStats";
 const VIEW_ID = "cursorSubscription.chatView";
+const execFileAsync = promisify(execFileCallback);
 const DEFAULT_MODEL = "auto";
 const IS_JAPANESE = vscode.env.language.toLowerCase().startsWith("ja");
 const MAX_DROPPED_FILE_BYTES = 20 * 1024 * 1024;
@@ -165,6 +215,18 @@ export function activate(context: vscode.ExtensionContext): void {
     changeSessions,
     reviewDiagnostics,
   );
+  const auditTimeline = new AuditTimelineController(context.workspaceState, IS_JAPANESE);
+  provider.setAuditTimeline(auditTimeline);
+  const backgroundJobs = new BackgroundJobsController(
+    context,
+    output,
+    IS_JAPANESE,
+    (job, changes) => provider.applyBackgroundJob(job, changes),
+    (job, action) => provider.recordAudit({
+      action,
+      summary: `${action === "background.cancel" ? "Cancelled" : "Discarded"} background job: ${job.title}`,
+    }),
+  );
   const cleanupChatWorktrees = (folder: vscode.WorkspaceFolder): void => {
     void cleanupOrphanedManagedWorktrees(
       folder.uri.fsPath,
@@ -200,14 +262,34 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       return outcome;
     },
-    () => supervisorRunner.isBusy(),
-    () => supervisorRunner.cancel(),
+    () => supervisorRunner.isAtCapacity(),
+    (taskId) => supervisorRunner.cancel(taskId),
   );
   const supervisorTree = vscode.window.createTreeView(
     "cursorSubscription.supervisorTasks",
     { treeDataProvider: supervisor },
   );
   supervisor.attachTreeView(supervisorTree);
+  const integrations = new IntegrationCatalogController(context.workspaceState, IS_JAPANESE);
+  const integrationsTree = vscode.window.createTreeView(
+    "cursorSubscription.integrations",
+    { treeDataProvider: integrations },
+  );
+  supervisor.setAuditSink((event) => {
+    void provider.recordAudit(event);
+  });
+  if (
+    !vscode.workspace.isTrusted
+    && !context.workspaceState.get<boolean>(UNTRUSTED_WORKSPACE_WARNING_KEY, false)
+  ) {
+    void context.workspaceState.update(UNTRUSTED_WORKSPACE_WARNING_KEY, true);
+    void vscode.window.showInformationMessage(
+      localize(
+        "This workspace is not trusted. Autonomous Supervisor, auto-apply, auto-repair, and similar automation are restricted until you trust the workspace.",
+        "このワークスペースは信頼されていません。ワークスペースを信頼するまで、Autonomous Supervisor、自動適用、自動修復などの自動化は制限されます。",
+      ),
+    );
+  }
 
   context.subscriptions.push(
     output,
@@ -217,11 +299,23 @@ export function activate(context: vscode.ExtensionContext): void {
     supervisorRunner,
     reviewDiagnostics,
     provider,
+    auditTimeline,
+    backgroundJobs,
     supervisorTree,
+    integrations,
+    integrationsTree,
     orphanCleanupSubscription,
     vscode.window.registerTreeDataProvider(
       "cursorSubscription.changeSessions",
       changeSessions,
+    ),
+    vscode.window.registerTreeDataProvider(
+      "cursorSubscription.auditTimeline",
+      auditTimeline,
+    ),
+    vscode.window.registerTreeDataProvider(
+      "cursorSubscription.backgroundJobs",
+      backgroundJobs,
     ),
     vscode.workspace.registerTextDocumentContentProvider(
       "cursor-supervisor-preview",
@@ -261,6 +355,24 @@ export function activate(context: vscode.ExtensionContext): void {
         "workbench.action.openSettings",
         "@ext:ark4ez.cursor-subscription-for-vscode",
       )),
+    vscode.commands.registerCommand("cursorSubscription.startBackgroundJob", () =>
+      backgroundJobs.create()),
+    vscode.commands.registerCommand("cursorSubscription.refreshBackgroundJobs", () =>
+      backgroundJobs.refresh()),
+    vscode.commands.registerCommand("cursorSubscription.applyBackgroundJob", (target) =>
+      backgroundJobs.apply(target)),
+    vscode.commands.registerCommand("cursorSubscription.cancelBackgroundJob", (target) =>
+      backgroundJobs.cancel(target)),
+    vscode.commands.registerCommand("cursorSubscription.discardBackgroundJob", (target) =>
+      backgroundJobs.discard(target)),
+    vscode.commands.registerCommand("cursorSubscription.refreshAuditTimeline", () =>
+      auditTimeline.refresh()),
+    vscode.commands.registerCommand(
+      "cursorSubscription.openAuditFile",
+      async (entry: AuditEntry, file: string) => provider.openAuditFile(entry, file),
+    ),
+    vscode.commands.registerCommand("cursorSubscription.inlineCompletionAccepted", () =>
+      provider.noteInlineCompletionAccepted()),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (
         event.affectsConfiguration("cursorSubscription.enableAiNativeFeatures")
@@ -360,6 +472,14 @@ export function activate(context: vscode.ExtensionContext): void {
       "cursorSubscription.restoreAllSessionEdits",
       (sessionId?: string) => provider.restoreAllSessionEdits(sessionId),
     ),
+    vscode.commands.registerCommand(
+      "cursorSubscription.compareChangeSessions",
+      (sessionId?: string) => provider.compareChangeSessions(sessionId),
+    ),
+    vscode.commands.registerCommand(
+      "cursorSubscription.compareSessionContents",
+      (sessionId?: string) => provider.compareSessionContents(sessionId),
+    ),
     vscode.commands.registerCommand("cursorSubscription.chooseSupervisorMode", () =>
       supervisor.chooseMode()),
     vscode.commands.registerCommand("cursorSubscription.createSupervisorTask", () =>
@@ -398,6 +518,34 @@ export function activate(context: vscode.ExtensionContext): void {
       "cursorSubscription.dismissSupervisorTask",
       (target?: SupervisorTaskTarget | string) => supervisor.dismissTask(target),
     ),
+    vscode.commands.registerCommand("cursorSubscription.runTaskPipeline", () =>
+      provider.runTaskPipeline()),
+    vscode.commands.registerCommand("cursorSubscription.executeLastPlan", () =>
+      provider.executeLastPlan()),
+    vscode.commands.registerCommand("cursorSubscription.exportAuditLog", () =>
+      provider.exportAuditLog()),
+    vscode.commands.registerCommand("cursorSubscription.refreshIntegrations", () =>
+      integrations.refresh()),
+    vscode.commands.registerCommand(
+      "cursorSubscription.previewIntegration",
+      (target?: string) => integrations.preview(target),
+    ),
+    vscode.commands.registerCommand(
+      "cursorSubscription.enableIntegration",
+      (target?: string) => integrations.toggle(target, true),
+    ),
+    vscode.commands.registerCommand(
+      "cursorSubscription.disableIntegration",
+      (target?: string) => integrations.toggle(target, false),
+    ),
+    vscode.commands.registerCommand(
+      "cursorSubscription.openIntegration",
+      (target?: string) => integrations.open(target),
+    ),
+    vscode.commands.registerCommand("cursorSubscription.scanSupervisorTodos", () =>
+      supervisor.scanTodos()),
+    vscode.commands.registerCommand("cursorSubscription.scanSupervisorGitHub", () =>
+      supervisor.scanGitHubSignals()),
   );
 }
 
@@ -432,13 +580,26 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private readonly repairAttempts = new Map<string, number>();
   private readonly sessionDecisionQueues = new Map<string, Promise<void>>();
   private readonly verifyingSessions = new Set<string>();
-  private inlineCompletionBusy = false;
-  private inlineCompletionCache:
-    | { key: string; value: vscode.InlineCompletionItem[] }
-    | undefined;
+  private readonly suppressPullRequestOffers = new Set<string>();
+  private readonly inlineCompletionCache = new Map<string, string>();
+  private readonly inlineCompletionInFlight = new Map<string, Promise<string>>();
+  private readonly inlineCompletionGeneration = new Map<string, number>();
+  private readonly fileOwnership = new FileOwnershipCoordinator();
+  private readonly parallelApplyQueue = new ApplyQueue();
+  private auditTimeline?: AuditTimelineController;
+  private auditWriteQueue: Promise<void> = Promise.resolve();
   private readonly previewContents = new Map<string, string>();
   private projectCommands: ProjectCommand[] = [];
   private bestOfNExperiments: BestOfNExperiment[];
+  private readonly bestOfNArtifacts = new Map<
+    string,
+    { session: IsolatedWorktreeSession; changes: IsolatedChange[]; root: string }
+  >();
+  private orchestratorExperiments: OrchestratorExperiment[];
+  private executionPlans: ExecutionPlan[];
+  private pendingPipelinePr:
+    | { title: string; body: string; root: string; files: string[] }
+    | undefined;
   /** Workspace folder chosen for a new chat before the conversation is created. */
   private draftWorkspaceFolderUri: string | undefined;
 
@@ -470,6 +631,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       () => this.saveConversations(),
     );
     this.bestOfNExperiments = context.workspaceState.get<BestOfNExperiment[]>(BEST_OF_N_KEY, []);
+    this.orchestratorExperiments = context.workspaceState.get<OrchestratorExperiment[]>(
+      ORCHESTRATOR_KEY,
+      [],
+    );
+    this.executionPlans = context.workspaceState.get<ExecutionPlan[]>(EXECUTION_PLANS_KEY, []);
+  }
+
+  public setAuditTimeline(timeline: AuditTimelineController): void {
+    this.auditTimeline = timeline;
   }
 
   private get conversations(): Conversation[] {
@@ -492,6 +662,24 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
     view.webview.onDidReceiveMessage(
       async (raw: unknown) => {
+        if (raw && typeof raw === "object") {
+          const direct = raw as Record<string, unknown>;
+          if (direct.type === "startOrchestrate" && typeof direct.prompt === "string") {
+            await this.startOrchestrate(
+              direct.prompt.trim(),
+              direct.attachContext === true,
+              Array.isArray(direct.files)
+                ? direct.files.filter((file): file is string => typeof file === "string")
+                : [],
+              this.isRunProfile(direct.profile) ? direct.profile : "agent",
+              Array.isArray(direct.skills)
+                ? direct.skills.filter((skill): skill is string => typeof skill === "string")
+                : [],
+              direct.includeProjectMemory !== false,
+            );
+            return;
+          }
+        }
         const message = parseWebviewMessage(raw);
         if (!message) {
           return;
@@ -964,6 +1152,806 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     await this.drainMessageQueue();
   }
 
+  public async recordAudit(
+    event: {
+      action: AuditAction;
+      summary: string;
+      details?: string;
+      files?: string[];
+      taskId?: string;
+      sessionId?: string;
+    },
+  ): Promise<void> {
+    const entries = this.context.workspaceState.get<AuditEntry[]>(AUDIT_LOG_KEY);
+    const nextEntries = appendAuditEntry(entries, event);
+    await this.context.workspaceState.update(
+      AUDIT_LOG_KEY,
+      nextEntries,
+    );
+    this.auditTimeline?.refresh();
+    const added = nextEntries[0];
+    if (added) {
+      this.auditWriteQueue = this.auditWriteQueue
+        .then(() => this.appendSharedAuditEntry(added))
+        .catch((error) => {
+          this.output.appendLine(
+            `[${new Date().toISOString()}] Could not append shared audit log: ${String(error)}`,
+          );
+        });
+      await this.auditWriteQueue;
+    }
+  }
+
+  private async appendSharedAuditEntry(entry: AuditEntry): Promise<void> {
+    const workspace = this.resolveChatWorkspace() ?? defaultWorkspaceFolder();
+    if (!workspace) {
+      return;
+    }
+    const configuration = vscode.workspace.getConfiguration("cursorSubscription", workspace.uri);
+    if (!configuration.get<boolean>("auditSharedLogEnabled", false)) {
+      return;
+    }
+    const configuredPath = configuration.get<string>(
+      "auditSharedLogPath",
+      ".cursor/ai-audit-log.jsonl",
+    );
+    if (!configuredPath || path.isAbsolute(configuredPath)) {
+      throw new Error("cursorSubscription.auditSharedLogPath must be workspace-relative.");
+    }
+    const target = path.resolve(workspace.uri.fsPath, configuredPath);
+    const relative = path.relative(workspace.uri.fsPath, target);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new Error("The shared audit log path escapes the workspace.");
+    }
+    await mkdir(path.dirname(target), { recursive: true });
+    await appendFile(target, `${JSON.stringify(entry)}\n`, "utf8");
+  }
+
+  public async openAuditFile(_entry: AuditEntry, file: string): Promise<void> {
+    const workspace = this.resolveChatWorkspace() ?? defaultWorkspaceFolder();
+    const absolute = resolveAbsoluteInWorkspace(file, workspace);
+    if (!absolute || !vscode.workspace.getWorkspaceFolder(vscode.Uri.file(absolute))) {
+      void vscode.window.showWarningMessage(localize(
+        "The audit entry points outside the open workspace and was not opened.",
+        "監査エントリがワークスペース外を指しているため開きませんでした。",
+      ));
+      return;
+    }
+    try {
+      const document = await vscode.workspace.openTextDocument(vscode.Uri.file(absolute));
+      await vscode.window.showTextDocument(document, { preview: true });
+    } catch {
+      void vscode.window.showWarningMessage(localize(
+        `Audit file is no longer available: ${file}`,
+        `監査対象ファイルは現在利用できません: ${file}`,
+      ));
+    }
+  }
+
+  public async applyBackgroundJob(
+    job: BackgroundJob,
+    changes: readonly IsolatedChange[],
+  ): Promise<void> {
+    const storageRoot = vscode.Uri.file(job.storageRoot);
+    const changeSession = this.featureEnabled("enableChangeSessions")
+      ? await this.changeSessions.begin(job.prompt, job.workspaceRoot)
+      : undefined;
+    const result = await this.parallelApplyQueue.run(async () => {
+      const lease = await this.fileOwnership.acquire(
+        `background:${job.id}`,
+        [
+          path.join(job.workspaceRoot, ".cursor-parallel-workspace-owner"),
+          ...changes.map((change) => path.join(job.workspaceRoot, change.relative)),
+        ],
+      );
+      try {
+        return await applyIsolatedChanges(job.session, storageRoot, changes, {
+          pathEscapeLabel: "background agent",
+          unavailableMessage: localize(
+            "The background worktree is unavailable.",
+            "バックグラウンドworktreeを利用できません。",
+          ),
+          conflictMessage: localize(
+            "The workspace changed while the background agent was running.",
+            "バックグラウンドAgentの実行中にワークスペースが変更されました。",
+          ),
+          missingBaselineMessage: (relative) => `Background baseline is unavailable for ${relative}.`,
+          autoMerge: true,
+        });
+      } finally {
+        lease.release();
+      }
+    });
+    if (result.conflicts.length > 0) {
+      throw new Error(localize(
+        `${result.conflicts.length} background change(s) still conflict. The isolated result was preserved.`,
+        `${result.conflicts.length}件のバックグラウンド変更が競合しています。隔離結果は保持されました。`,
+      ));
+    }
+    const appliedFiles = result.applied.map((relative) => path.join(job.workspaceRoot, relative));
+    if (changeSession) {
+      await this.changeSessions.markPending(appliedFiles, changeSession.id);
+      this.changeSessions.keepAll(changeSession.id);
+      const verification = await runVerification(
+        job.workspaceRoot,
+        vscode.workspace.getConfiguration("cursorSubscription").get<string[]>("verificationCommands", []),
+        this.output,
+      );
+      this.changeSessions.setVerification(verification, changeSession.id);
+    }
+    if (job.usage) {
+      await this.recordUsage("chat", job.usage);
+    }
+    await this.recordAudit({
+      action: "background.apply",
+      summary: `Applied background job: ${job.title}`,
+      details: job.assistantText,
+      files: result.applied,
+      sessionId: changeSession?.id,
+    });
+    void vscode.window.showInformationMessage(localize(
+      `Applied ${result.applied.length} background change(s).`,
+      `${result.applied.length}件のバックグラウンド変更を適用しました。`,
+    ));
+  }
+
+  public async exportAuditLog(): Promise<void> {
+    const entries = this.context.workspaceState.get<AuditEntry[]>(AUDIT_LOG_KEY, []);
+    const markdown = formatAuditLogMarkdown(entries);
+    const target = await vscode.window.showSaveDialog({
+      defaultUri: vscode.Uri.file("ai-audit-log.md"),
+      filters: { Markdown: ["md"] },
+    });
+    if (!target) {
+      return;
+    }
+    await vscode.workspace.fs.writeFile(target, Buffer.from(markdown, "utf8"));
+    void vscode.window.showInformationMessage(
+      localize(
+        `Exported audit log to ${target.fsPath}`,
+        `監査ログを書き出しました: ${target.fsPath}`,
+      ),
+    );
+  }
+
+  public async runTaskPipeline(): Promise<void> {
+    if (!this.ensureFeatureEnabled("enableAutopilot", "Autopilot")) {
+      return;
+    }
+    const workspace = this.resolveChatWorkspace()
+      ?? await pickWorkspaceFolder(
+        localize("Select a workspace for the task pipeline", "タスクパイプラインのワークスペースを選択"),
+      );
+    if (!workspace) {
+      return;
+    }
+
+    const source = await vscode.window.showQuickPick(
+      [
+        {
+          label: localize("GitHub Issue (gh)", "GitHub Issue (gh)"),
+          description: localize("Pick an open issue from gh issue list", "gh issue list から未解決Issueを選択"),
+          id: "gh" as const,
+        },
+        {
+          label: localize("Active editor TODO(ai)", "アクティブエディタの TODO(ai)"),
+          description: localize("Resolve a TODO(ai): comment in the active file", "アクティブファイルの TODO(ai): を解決"),
+          id: "todo" as const,
+        },
+        {
+          label: localize("Free text", "自由入力"),
+          description: localize("Describe the pipeline goal manually", "パイプラインの目標を手入力"),
+          id: "text" as const,
+        },
+      ],
+      {
+        title: localize("Cursor: Run Task Pipeline", "Cursor: タスクパイプラインを実行"),
+        placeHolder: localize("Choose a task source", "タスクの取得元を選択"),
+      },
+    );
+    if (!source) {
+      return;
+    }
+
+    let goal = "";
+    let pipelineTitle = "";
+    if (source.id === "gh") {
+      const issues = await this.listGhIssues(workspace.uri.fsPath);
+      if (issues.length === 0) {
+        void vscode.window.showWarningMessage(localize(
+          "No GitHub issues were found. Install gh, authenticate, and run from a git repository.",
+          "GitHub Issueが見つかりませんでした。gh をインストール・認証し、git リポジトリから実行してください。",
+        ));
+        return;
+      }
+      const picked = await vscode.window.showQuickPick(
+        issues.map((issue) => ({
+          label: `#${issue.number} ${issue.title}`,
+          description: issue.url,
+          issue,
+        })),
+        {
+          title: localize("Select a GitHub issue", "GitHub Issueを選択"),
+          matchOnDescription: true,
+        },
+      );
+      if (!picked) {
+        return;
+      }
+      pipelineTitle = picked.issue.title;
+      goal = [picked.issue.title, picked.issue.body, picked.issue.url].filter(Boolean).join("\n\n");
+    } else if (source.id === "todo") {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor || editor.document.uri.scheme !== "file") {
+        void vscode.window.showWarningMessage(localize(
+          "Open a file in the editor to scan TODO(ai) comments.",
+          "TODO(ai) を検出するには、エディタでファイルを開いてください。",
+        ));
+        return;
+      }
+      const matches = scanTodoAiComments(editor.document.getText());
+      if (matches.length === 0) {
+        void vscode.window.showWarningMessage(localize(
+          "No TODO(ai): comments were found in the active editor.",
+          "アクティブエディタに TODO(ai): コメントは見つかりませんでした。",
+        ));
+        return;
+      }
+      const picked = await vscode.window.showQuickPick(
+        matches.map((match) => ({
+          label: match.text,
+          description: match.detail,
+          match,
+        })),
+        { title: localize("Select a TODO(ai)", "TODO(ai) を選択") },
+      );
+      if (!picked) {
+        return;
+      }
+      pipelineTitle = picked.match.text;
+      goal = [
+        `Resolve this TODO(ai) in ${vscode.workspace.asRelativePath(editor.document.uri)}:${picked.match.line}`,
+        picked.match.text,
+      ].join("\n\n");
+    } else {
+      const text = await vscode.window.showInputBox({
+        title: localize("Cursor: Run Task Pipeline", "Cursor: タスクパイプラインを実行"),
+        prompt: localize("Describe the outcome for the pipeline run.", "パイプライン実行の目標を入力してください。"),
+        ignoreFocusOut: true,
+      });
+      if (!text?.trim()) {
+        return;
+      }
+      pipelineTitle = text.trim();
+      goal = text.trim();
+    }
+
+    const pipelineAutoKeep = this.alertConfiguration().get<boolean>("pipelineAutoKeep", false);
+    const reviewChanges = pipelineAutoKeep
+      ? false
+      : this.featureEnabled("enableChangeSessions");
+    const automaticVerification = this.featureEnabled("enableVerification")
+      && this.alertConfiguration().get<boolean>("autoVerify", true);
+    this.pendingPipelinePr = pipelineAutoKeep
+      ? {
+          title: pipelineTitle,
+          body: goal,
+          root: workspace.uri.fsPath,
+          files: [],
+        }
+      : undefined;
+
+    await vscode.commands.executeCommand(`${VIEW_ID}.focus`);
+    await this.send(
+      [
+        goal,
+        "",
+        "Run this as an autonomous change session through the task pipeline.",
+        "Investigate the repository, make the smallest coherent implementation, and review the resulting diff.",
+        automaticVerification
+          ? reviewChanges
+            ? "Do not run final validation; the extension will run it after the user accepts the proposed file changes."
+            : "Do not run final validation; the extension will run it after the edit finishes."
+          : "Run the relevant validation before reporting completion.",
+        "Do not stop after describing code: complete the change and report remaining risks.",
+      ].join("\n"),
+      true,
+      [],
+      "multitask",
+      [],
+      undefined,
+      undefined,
+      undefined,
+      false,
+      reviewChanges,
+    );
+    await this.drainMessageQueue();
+  }
+
+  public async executeLastPlan(): Promise<void> {
+    const plan = this.executionPlans.find((candidate) =>
+      candidate.status === "pending" || candidate.status === "failed"
+    );
+    if (!plan) {
+      void vscode.window.showInformationMessage(localize(
+        "No executable Plan artifact is available. Run a chat with the Plan profile first.",
+        "実行可能なPlan成果物がありません。先にPlanプロファイルでチャットを実行してください。",
+      ));
+      return;
+    }
+    await this.executePlan(plan.id);
+  }
+
+  private async captureExecutionPlan(
+    prompt: string,
+    conversationId: string,
+    assistantText: string,
+  ): Promise<void> {
+    if (this.orchestratorExperiments.some((experiment) =>
+      experiment.planConversationId === conversationId
+    )) {
+      return;
+    }
+    const steps = parseExecutionPlanSteps(assistantText);
+    if (steps.length === 0) {
+      return;
+    }
+    const plan = createExecutionPlan(prompt, conversationId, steps);
+    this.executionPlans = [plan, ...this.executionPlans].slice(0, 20);
+    await this.persistExecutionPlans();
+    const executeLabel = localize("Execute steps", "ステップを実行");
+    const answer = await vscode.window.showInformationMessage(
+      localize(
+        `Plan contains ${steps.length} step(s). Execute them sequentially with a change-session checkpoint per step?`,
+        `Planに${steps.length}ステップあります。各ステップに変更セッションのチェックポイントを作成して順番に実行しますか？`,
+      ),
+      executeLabel,
+    );
+    if (answer === executeLabel) {
+      void this.executePlan(plan.id);
+    }
+  }
+
+  private async executePlan(planId: string): Promise<void> {
+    const plan = this.executionPlans.find((candidate) => candidate.id === planId);
+    const source = plan
+      ? this.conversations.find((conversation) => conversation.id === plan.sourceConversationId)
+      : undefined;
+    const workspace = source ? this.resolveChatWorkspace(source) : undefined;
+    if (!plan || !workspace || plan.status === "running" || plan.status === "completed") {
+      return;
+    }
+    plan.status = "running";
+    await this.persistExecutionPlans();
+    await this.recordAudit({
+      action: "plan.start",
+      summary: `Started ${plan.steps.length}-step execution plan`,
+      details: plan.prompt,
+    });
+
+    for (let index = 0; index < plan.steps.length; index += 1) {
+      const step = plan.steps[index];
+      if (step.status === "completed") {
+        continue;
+      }
+      step.status = "running";
+      step.error = undefined;
+      await this.persistExecutionPlans();
+      const conversation: Conversation = {
+        id: randomUUID(),
+        title: makeConversationTitle(`[Plan ${index + 1}/${plan.steps.length}] ${step.title}`),
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        workspaceFolderUri: workspace.uri.toString(),
+        transcript: [],
+      };
+      this.conversations.unshift(conversation);
+      await this.saveConversations();
+      this.suppressPullRequestOffers.add(conversation.id);
+      try {
+        await this.send(
+          [
+            step.prompt,
+            "",
+            `Execute step ${index + 1} of ${plan.steps.length}: ${step.title}`,
+            "Complete only this step, preserve prior completed steps, and leave the workspace verified.",
+            "A change-session checkpoint is created before this step so failures can be restored independently.",
+          ].join("\n"),
+          true,
+          [],
+          "multitask",
+          [],
+          conversation.id,
+          undefined,
+          undefined,
+          false,
+          false,
+        );
+      } finally {
+        this.suppressPullRequestOffers.delete(conversation.id);
+      }
+      const runtime = this.chatRuntimes.get(conversation.id);
+      step.checkpointSessionId = runtime?.changeSessionId;
+      const lastAssistant = [...conversation.transcript]
+        .reverse()
+        .find((entry) => entry.role === "assistant");
+      const session = step.checkpointSessionId
+        ? this.changeSessions.snapshot(step.checkpointSessionId)
+        : undefined;
+      if (lastAssistant?.error || session?.phase === "failed" || session?.verification?.success === false) {
+        step.status = "failed";
+        step.error = lastAssistant?.text.slice(0, 1_000)
+          ?? localize("Step verification failed.", "ステップの検証に失敗しました。");
+        plan.status = "failed";
+        await this.recordAudit({
+          action: "plan.step",
+          summary: `Plan step failed: ${step.title}`,
+          details: step.error,
+          sessionId: step.checkpointSessionId,
+        });
+        await this.persistExecutionPlans();
+        void vscode.window.showWarningMessage(localize(
+          `Plan stopped at step ${index + 1}: ${step.title}`,
+          `Planはステップ${index + 1}「${step.title}」で停止しました。`,
+        ));
+        return;
+      }
+      step.status = "completed";
+      await this.recordAudit({
+        action: "plan.step",
+        summary: `Completed plan step ${index + 1}/${plan.steps.length}: ${step.title}`,
+        sessionId: step.checkpointSessionId,
+      });
+      await this.persistExecutionPlans();
+    }
+    plan.status = "completed";
+    await this.persistExecutionPlans();
+    await this.recordAudit({
+      action: "plan.complete",
+      summary: `Completed ${plan.steps.length}-step execution plan`,
+    });
+    void vscode.window.showInformationMessage(localize(
+      `Completed all ${plan.steps.length} Plan steps with per-step checkpoints.`,
+      `Planの全${plan.steps.length}ステップを、ステップごとのチェックポイント付きで完了しました。`,
+    ));
+  }
+
+  private async persistExecutionPlans(): Promise<void> {
+    await this.context.workspaceState.update(EXECUTION_PLANS_KEY, this.executionPlans);
+  }
+
+  public async startOrchestrate(
+    prompt: string,
+    attachContext: boolean,
+    files: string[],
+    _profile: RunProfile,
+    skills: string[],
+    includeProjectMemory = true,
+  ): Promise<void> {
+    const trimmed = prompt.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    const experiment = createOrchestratorExperiment(trimmed);
+    const workspaceFolderUri = this.resolveChatWorkspace()?.uri.toString();
+    const planConversation: Conversation = {
+      id: randomUUID(),
+      title: makeConversationTitle(`[Plan] ${trimmed}`),
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      workspaceFolderUri,
+      transcript: [],
+    };
+    experiment.planConversationId = planConversation.id;
+    this.conversations.unshift(planConversation);
+    this.orchestratorExperiments = [experiment, ...this.orchestratorExperiments].slice(0, 20);
+    await this.saveOrchestratorExperiments();
+    await this.saveConversations();
+
+    this.activeId = planConversation.id;
+    this.showingHome = false;
+    this.draftWorkspaceFolderUri = undefined;
+    this.postView();
+    this.postWorkspaceLabel();
+
+    const planPrompt = [
+      trimmed,
+      "",
+      "Break this request into parallel subtasks for independent agents.",
+      "Respond with a JSON array inside <ORCHESTRATOR_SUBTASKS>...</ORCHESTRATOR_SUBTASKS>.",
+      'Each item must be {"title":"short title","prompt":"full agent prompt"}.',
+      "Planning only: do not edit files.",
+    ].join("\n");
+
+    await this.enqueueMessage(
+      planPrompt,
+      attachContext,
+      files,
+      "plan",
+      skills,
+      false,
+      undefined,
+      false,
+      planConversation.id,
+      undefined,
+      includeProjectMemory,
+    );
+    void vscode.window.showInformationMessage(
+      localize(
+        "Orchestrator planning started. Subtasks will launch when the plan finishes.",
+        "オーケストレーターの計画を開始しました。計画完了後にサブタスクを起動します。",
+      ),
+    );
+  }
+
+  private async saveOrchestratorExperiments(): Promise<void> {
+    await this.context.workspaceState.update(ORCHESTRATOR_KEY, this.orchestratorExperiments);
+  }
+
+  private async listGhIssues(
+    root: string,
+  ): Promise<Array<{ number: number; title: string; body: string; url: string }>> {
+    try {
+      const { stdout } = await execFileAsync(
+        "gh",
+        ["issue", "list", "--limit", "20", "--json", "number,title,body,url"],
+        {
+          cwd: root,
+          encoding: "utf8",
+          maxBuffer: 4 * 1024 * 1024,
+          windowsHide: true,
+        },
+      );
+      const parsed = JSON.parse(stdout) as unknown;
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+      return parsed.flatMap((item) => {
+        if (!item || typeof item !== "object") {
+          return [];
+        }
+        const record = item as Record<string, unknown>;
+        const number = typeof record.number === "number" ? record.number : 0;
+        const title = typeof record.title === "string" ? record.title : "";
+        const body = typeof record.body === "string" ? record.body : "";
+        const url = typeof record.url === "string" ? record.url : "";
+        if (!number || !title) {
+          return [];
+        }
+        return [{ number, title, body, url }];
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  private touchInlineCompletionCache(
+    key: string,
+    value: string,
+  ): string {
+    if (this.inlineCompletionCache.has(key)) {
+      this.inlineCompletionCache.delete(key);
+    }
+    this.inlineCompletionCache.set(key, value);
+    while (this.inlineCompletionCache.size > MAX_INLINE_COMPLETION_CACHE) {
+      const oldest = this.inlineCompletionCache.keys().next().value;
+      if (oldest) {
+        this.inlineCompletionCache.delete(oldest);
+      } else {
+        break;
+      }
+    }
+    return value;
+  }
+
+  private async ensureTokenBudgetAllows(): Promise<boolean> {
+    const configuration = this.alertConfiguration();
+    const dailyBudget = configuration.get<number>("dailyTokenBudget", 0);
+    const monthlyBudget = configuration.get<number>("monthlyTokenBudget", 0);
+    const monthlyCostLimit = configuration.get<number>("monthlyCostLimitUsd", 0);
+    const blendedRate = configuration.get<number>("estimatedCostPerMillionTokensUsd", 0);
+    const ledger = this.context.workspaceState.get<UsageLedger>(USAGE_LEDGER_KEY);
+    const checks = [
+      {
+        id: `daily.${dayKey()}`,
+        snapshot: budgetSnapshot(ledger, dailyBudget),
+        warning: (used: number, budget: number, ratio: number) => localize(
+          `Daily token budget is ${Math.round(ratio * 100)}% used (${formatTokenCount(used)}/${formatTokenCount(budget)}).`,
+          `1日のトークン予算を ${Math.round(ratio * 100)}% 使用しています（${formatTokenCount(used)}/${formatTokenCount(budget)}）。`,
+        ),
+        exceeded: (used: number, budget: number) => localize(
+          `Daily token budget exceeded (${formatTokenCount(used)}/${formatTokenCount(budget)}). Continue anyway?`,
+          `1日のトークン予算を超過しました（${formatTokenCount(used)}/${formatTokenCount(budget)}）。続行しますか？`,
+        ),
+      },
+      {
+        id: `monthly.${monthKey()}`,
+        snapshot: monthlyBudgetSnapshot(ledger, monthlyBudget),
+        warning: (used: number, budget: number, ratio: number) => localize(
+          `Monthly token budget is ${Math.round(ratio * 100)}% used (${formatTokenCount(used)}/${formatTokenCount(budget)}).`,
+          `月間トークン予算を ${Math.round(ratio * 100)}% 使用しています（${formatTokenCount(used)}/${formatTokenCount(budget)}）。`,
+        ),
+        exceeded: (used: number, budget: number) => localize(
+          `Monthly token budget exceeded (${formatTokenCount(used)}/${formatTokenCount(budget)}). Continue anyway?`,
+          `月間トークン予算を超過しました（${formatTokenCount(used)}/${formatTokenCount(budget)}）。続行しますか？`,
+        ),
+      },
+      {
+        id: `cost.${monthKey()}`,
+        snapshot: estimatedMonthlyCostSnapshot(ledger, monthlyCostLimit, blendedRate),
+        warning: (used: number, budget: number, ratio: number) => localize(
+          `Estimated monthly cost is ${Math.round(ratio * 100)}% of the limit ($${used.toFixed(2)}/$${budget.toFixed(2)}).`,
+          `推定月間コストが上限の${Math.round(ratio * 100)}%です（$${used.toFixed(2)}/$${budget.toFixed(2)}）。`,
+        ),
+        exceeded: (used: number, budget: number) => localize(
+          `Estimated monthly cost limit exceeded ($${used.toFixed(2)}/$${budget.toFixed(2)}). Continue anyway?`,
+          `推定月間コスト上限を超過しました（$${used.toFixed(2)}/$${budget.toFixed(2)}）。続行しますか？`,
+        ),
+      },
+    ];
+    for (const check of checks) {
+      const snapshot = check.snapshot;
+      if (!snapshot) {
+        continue;
+      }
+      if (snapshot.status === "warning") {
+        const warnedKey = `${BUDGET_WARNED_KEY_PREFIX}.${check.id}`;
+        if (!this.context.workspaceState.get<boolean>(warnedKey, false)) {
+          await this.context.workspaceState.update(warnedKey, true);
+          void vscode.window.showWarningMessage(
+            check.warning(snapshot.used, snapshot.budget, snapshot.ratio),
+          );
+        }
+      }
+      if (snapshot.status !== "exceeded") {
+        continue;
+      }
+      const continueLabel = localize("Continue", "続行");
+      const cancelLabel = localize("Cancel", "キャンセル");
+      const answer = await vscode.window.showWarningMessage(
+        check.exceeded(snapshot.used, snapshot.budget),
+        { modal: true },
+        continueLabel,
+        cancelLabel,
+      );
+      if (answer !== continueLabel) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private async handleOrchestratorConversationComplete(
+    conversationId: string,
+    progressState: "completed" | "stopped" | "error",
+    assistantText: string,
+  ): Promise<void> {
+    const planIndex = this.orchestratorExperiments.findIndex(
+      (experiment) =>
+        experiment.planConversationId === conversationId
+        && experiment.status === "planning",
+    );
+    if (planIndex >= 0) {
+      let experiment = this.orchestratorExperiments[planIndex];
+      if (progressState !== "completed") {
+        experiment = {
+          ...experiment,
+          status: "failed",
+          error: progressState === "stopped"
+            ? "Planning was stopped."
+            : "Planning failed.",
+        };
+        this.orchestratorExperiments[planIndex] = experiment;
+        await this.saveOrchestratorExperiments();
+        return;
+      }
+      const parsed = parseOrchestratorSubtasks(assistantText);
+      experiment = attachSubtasks(experiment, parsed);
+      if (experiment.status === "failed") {
+        this.orchestratorExperiments[planIndex] = experiment;
+        await this.saveOrchestratorExperiments();
+        void vscode.window.showWarningMessage(
+          localize(
+            experiment.error ?? "Orchestrator planning produced no subtasks.",
+            experiment.error ?? "オーケストレーターの計画でサブタスクが生成されませんでした。",
+          ),
+        );
+        return;
+      }
+      const workspaceFolderUri = this.resolveChatWorkspace()?.uri.toString();
+      for (const subtask of experiment.subtasks) {
+        const conversation: Conversation = {
+          id: randomUUID(),
+          title: makeConversationTitle(`[${subtask.title}] ${experiment.prompt}`),
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          workspaceFolderUri,
+          transcript: [],
+        };
+        this.conversations.unshift(conversation);
+        experiment = markSubtaskConversation(experiment, subtask.id, conversation.id);
+        await this.enqueueMessage(
+          subtask.prompt,
+          false,
+          [],
+          "agent",
+          [],
+          false,
+          undefined,
+          false,
+          conversation.id,
+        );
+      }
+      this.orchestratorExperiments[planIndex] = experiment;
+      await this.saveOrchestratorExperiments();
+      await this.saveConversations();
+      return;
+    }
+
+    const subtaskIndex = this.orchestratorExperiments.findIndex(
+      (experiment) =>
+        experiment.status === "running"
+        && experiment.subtasks.some((subtask) => subtask.conversationId === conversationId),
+    );
+    if (subtaskIndex >= 0) {
+      let experiment = markSubtaskStatus(
+        this.orchestratorExperiments[subtaskIndex],
+        conversationId,
+        progressState === "completed" ? "completed" : "failed",
+      );
+      if (experiment.status === "synthesizing") {
+        const workspaceFolderUri = this.resolveChatWorkspace()?.uri.toString();
+        const synthesisConversation: Conversation = {
+          id: randomUUID(),
+          title: makeConversationTitle(`[Synthesis] ${experiment.prompt}`),
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          workspaceFolderUri,
+          transcript: [],
+        };
+        this.conversations.unshift(synthesisConversation);
+        experiment = {
+          ...experiment,
+          synthesisConversationId: synthesisConversation.id,
+        };
+        await this.enqueueMessage(
+          buildSynthesisPrompt(experiment),
+          false,
+          [],
+          "agent",
+          [],
+          false,
+          undefined,
+          false,
+          synthesisConversation.id,
+        );
+        await this.saveConversations();
+      }
+      this.orchestratorExperiments[subtaskIndex] = experiment;
+      await this.saveOrchestratorExperiments();
+      return;
+    }
+
+    const synthesisIndex = this.orchestratorExperiments.findIndex(
+      (experiment) =>
+        experiment.synthesisConversationId === conversationId
+        && experiment.status === "synthesizing",
+    );
+    if (synthesisIndex >= 0) {
+      this.orchestratorExperiments[synthesisIndex] = {
+        ...this.orchestratorExperiments[synthesisIndex],
+        status: progressState === "completed" ? "completed" : "failed",
+        error: progressState === "completed"
+          ? undefined
+          : progressState === "stopped"
+            ? "Synthesis was stopped."
+            : "Synthesis failed.",
+      };
+      await this.saveOrchestratorExperiments();
+    }
+  }
+
   public async fixDiagnostics(
     uri: vscode.Uri,
     range: vscode.Range,
@@ -1219,12 +2207,86 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     );
   }
 
+  public async compareChangeSessions(sessionId?: string): Promise<void> {
+    const resolvedId = sessionId ?? this.changeSessions.snapshot()?.id;
+    const markdown = resolvedId
+      ? this.changeSessions.comparisonMarkdown(resolvedId)
+      : undefined;
+    if (!markdown) {
+      void vscode.window.showInformationMessage(localize(
+        "There is no previous change session to compare.",
+        "比較できる前の変更セッションがありません。",
+      ));
+      return;
+    }
+    const uri = vscode.Uri.from({
+      scheme: "cursor-ai-preview",
+      path: `/session-comparison/${resolvedId}.md`,
+    });
+    this.previewContents.set(uri.toString(), markdown);
+    const document = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(document, { preview: true });
+  }
+
+  public async compareSessionContents(sessionId?: string): Promise<void> {
+    const resolvedId = sessionId ?? this.changeSessions.snapshot()?.id;
+    const comparisons = resolvedId ? this.changeSessions.contentComparisons(resolvedId) : [];
+    if (comparisons.length === 0) {
+      void vscode.window.showInformationMessage(localize(
+        "No file content snapshots are shared with the previous session.",
+        "前のセッションと共通する内容スナップショットがありません。",
+      ));
+      return;
+    }
+    const selected = comparisons.length === 1
+      ? comparisons[0]
+      : (await vscode.window.showQuickPick(
+          comparisons.map((comparison) => ({
+            label: comparison.relative,
+            comparison,
+          })),
+          { placeHolder: localize("Select a file to compare", "比較するファイルを選択") },
+        ))?.comparison;
+    if (!selected) {
+      return;
+    }
+    const [previous, current] = await Promise.all([
+      this.changeSessions.proposedContent(selected.previousSessionId, selected.previousFile),
+      this.changeSessions.proposedContent(selected.currentSessionId, selected.currentFile),
+    ]);
+    const previewId = randomUUID();
+    const fileName = path.basename(selected.relative);
+    const previousUri = vscode.Uri.from({
+      scheme: "cursor-ai-preview",
+      path: `/${previewId}/previous/${fileName}`,
+    });
+    const currentUri = vscode.Uri.from({
+      scheme: "cursor-ai-preview",
+      path: `/${previewId}/current/${fileName}`,
+    });
+    this.previewContents.set(previousUri.toString(), previous);
+    this.previewContents.set(currentUri.toString(), current);
+    await vscode.commands.executeCommand(
+      "vscode.diff",
+      previousUri,
+      currentUri,
+      localize(`${selected.relative}: previous ↔ current`, `${selected.relative}: 前回 ↔ 今回`),
+      { preview: true },
+    );
+  }
+
   public async keepSessionEdit(sessionId?: string, file?: string): Promise<void> {
     if (!sessionId || !file) {
       return;
     }
     await this.runSessionDecision(sessionId, async () => {
       this.changeSessions.keep(file, sessionId);
+      await this.recordAudit({
+        action: "session.keep",
+        summary: `Kept ${vscode.workspace.asRelativePath(file)}`,
+        files: [vscode.workspace.asRelativePath(file)],
+        sessionId,
+      });
       await this.verifyAfterPendingReview(sessionId);
     });
   }
@@ -1235,6 +2297,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
     await this.runSessionDecision(sessionId, async () => {
       await this.changeSessions.restoreFile(file, sessionId);
+      await this.recordAudit({
+        action: "session.restore",
+        summary: `Restored ${vscode.workspace.asRelativePath(file)}`,
+        files: [vscode.workspace.asRelativePath(file)],
+        sessionId,
+      });
       await this.verifyAfterPendingReview(sessionId);
     });
   }
@@ -1245,7 +2313,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return;
     }
     await this.runSessionDecision(resolvedId, async () => {
+      const files = this.changeSessions.pendingFiles(resolvedId)
+        .map((file) => vscode.workspace.asRelativePath(file));
       this.changeSessions.keepAll(resolvedId);
+      await this.recordAudit({
+        action: "session.keepAll",
+        summary: `Kept all pending AI changes (${files.length})`,
+        files,
+        sessionId: resolvedId,
+      });
       await this.verifyAfterPendingReview(resolvedId);
     });
   }
@@ -1256,7 +2332,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return;
     }
     await this.runSessionDecision(resolvedId, async () => {
+      const files = this.changeSessions.pendingFiles(resolvedId)
+        .map((file) => vscode.workspace.asRelativePath(file));
       await this.changeSessions.restorePending(resolvedId);
+      await this.recordAudit({
+        action: "session.restoreAll",
+        summary: `Restored all pending AI changes (${files.length})`,
+        files,
+        sessionId: resolvedId,
+      });
       await this.verifyAfterPendingReview(resolvedId);
     });
   }
@@ -1264,20 +2348,56 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   public async provideInlineCompletionItems(
     document: vscode.TextDocument,
     position: vscode.Position,
-    _inlineContext: vscode.InlineCompletionContext,
+    inlineContext: vscode.InlineCompletionContext,
     token: vscode.CancellationToken,
   ): Promise<vscode.InlineCompletionItem[]> {
     const enabled = this.featureEnabled("enableInlineCompletions");
-    if (!enabled || this.inlineCompletionBusy || this.anyChatBusy() || document.uri.scheme !== "file") {
+    const configuration = this.alertConfiguration();
+    if (
+      !enabled
+      || document.uri.scheme !== "file"
+      || (configuration.get<boolean>("inlineCompletionPauseDuringAgentRuns", true) && this.anyChatBusy())
+    ) {
       return [];
     }
-    const linePrefix = document.lineAt(position.line).text.slice(0, position.character);
-    if (linePrefix.trim().length < 3) {
+    const ledger = this.context.workspaceState.get<UsageLedger>(USAGE_LEDGER_KEY);
+    const budgets = [
+      budgetSnapshot(ledger, configuration.get<number>("dailyTokenBudget", 0)),
+      monthlyBudgetSnapshot(ledger, configuration.get<number>("monthlyTokenBudget", 0)),
+      estimatedMonthlyCostSnapshot(
+        ledger,
+        configuration.get<number>("monthlyCostLimitUsd", 0),
+        configuration.get<number>("estimatedCostPerMillionTokensUsd", 0),
+      ),
+    ];
+    if (budgets.some((budget) => budget?.status === "exceeded")) {
       return [];
     }
-    const key = `${document.uri.toString()}:${document.version}:${position.line}:${position.character}`;
-    if (this.inlineCompletionCache?.key === key) {
-      return this.inlineCompletionCache.value;
+    const offset = document.offsetAt(position);
+    const source = document.getText();
+    const before = source.slice(Math.max(0, offset - 8_000), offset);
+    const after = source.slice(offset, Math.min(source.length, offset + 3_000));
+    if (!shouldRequestInlineCompletion(
+      before,
+      after,
+      configuration.get<number>("inlineCompletionMinPrefixCharacters", 3),
+    )) {
+      return [];
+    }
+    const key = [
+      document.uri.toString(),
+      document.languageId,
+      document.version,
+      position.line,
+      position.character,
+      before.slice(-256),
+      after.slice(0, 128),
+    ].join(":");
+    const documentVersion = document.version;
+    const cached = this.inlineCompletionCache.get(key);
+    if (cached) {
+      this.touchInlineCompletionCache(key, cached);
+      return [this.inlineCompletionItem(cached)];
     }
     const apiKey = await this.context.secrets.get(API_KEY_SECRET);
     const workspace = vscode.workspace.getWorkspaceFolder(document.uri);
@@ -1285,52 +2405,114 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return [];
     }
 
-    this.inlineCompletionBusy = true;
     try {
-      await new Promise<void>((resolve) => setTimeout(resolve, 350));
-      if (token.isCancellationRequested) {
+      const uriKey = document.uri.toString();
+      const generation = (this.inlineCompletionGeneration.get(uriKey) ?? 0) + 1;
+      this.inlineCompletionGeneration.set(uriKey, generation);
+      if (inlineContext.triggerKind !== vscode.InlineCompletionTriggerKind.Invoke) {
+        await new Promise<void>((resolve) => setTimeout(
+          resolve,
+          configuration.get<number>("inlineCompletionDebounceMs", 350),
+        ));
+      }
+      if (
+        token.isCancellationRequested
+        || this.inlineCompletionGeneration.get(uriKey) !== generation
+        || document.version !== documentVersion
+      ) {
         return [];
       }
-      const offset = document.offsetAt(position);
-      const source = document.getText();
-      const before = source.slice(Math.max(0, offset - 6_000), offset);
-      const after = source.slice(offset, Math.min(source.length, offset + 2_000));
-      const result = await Agent.prompt(
-        [
-          "Complete code at the cursor. Return only the text to insert, without Markdown or explanation.",
-          "Prefer a short, high-confidence continuation. Return an empty string if intent is unclear.",
-          `File: ${vscode.workspace.asRelativePath(document.uri)}`,
-          `Language: ${document.languageId}`,
-          "<before>",
-          before,
-          "</before>",
-          "<after>",
-          after,
-          "</after>",
-        ].join("\n"),
-        {
-          apiKey,
-          model: this.selectedModelSelection(),
-          name: "VS Code: Inline Completion",
-          mode: "plan",
-          local: { cwd: workspace.uri.fsPath, settingSources: [] },
-        },
-      );
-      if (result.status !== "finished" || token.isCancellationRequested) {
+      let request = this.inlineCompletionInFlight.get(key);
+      if (!request) {
+        request = (async () => {
+          const result = await Agent.prompt(
+            [
+              "Complete code at the cursor. Return only the exact text to insert, without Markdown or explanation.",
+              "Prefer a short, high-confidence continuation. Return an empty string if intent is unclear.",
+              `File: ${vscode.workspace.asRelativePath(document.uri)}`,
+              `Language: ${document.languageId}`,
+              "<before>", before, "</before>", "<after>", after, "</after>",
+            ].join("\n"),
+            {
+              apiKey,
+              model: this.selectedModelSelection(),
+              name: "VS Code: Inline Completion",
+              mode: "plan",
+              local: {
+                cwd: workspace.uri.fsPath,
+                settingSources: configuration.get<boolean>("inlineCompletionIncludeProjectRules", true)
+                  ? ["project"]
+                  : [],
+              },
+            },
+          );
+          if (result.usage) {
+            await this.recordUsage("chat", result.usage);
+          }
+          return result.status === "finished"
+            ? sanitizeInlineCompletion(result.result ?? "", before, after, {
+                maxCharacters: configuration.get<number>("inlineCompletionMaxCharacters", 1_200),
+                maxLines: configuration.get<number>("inlineCompletionMaxLines", 24),
+              })
+            : "";
+        })();
+        this.inlineCompletionInFlight.set(key, request);
+        void request.then(
+          () => this.inlineCompletionInFlight.delete(key),
+          () => this.inlineCompletionInFlight.delete(key),
+        );
+      }
+      const completion = await request;
+      if (!completion || token.isCancellationRequested) {
         return [];
       }
-      const completion = this.cleanGeneratedCode(result.result ?? "");
-      const value = completion ? [new vscode.InlineCompletionItem(completion)] : [];
-      this.inlineCompletionCache = { key, value };
-      return value;
+      this.touchInlineCompletionCache(key, completion);
+      await this.noteInlineCompletionSuggested();
+      return [this.inlineCompletionItem(completion)];
     } catch (error) {
       this.output.appendLine(
         `[${new Date().toISOString()}] Inline completion failed: ${error instanceof Error ? error.message : String(error)}`,
       );
       return [];
-    } finally {
-      this.inlineCompletionBusy = false;
     }
+  }
+
+  private inlineCompletionItem(completion: string): vscode.InlineCompletionItem {
+    const item = new vscode.InlineCompletionItem(completion);
+    item.command = {
+      command: "cursorSubscription.inlineCompletionAccepted",
+      title: localize("Inline completion accepted", "インライン補完を採用"),
+    };
+    return item;
+  }
+
+  private async noteInlineCompletionSuggested(): Promise<void> {
+    const stats = this.context.workspaceState.get<InlineCompletionStats>(
+      INLINE_COMPLETION_STATS_KEY,
+      { suggested: 0, accepted: 0 },
+    );
+    await this.context.workspaceState.update(INLINE_COMPLETION_STATS_KEY, {
+      ...stats,
+      suggested: stats.suggested + 1,
+    });
+    this.postUsageStats();
+  }
+
+  public async noteInlineCompletionAccepted(): Promise<void> {
+    const stats = this.context.workspaceState.get<InlineCompletionStats>(
+      INLINE_COMPLETION_STATS_KEY,
+      { suggested: 0, accepted: 0 },
+    );
+    await this.context.workspaceState.update(INLINE_COMPLETION_STATS_KEY, {
+      ...stats,
+      accepted: stats.accepted + 1,
+    });
+    this.postUsageStats();
+    this.output.appendLine(
+      `[${new Date().toISOString()}] Inline completion acceptance: ${(
+        inlineCompletionAcceptanceRate({ ...stats, accepted: stats.accepted + 1 }) * 100
+      ).toFixed(1)}%`,
+    );
   }
 
   public async generateCode(editor: vscode.TextEditor): Promise<void> {
@@ -1742,8 +2924,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.postView();
     this.postWorkspaceLabel();
 
-    for (const conversationId of conversationIds) {
-      await this.enqueueMessage(
+    await Promise.all(conversationIds.map((conversationId) =>
+      this.enqueueMessage(
         trimmed,
         attachContext,
         files,
@@ -1755,8 +2937,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         conversationId,
         undefined,
         includeProjectMemory,
-      );
-    }
+      )
+    ));
     void vscode.window.showInformationMessage(
       localize(
         `Started best-of-${runCount}. Compare the parallel chats and pick a winner from history when ready.`,
@@ -1781,15 +2963,32 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     conversation.pinned = true;
     await this.context.workspaceState.update(BEST_OF_N_KEY, this.bestOfNExperiments);
     await this.saveConversations();
+    const applyLabel = localize("Apply winner", "勝者を適用");
+    const prLabel = localize("Apply and create PR", "適用してPRを作成");
     const discardLabel = localize("Delete losing runs", "敗者の会話を削除");
+    const hasArtifact = this.bestOfNArtifacts.has(conversationId);
+    const stillRunning = experiment.conversationIds.some((id) => this.isConversationBusy(id));
+    const actions = hasArtifact && !stillRunning
+      ? [applyLabel, prLabel, discardLabel]
+      : [discardLabel];
     const answer = await vscode.window.showInformationMessage(
       localize(
-        `Pinned the winning conversation from best-of-N.`,
-        `best-of-Nの勝者会話をピン留めしました。`,
+        stillRunning
+          ? "Pinned the best-of-N winner. Wait for all candidates to finish before applying it."
+          : hasArtifact
+            ? "Pinned the best-of-N winner. Its isolated changes can now be applied directly or turned into a pull request."
+            : "Pinned the winning conversation from best-of-N.",
+        stillRunning
+          ? "best-of-Nの勝者をピン留めしました。全候補の完了後に適用できます。"
+          : hasArtifact
+            ? "best-of-Nの勝者をピン留めしました。隔離された変更を直接適用またはPR化できます。"
+            : "best-of-Nの勝者会話をピン留めしました。",
       ),
-      discardLabel,
+      ...actions,
     );
-    if (answer === discardLabel) {
+    if (answer === applyLabel || answer === prLabel) {
+      await this.applyBestOfNWinner(experiment, conversation, answer === prLabel);
+    } else if (answer === discardLabel) {
       for (const loserId of experiment.conversationIds) {
         if (loserId !== conversationId) {
           await this.deleteConversation(loserId);
@@ -1799,6 +2998,144 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (this.showingHome && !this.activeId) {
       this.postView();
     }
+  }
+
+  private async applyBestOfNWinner(
+    experiment: BestOfNExperiment,
+    conversation: Conversation,
+    createPullRequest: boolean,
+  ): Promise<void> {
+    const artifact = this.bestOfNArtifacts.get(conversation.id);
+    if (!artifact) {
+      return;
+    }
+    const storageRoot = this.context.storageUri ?? this.context.globalStorageUri;
+    let appliedFiles: string[] = [];
+    let appliedSuccessfully = false;
+    try {
+      const changeSession = this.featureEnabled("enableChangeSessions")
+        ? await this.changeSessions.begin(
+            `Apply best-of-N winner: ${conversation.title}`,
+            artifact.root,
+          )
+        : undefined;
+      const result = await this.parallelApplyQueue.run(async () => {
+        const lease = await this.fileOwnership.acquire(
+          `best-of-n:${conversation.id}`,
+          [
+            path.join(artifact.root, ".cursor-parallel-workspace-owner"),
+            ...artifact.changes.map((change) => path.join(artifact.root, change.relative)),
+          ],
+        );
+        try {
+          return await applyIsolatedChanges(
+            artifact.session,
+            storageRoot,
+            artifact.changes,
+            {
+          pathEscapeLabel: "best-of-N candidate",
+          unavailableMessage: localize(
+            "The winning candidate worktree is unavailable.",
+            "勝者候補のworktreeを利用できません。",
+          ),
+          conflictMessage: localize(
+            "The workspace changed after the candidate started; the conflicting file was not applied.",
+            "候補開始後にワークスペースが変更されたため、競合ファイルは適用しませんでした。",
+          ),
+          missingBaselineMessage: (relative) => localize(
+            `The best-of-N baseline for ${relative} is unavailable.`,
+            `${relative} のbest-of-Nベースラインを利用できません。`,
+          ),
+          autoMerge: true,
+            },
+          );
+        } finally {
+          lease.release();
+        }
+      });
+      appliedFiles = result.applied.map((relative) => path.join(artifact.root, relative));
+      if (changeSession && appliedFiles.length > 0) {
+        await this.changeSessions.markPending(appliedFiles, changeSession.id);
+        this.changeSessions.keepAll(changeSession.id);
+      }
+      await this.recordAudit({
+        action: "compare.apply",
+        summary: `Applied best-of-N winner (${result.applied.length} file(s))`,
+        details: result.merged.length > 0
+          ? `Automatically merged: ${result.merged.join(", ")}`
+          : undefined,
+        files: result.applied,
+        sessionId: changeSession?.id,
+      });
+      if (result.conflicts.length > 0) {
+        if (changeSession) {
+          this.changeSessions.setPhase("review", changeSession.id);
+        }
+        void vscode.window.showWarningMessage(localize(
+          `Applied the winner, but ${result.conflicts.length} conflicting file(s) require manual review.`,
+          `勝者を適用しましたが、${result.conflicts.length}件の競合ファイルは手動確認が必要です。`,
+        ));
+      }
+      const verification = this.featureEnabled("enableVerification")
+        ? await runVerification(
+            artifact.root,
+            this.alertConfiguration().get<string[]>("verificationCommands", []),
+            this.output,
+          )
+        : undefined;
+      if (verification && changeSession) {
+        this.changeSessions.setVerification(verification, changeSession.id);
+      }
+      if (createPullRequest && result.conflicts.length === 0 && verification?.success !== false) {
+        await this.recordAudit({
+          action: "compare.pr",
+          summary: `Creating PR from best-of-N winner: ${conversation.title}`,
+          files: result.applied,
+          sessionId: changeSession?.id,
+        });
+        await this.createPipelinePullRequest(
+          artifact.root,
+          conversation.title.replace(/^\[B\d+\]\s*/, ""),
+          [
+            experiment.prompt,
+            "",
+            verification ? this.formatVerificationSummary(verification) : "",
+          ].filter(Boolean).join("\n"),
+          appliedFiles,
+        );
+      }
+      experiment.appliedWinnerId = conversation.id;
+      experiment.pullRequestCreated = createPullRequest && verification?.success !== false;
+      appliedSuccessfully = true;
+      await this.context.workspaceState.update(BEST_OF_N_KEY, this.bestOfNExperiments);
+      void vscode.window.showInformationMessage(localize(
+        `Applied best-of-N winner (${appliedFiles.length} file(s)).`,
+        `best-of-Nの勝者を適用しました（${appliedFiles.length}ファイル）。`,
+      ));
+    } catch (error) {
+      void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (appliedSuccessfully) {
+        await this.cleanupBestOfNArtifacts(experiment);
+      }
+    }
+  }
+
+  private async cleanupBestOfNArtifact(conversationId: string): Promise<void> {
+    const artifact = this.bestOfNArtifacts.get(conversationId);
+    if (!artifact) {
+      return;
+    }
+    this.bestOfNArtifacts.delete(conversationId);
+    await cleanupIsolatedWorktree(
+      artifact.session,
+      this.context.storageUri ?? this.context.globalStorageUri,
+      (message) => this.output.appendLine(message),
+    );
+  }
+
+  private async cleanupBestOfNArtifacts(experiment: BestOfNExperiment): Promise<void> {
+    await Promise.all(experiment.conversationIds.map((id) => this.cleanupBestOfNArtifact(id)));
   }
 
   private postBestOfNCompare(experimentId: string): void {
@@ -1930,6 +3267,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const wasActive = this.activeId === id;
     await this.cancelConversation(id);
     await this.disposeAgent(id);
+    await this.cleanupBestOfNArtifact(id);
     for (let index = this.messageQueue.length - 1; index >= 0; index -= 1) {
       if (this.messageQueue[index].conversationId === id) {
         this.messageQueue.splice(index, 1);
@@ -1968,6 +3306,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
     await this.cancelAllChats();
     await this.disposeAgent();
+    await Promise.all([...this.bestOfNArtifacts.keys()].map((id) => this.cleanupBestOfNArtifact(id)));
     await this.attachmentService.dispose();
     for (const disposable of this.disposables) {
       disposable.dispose();
@@ -2270,7 +3609,91 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private postUsageStats(): void {
-    this.post({ type: "usageStats", summary: this.usageSummary() });
+    const configuration = this.alertConfiguration();
+    const dailyBudget = configuration.get<number>("dailyTokenBudget", 0);
+    const monthlyBudget = configuration.get<number>("monthlyTokenBudget", 0);
+    const monthlyCostLimit = configuration.get<number>("monthlyCostLimitUsd", 0);
+    const blendedRate = configuration.get<number>("estimatedCostPerMillionTokensUsd", 0);
+    const ledger = this.context.workspaceState.get<UsageLedger>(USAGE_LEDGER_KEY);
+    const budget = budgetSnapshot(
+      ledger,
+      dailyBudget,
+    );
+    const monthly = monthlyBudgetSnapshot(ledger, monthlyBudget);
+    const cost = estimatedMonthlyCostSnapshot(ledger, monthlyCostLimit, blendedRate);
+    const inlineCompletion = this.context.workspaceState.get<InlineCompletionStats>(
+      INLINE_COMPLETION_STATS_KEY,
+      { suggested: 0, accepted: 0 },
+    );
+    this.post({
+      type: "usageStats",
+      summary: this.usageSummary(),
+      budget: budget
+        ? {
+            budget: budget.budget,
+            used: budget.used,
+            remaining: budget.remaining,
+            ratio: budget.ratio,
+            status: budget.status,
+          }
+        : undefined,
+      monthlyBudget: monthly,
+      estimatedCost: cost
+        ? {
+            estimatedUsd: cost.estimatedUsd,
+            limitUsd: cost.limitUsd,
+            ratio: cost.ratio,
+            status: cost.status,
+          }
+        : undefined,
+      inlineCompletion: {
+        ...inlineCompletion,
+        acceptanceRate: inlineCompletionAcceptanceRate(inlineCompletion),
+      },
+    });
+  }
+
+  private async createPipelinePullRequest(
+    root: string,
+    title: string,
+    body: string,
+    files: string[],
+  ): Promise<void> {
+    try {
+      const relativeFiles = files
+        .map((file) => path.relative(root, file).replaceAll("\\", "/"))
+        .filter((file) => isSafeRelativePath(file));
+      const result = await createBranchCommitAndPullRequest({
+        root,
+        title,
+        body,
+        files: relativeFiles.length > 0 ? relativeFiles : undefined,
+        japanese: IS_JAPANESE,
+      });
+      await this.recordAudit({
+        action: "pipeline.pr",
+        summary: `Created pipeline PR ${result.branch}`,
+        details: result.url,
+        files: relativeFiles,
+      });
+      const openLabel = localize("Open pull request", "PRを開く");
+      const followUp = result.url
+        ? await vscode.window.showInformationMessage(
+          localize(
+            `Pipeline created ${result.branch}`,
+            `パイプラインが ${result.branch} を作成しました`,
+          ),
+          openLabel,
+        )
+        : undefined;
+      if (followUp === openLabel && result.url) {
+        await vscode.env.openExternal(vscode.Uri.parse(result.url));
+      }
+    } catch (error) {
+      void vscode.window.showErrorMessage(
+        error instanceof Error ? error.message : String(error),
+      );
+    }
   }
 
   private postView(searchQuery = ""): void {
@@ -2409,6 +3832,37 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }
     }
     return defaultWorkspaceFolder(vscode.window.activeTextEditor?.document.uri);
+  }
+
+  private explicitTargetFiles(
+    workspace: vscode.WorkspaceFolder,
+    requestedFiles: readonly string[],
+    editorContext: EditorContextSnapshot | undefined,
+    attachContext: boolean,
+  ): string[] {
+    const root = path.resolve(workspace.uri.fsPath);
+    const candidates = [
+      path.join(root, ".cursor-parallel-workspace-owner"),
+      ...requestedFiles
+        .map((file) => resolveAbsoluteInWorkspace(file, workspace))
+        .filter((file): file is string => Boolean(file)),
+    ];
+    if (editorContext?.filePath) {
+      candidates.push(editorContext.filePath);
+    }
+    const active = attachContext ? vscode.window.activeTextEditor?.document.uri : undefined;
+    if (active?.scheme === "file") {
+      candidates.push(active.fsPath);
+    }
+    const unique = new Map<string, string>();
+    for (const file of candidates) {
+      const resolved = path.resolve(file);
+      const relative = path.relative(root, resolved);
+      if (!relative.startsWith("..") && !path.isAbsolute(relative)) {
+        unique.set(process.platform === "win32" ? resolved.toLowerCase() : resolved, resolved);
+      }
+    }
+    return [...unique.values()];
   }
 
   private async bindConversationWorkspace(
@@ -2774,6 +4228,17 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return;
     }
 
+    if (!await this.ensureTokenBudgetAllows()) {
+      this.post({
+        type: "error",
+        text: localize(
+          "Send cancelled because the daily token budget was exceeded.",
+          "1日のトークン予算を超過したため送信を中止しました。",
+        ),
+      });
+      return;
+    }
+
     await this.ensureWindowsSafeModeMigrated();
     if (!SUPPORTS_LOCAL_SANDBOX && !await this.ensureSandboxWarningAcknowledged()) {
       this.post({
@@ -2860,8 +4325,17 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       conversationId,
       runtime.mutating,
     );
-    runtime.overlappedMutation = overlapFlags.get(conversationId) === true;
-    const useIsolatedWorktree = shouldUseIsolatedWorktree({
+    const ownershipAttempt = runtime.mutating
+      ? this.fileOwnership.tryAcquire(
+          conversationId,
+          this.explicitTargetFiles(workspace, requestedFiles, editorContext, attachContext),
+        )
+      : { conflicts: [] };
+    runtime.ownershipLease = ownershipAttempt.lease;
+    runtime.overlappedMutation = overlapFlags.get(conversationId) === true
+      || ownershipAttempt.conflicts.length > 0;
+    const bestOfNCandidate = Boolean(conversation.experimentGroupId) && profile !== "plan";
+    const useIsolatedWorktree = bestOfNCandidate || shouldUseIsolatedWorktree({
       approvalMode: this.selectedApprovalMode(),
       mutating: runtime.mutating,
       overlappedMutation: runtime.overlappedMutation,
@@ -2869,7 +4343,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     });
     runtime.isolationKind = useIsolatedWorktree
       ? (!SUPPORTS_LOCAL_SANDBOX && this.selectedApprovalMode() === "safe-worktree"
-        ? "windows-safe"
+        && !bestOfNCandidate ? "windows-safe"
         : "parallel")
       : undefined;
     if (runtime.overlappedMutation) {
@@ -2895,9 +4369,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     let contextLabel: string | undefined;
     let images: SDKImage[] = [];
     let changeSessionId = continueSession ? runtime.changeSessionId : undefined;
+    let preserveIsolatedWorktree = false;
     const storageRoot = this.context.storageUri ?? this.context.globalStorageUri;
     const shouldStartChangeSession = profile !== "plan"
       && !continueSession
+      && !bestOfNCandidate
       && this.featureEnabled("enableChangeSessions");
     try {
       if (useIsolatedWorktree) {
@@ -2951,8 +4427,16 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         changeSessionId = (await this.changeSessions.begin(effectivePrompt, workspace.uri.fsPath)).id;
         runtime.changeSessionId = changeSessionId;
         this.repairAttempts.set(conversationId, 0);
+        this.changeSessions.setRepairBudget({
+          attempts: 0,
+          maxAttempts: this.alertConfiguration().get<number>("maxAutoRepairAttempts", 1),
+          status: "idle",
+        }, changeSessionId);
       }
     } catch (error) {
+      runtime.ownershipLease?.release();
+      runtime.ownershipLease = undefined;
+      this.fileOwnership.releaseOwner(conversationId);
       if (runtime.isolatedWorktree) {
         await cleanupIsolatedWorktree(
           runtime.isolatedWorktree,
@@ -3181,11 +4665,40 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             `${relative} の隔離チャットベースラインを利用できません。`,
           ),
         });
-        const { applied, merged, conflicts } = await applyIsolatedChanges(
-          session,
-          storageRoot,
-          changes,
-          {
+        if (bestOfNCandidate) {
+          await this.cleanupBestOfNArtifact(conversationId);
+          this.bestOfNArtifacts.set(conversationId, {
+            session,
+            changes,
+            root: workspaceRoot,
+          });
+          preserveIsolatedWorktree = true;
+          const comparisonSummary = localize(
+            `Prepared ${changes.length} isolated candidate change(s). Pick this run as the best-of-N winner to apply them or create a pull request.`,
+            `${changes.length}件の候補変更を隔離して準備しました。best-of-Nの勝者に選ぶと適用またはPR作成できます。`,
+          );
+          assistantText = `${assistantText}\n\n${comparisonSummary}`.trim();
+          if (runtime.live) {
+            runtime.live.assistantText = assistantText;
+          }
+          this.postIfActive(conversationId, { type: "chunk", text: `\n\n${comparisonSummary}` });
+        } else {
+          runtime.ownershipLease?.release();
+          runtime.ownershipLease = undefined;
+          const { applied, merged, conflicts } = await this.parallelApplyQueue.run(async () => {
+            const applyLease = await this.fileOwnership.acquire(
+              conversationId,
+              [
+                path.join(workspaceRoot, ".cursor-parallel-workspace-owner"),
+                ...changes.map((change) => path.join(workspaceRoot, change.relative)),
+              ],
+            );
+            try {
+              return await applyIsolatedChanges(
+                session,
+                storageRoot,
+                changes,
+                {
             pathEscapeLabel: isolationPathLabel,
             unavailableMessage: localize(
               "The isolated worktree is unavailable.",
@@ -3200,10 +4713,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               `${relative} の隔離チャットベースラインを利用できません。`,
             ),
             autoMerge: runtime.overlappedMutation,
-          },
-        );
-        editedFiles.clear();
-        for (const relative of applied) {
+                },
+              );
+            } finally {
+              applyLease.release();
+            }
+          });
+          editedFiles.clear();
+          for (const relative of applied) {
           const absolute = path.join(workspaceRoot, relative);
           editedFiles.add(absolute);
           if (changeSessionId) {
@@ -3215,7 +4732,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             label: vscode.workspace.asRelativePath(absolute),
           });
         }
-        if (merged.length > 0) {
+          if (merged.length > 0) {
           const mergeSummary = localize(
             `${merged.length} concurrently edited file(s) were merged automatically:\n${
               merged.map((relative) => `- ${relative}`).join("\n")
@@ -3232,8 +4749,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           }
           this.postIfActive(conversationId, { type: "chunk", text: `\n\n${mergeSummary}` });
         }
-        let remainingConflicts = conflicts;
-        if (conflicts.length > 0 && runtime.agent) {
+          let remainingConflicts = conflicts;
+          if (conflicts.length > 0 && runtime.agent) {
           const resolution = await this.offerAiConflictResolution({
             runtime,
             conversation,
@@ -3273,7 +4790,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             });
           }
         }
-        if (remainingConflicts.length > 0) {
+          if (remainingConflicts.length > 0) {
           const conflictSummary = localize(
             `${remainingConflicts.length} file(s) remain unresolved and were not applied:\n${
               remainingConflicts.map((item) => `- ${item.relative}: ${item.error}`).join("\n")
@@ -3293,6 +4810,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             runtime.live.assistantText = assistantText;
           }
           this.postIfActive(conversationId, { type: "chunk", text: `\n\n${conflictSummary}` });
+          }
         }
       } else if (
         profile !== "plan"
@@ -3412,23 +4930,68 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         assistantText = `${assistantText}\n\n${this.formatVerificationSummary(verificationResult)}`.trim();
 
         if (verificationResult.success) {
-          void this.offerCreatePullRequest(
-            workspace.uri.fsPath,
-            conversation.title,
-            [...editedFiles],
-          );
+          if (this.pendingPipelinePr) {
+            const pipeline = this.pendingPipelinePr;
+            this.pendingPipelinePr = undefined;
+            void this.createPipelinePullRequest(
+              pipeline.root,
+              pipeline.title,
+              [
+                pipeline.body,
+                "",
+                this.formatVerificationSummary(verificationResult),
+              ].join("\n"),
+              [...editedFiles],
+            );
+          } else if (!this.suppressPullRequestOffers.has(conversationId)) {
+            void this.offerCreatePullRequest(
+              workspace.uri.fsPath,
+              conversation.title,
+              [...editedFiles],
+            );
+          }
         }
 
-        const autoRepair = this.featureEnabled("enableVerification")
+        const autoRepair = vscode.workspace.isTrusted
+          && this.featureEnabled("enableVerification")
           && this.alertConfiguration().get<boolean>("autoRepair", false);
         const maxAttempts = this.alertConfiguration().get<number>("maxAutoRepairAttempts", 1);
-        const attempts = this.repairAttempts.get(conversationId) ?? 0;
+        const persistedRepair = changeSessionId
+          ? this.changeSessions.snapshot(changeSessionId)?.repair
+          : undefined;
+        const attempts = persistedRepair?.attempts
+          ?? this.repairAttempts.get(conversationId)
+          ?? 0;
+        if (changeSessionId && verificationResult.success && attempts > 0) {
+          this.changeSessions.setRepairBudget({
+            attempts,
+            maxAttempts,
+            status: "succeeded",
+          }, changeSessionId);
+        }
         if (!verificationResult.success && autoRepair && attempts < maxAttempts) {
           this.repairAttempts.set(conversationId, attempts + 1);
           const failures = verificationResult.steps
             .filter((step) => !step.success)
             .map((step) => `$ ${step.command}\n${step.output}`)
             .join("\n\n");
+          if (changeSessionId) {
+            this.changeSessions.setRepairBudget({
+              attempts: attempts + 1,
+              maxAttempts,
+              status: "repairing",
+              lastFailure: failures.slice(0, 12_000),
+            }, changeSessionId);
+          }
+          this.postIfActive(conversationId, {
+            type: "toolStatus",
+            callId: `repair-budget-${run.id}`,
+            text: localize(
+              `Automatic repair budget: ${attempts + 1}/${maxAttempts}`,
+              `自動修復バジェット: ${attempts + 1}/${maxAttempts}`,
+            ),
+            status: "running",
+          });
           await this.enqueueMessage(
             [
               `Automatic verification failed (repair attempt ${attempts + 1}/${maxAttempts}).`,
@@ -3445,6 +5008,26 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             true,
             conversationId,
           );
+        } else if (!verificationResult.success && autoRepair && changeSessionId) {
+          const failures = verificationResult.steps
+            .filter((step) => !step.success)
+            .map((step) => `$ ${step.command}\n${step.output}`)
+            .join("\n\n");
+          this.changeSessions.setRepairBudget({
+            attempts,
+            maxAttempts,
+            status: "exhausted",
+            lastFailure: failures.slice(0, 12_000),
+          }, changeSessionId);
+          this.postIfActive(conversationId, {
+            type: "toolStatus",
+            callId: `repair-budget-${run.id}`,
+            text: localize(
+              `Automatic repair budget exhausted (${attempts}/${maxAttempts}).`,
+              `自動修復バジェットの上限に達しました (${attempts}/${maxAttempts})。`,
+            ),
+            status: "error",
+          });
         }
       } else if (result.status === "finished" && profile !== "plan") {
         if (changeSessionId) {
@@ -3508,16 +5091,21 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             );
           }
         }
-        await cleanupIsolatedWorktree(
-          isolated,
-          storageRoot,
-          (message) => this.output.appendLine(message),
-        );
+        if (!preserveIsolatedWorktree) {
+          await cleanupIsolatedWorktree(
+            isolated,
+            storageRoot,
+            (message) => this.output.appendLine(message),
+          );
+        }
       }
 
       runtime.busy = false;
       runtime.pendingCancel = false;
       runtime.isolationKind = undefined;
+      runtime.ownershipLease?.release();
+      runtime.ownershipLease = undefined;
+      this.fileOwnership.releaseOwner(conversationId);
       this.retainFinishedParallelTask(conversationId, progressState);
       this.postParallelState();
       this.postIfActive(conversationId, {
@@ -3567,6 +5155,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       if (this.showingHome) {
         this.postView();
       }
+      if (profile === "plan" && progressState === "completed") {
+        await this.captureExecutionPlan(effectivePrompt, conversationId, assistantText);
+      }
+      await this.handleOrchestratorConversationComplete(
+        conversationId,
+        progressState,
+        assistantText,
+      );
       this.notifyRunComplete(conversation, progressState);
       setTimeout(() => void this.drainMessageQueue(), 0);
     }
@@ -3575,6 +5171,34 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private async reviewAutopilotEdits(sessionId?: string): Promise<void> {
     const session = this.changeSessions.snapshot(sessionId);
     if (!session) {
+      return;
+    }
+    const policy = this.alertConfiguration().get<"prompt" | "keep-all" | "restore-all">(
+      "changeSessionReviewPolicy",
+      "prompt",
+    );
+    if (policy === "keep-all" && vscode.workspace.isTrusted) {
+      const files = this.changeSessions.pendingFiles(session.id)
+        .map((file) => vscode.workspace.asRelativePath(file));
+      this.changeSessions.keepAll(session.id);
+      await this.recordAudit({
+        action: "session.keepAll",
+        summary: `Applied change-session keep-all policy (${files.length})`,
+        files,
+        sessionId: session.id,
+      });
+      return;
+    }
+    if (policy === "restore-all" && this.changeSessions.canRestorePending(session.id)) {
+      const files = this.changeSessions.pendingFiles(session.id)
+        .map((file) => vscode.workspace.asRelativePath(file));
+      await this.changeSessions.restorePending(session.id);
+      await this.recordAudit({
+        action: "session.restoreAll",
+        summary: `Applied change-session restore-all policy (${files.length})`,
+        files,
+        sessionId: session.id,
+      });
       return;
     }
     const keepLabel = localize("Keep", "保持");
@@ -3819,7 +5443,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     includeProjectMemory = true,
   ): { composed: string; contextLabel?: string } {
     const profileInstruction: Partial<Record<RunProfile, string>> = {
-      plan: "Create a concrete implementation plan. Do not edit files or run mutating commands.",
+      plan: [
+        "Create a concrete implementation plan. Do not edit files or run mutating commands.",
+        "End with a machine-readable JSON array of independently executable steps, each with title and prompt:",
+        "<CURSOR_EXECUTION_PLAN>",
+        '[{"title":"Step title","prompt":"Complete implementation instruction for this step"}]',
+        "</CURSOR_EXECUTION_PLAN>",
+        "Order steps so each can run after the previous step and keep each step small enough for a safe checkpoint.",
+      ].join("\n"),
       multitask: "Split independent work into parallel workstreams and delegate them to the available specialist subagents when useful. Integrate and verify their results.",
     };
     const skills = [...new Set(requestedSkills)]
