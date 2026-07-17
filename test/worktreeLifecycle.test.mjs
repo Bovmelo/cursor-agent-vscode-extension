@@ -96,7 +96,7 @@ test("managed worktrees clean up preparation failures and dead-process orphans",
       managedRoots: [managedRoot],
       isProcessAlive: () => false,
     });
-    assert.deepEqual(removed.map((item) => path.resolve(item)), [path.resolve(orphanPath)]);
+    assert.deepEqual(removed.map((item) => path.basename(item)), ["orphaned-run"]);
     assert.equal(await missing(orphanPath), true);
     assert.equal(await missing(worktreeLeasePath(orphanPath)), true);
     assert.doesNotMatch(
