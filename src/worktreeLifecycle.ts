@@ -18,7 +18,14 @@ export interface ManagedWorktreeOptions {
   id: string;
   root: string;
   worktreesHomeSegment: string;
+  worktreesRoot?: string;
   onLog?: (message: string) => void;
+}
+
+export interface OrphanCleanupOptions {
+  now?: number;
+  isProcessAlive?: (pid: number) => boolean;
+  managedRoots?: readonly string[];
 }
 
 export async function runGit(root: string, args: string[]): Promise<string> {
@@ -117,7 +124,8 @@ export async function removeManagedWorktree(
 export async function createManagedWorktree(
   options: ManagedWorktreeOptions,
 ): Promise<string> {
-  const worktreesRoot = managedWorktreesRoot(options.worktreesHomeSegment);
+  const worktreesRoot = options.worktreesRoot
+    ?? managedWorktreesRoot(options.worktreesHomeSegment);
   await mkdir(worktreesRoot, { recursive: true });
   const worktreePath = path.join(worktreesRoot, options.id);
   await writeFile(
@@ -208,8 +216,7 @@ export async function cleanupOrphanedManagedWorktrees(
   root: string,
   worktreesHomeSegments: readonly string[],
   onLog?: (message: string) => void,
-  now = Date.now(),
-  isProcessAlive: (pid: number) => boolean = processIsAlive,
+  options: OrphanCleanupOptions = {},
 ): Promise<string[]> {
   let porcelain: string;
   try {
@@ -217,7 +224,10 @@ export async function cleanupOrphanedManagedWorktrees(
   } catch {
     return [];
   }
-  const managedRoots = worktreesHomeSegments.map(managedWorktreesRoot);
+  const managedRoots = options.managedRoots?.map((managedRoot) => path.resolve(managedRoot))
+    ?? worktreesHomeSegments.map(managedWorktreesRoot);
+  const now = options.now ?? Date.now();
+  const isProcessAlive = options.isProcessAlive ?? processIsAlive;
   const removed: string[] = [];
   for (const worktreePath of parseWorktreePaths(porcelain)) {
     if (!managedRoots.some((managedRoot) => isInside(managedRoot, worktreePath))) {

@@ -50,6 +50,7 @@ test("managed worktrees clean up preparation failures and dead-process orphans",
           id: "preparation-failure",
           root: repository,
           worktreesHomeSegment: homeSegment,
+          worktreesRoot: managedRoot,
         },
         async () => {
           throw new Error("simulated baseline failure");
@@ -70,6 +71,7 @@ test("managed worktrees clean up preparation failures and dead-process orphans",
       id: "orphaned-run",
       root: repository,
       worktreesHomeSegment: homeSegment,
+      worktreesRoot: managedRoot,
     });
     await linkManagedNodeModules(repository, orphanPath);
     assert.equal((await lstat(path.join(orphanPath, "node_modules"))).isSymbolicLink(), true);
@@ -78,7 +80,9 @@ test("managed worktrees clean up preparation failures and dead-process orphans",
       "linked\n",
     );
     assert.deepEqual(
-      await cleanupOrphanedManagedWorktrees(repository, [homeSegment]),
+      await cleanupOrphanedManagedWorktrees(repository, [homeSegment], undefined, {
+        managedRoots: [managedRoot],
+      }),
       [],
       "a live extension-host lease must protect another window's worktree",
     );
@@ -88,13 +92,10 @@ test("managed worktrees clean up preparation failures and dead-process orphans",
       JSON.stringify({ pid: 2_147_483_647, root: repository, createdAt: Date.now() }),
       "utf8",
     );
-    const removed = await cleanupOrphanedManagedWorktrees(
-      repository,
-      [homeSegment],
-      undefined,
-      Date.now(),
-      () => false,
-    );
+    const removed = await cleanupOrphanedManagedWorktrees(repository, [homeSegment], undefined, {
+      managedRoots: [managedRoot],
+      isProcessAlive: () => false,
+    });
     assert.deepEqual(removed.map((item) => path.resolve(item)), [path.resolve(orphanPath)]);
     assert.equal(await missing(orphanPath), true);
     assert.equal(await missing(worktreeLeasePath(orphanPath)), true);
