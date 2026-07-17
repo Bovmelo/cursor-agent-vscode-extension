@@ -1,0 +1,668 @@
+import { execFile as execFileCallback } from "node:child_process";
+import { createHash } from "node:crypto";
+import { homedir } from "node:os";
+import * as path from "node:path";
+import { promisify } from "node:util";
+import * as vscode from "vscode";
+import {
+  canApplyAgainstBaseline,
+  hashBytes,
+  isPathInside,
+  safeResolvePath,
+} from "./safety.js";
+import { hasConflictMarkers, threeWayMergeBytes } from "./threeWayMerge.js";
+
+const execFileAsync = promisify(execFileCallback);
+const MAX_GIT_OUTPUT = 32 * 1024 * 1024;
+
+export interface IsolatedBaselineFile {
+  existed: boolean;
+  hash?: string;
+  backupName?: string;
+}
+
+export interface IsolatedWorktreeSession {
+  id: string;
+  root: string;
+  worktreePath: string;
+  baselineCommit: string;
+  baselineFiles: Record<string, IsolatedBaselineFile>;
+  initialChangedFiles: string[];
+  baselinesFolder: string;
+}
+
+export interface IsolatedChange {
+  relative: string;
+  kind: "added" | "modified" | "deleted";
+  added: number;
+  deleted: number;
+}
+
+export interface PrepareIsolatedWorktreeOptions {
+  id: string;
+  root: string;
+  storageRoot: vscode.Uri;
+  /** Short home-relative segment, e.g. `.cursor-supervisor/worktrees`. */
+  worktreesHomeSegment: string;
+  /** Folder under storageRoot for baseline byte backups. */
+  baselinesFolder: string;
+  isExcluded?: (relative: string) => boolean;
+  onLog?: (message: string) => void;
+  pathEscapeLabel?: string;
+}
+
+export { hashBytes };
+
+export function normalizedRelative(value: string): string {
+  return value.replaceAll("\\", "/").replace(/^\.\//, "");
+}
+
+export function isInside(root: string, candidate: string): boolean {
+  return isPathInside(root, candidate);
+}
+
+export function safePath(
+  root: string,
+  relative: string,
+  pathEscapeLabel = "isolated worktree",
+): string {
+  try {
+    return safeResolvePath(root, relative);
+  } catch {
+    throw new Error(`Path escapes the ${pathEscapeLabel} workspace: ${relative}`);
+  }
+}
+
+function splitNull(value: string): string[] {
+  return value.split("\0").filter((item) => item.length > 0).map(normalizedRelative);
+}
+
+export function lineDiffCounts(
+  baseline: Uint8Array | undefined,
+  proposed: Uint8Array | undefined,
+): { added: number; deleted: number } {
+  const before = baseline ? Buffer.from(baseline) : Buffer.alloc(0);
+  const after = proposed ? Buffer.from(proposed) : Buffer.alloc(0);
+  if (before.includes(0) || after.includes(0)) {
+    return { added: 0, deleted: 0 };
+  }
+  const beforeLines = before.length === 0 ? [] : before.toString("utf8").split(/\r?\n/);
+  const afterLines = after.length === 0 ? [] : after.toString("utf8").split(/\r?\n/);
+  if (beforeLines.length * afterLines.length > 2_000_000) {
+    return { added: afterLines.length, deleted: beforeLines.length };
+  }
+  const previous = new Uint32Array(afterLines.length + 1);
+  const current = new Uint32Array(afterLines.length + 1);
+  for (const beforeLine of beforeLines) {
+    for (let column = 1; column <= afterLines.length; column += 1) {
+      current[column] = beforeLine === afterLines[column - 1]
+        ? previous[column - 1] + 1
+        : Math.max(previous[column], current[column - 1]);
+    }
+    previous.set(current);
+    current.fill(0);
+  }
+  const common = previous[afterLines.length];
+  return {
+    added: afterLines.length - common,
+    deleted: beforeLines.length - common,
+  };
+}
+
+export async function runGit(root: string, args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync("git", args, {
+    cwd: root,
+    windowsHide: true,
+    maxBuffer: MAX_GIT_OUTPUT,
+    encoding: "utf8",
+  });
+  return stdout;
+}
+
+async function git(root: string, args: string[]): Promise<string> {
+  return runGit(root, args);
+}
+
+async function gitBytes(root: string, args: string[]): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    execFileCallback(
+      "git",
+      args,
+      {
+        cwd: root,
+        windowsHide: true,
+        maxBuffer: MAX_GIT_OUTPUT,
+        encoding: "buffer",
+      },
+      (error, stdout) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve(Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout));
+        }
+      },
+    );
+  });
+}
+
+export async function fileState(file: string): Promise<{ exists: boolean; bytes?: Uint8Array }> {
+  try {
+    return {
+      exists: true,
+      bytes: await vscode.workspace.fs.readFile(vscode.Uri.file(file)),
+    };
+  } catch {
+    return { exists: false };
+  }
+}
+
+async function overlayCurrentWorkspace(
+  root: string,
+  worktree: string,
+  isExcluded: ((relative: string) => boolean) | undefined,
+  pathEscapeLabel: string,
+): Promise<void> {
+  const tracked = splitNull(await git(root, ["ls-files", "-z"]));
+  const untracked = splitNull(await git(root, [
+    "ls-files",
+    "--others",
+    "--exclude-standard",
+    "-z",
+  ]));
+  for (const relative of new Set([...tracked, ...untracked])) {
+    if (isExcluded?.(relative)) {
+      continue;
+    }
+    const source = safePath(root, relative, pathEscapeLabel);
+    const target = safePath(worktree, relative, pathEscapeLabel);
+    const state = await fileState(source);
+    if (!state.exists) {
+      try {
+        await vscode.workspace.fs.delete(vscode.Uri.file(target), { recursive: false });
+      } catch {
+        // The detached worktree may already reflect the deletion.
+      }
+      continue;
+    }
+    await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(target)));
+    await vscode.workspace.fs.copy(
+      vscode.Uri.file(source),
+      vscode.Uri.file(target),
+      { overwrite: true },
+    );
+  }
+}
+
+async function captureBaseline(
+  session: IsolatedWorktreeSession,
+  storageRoot: vscode.Uri,
+): Promise<void> {
+  const changed = splitNull(await git(session.worktreePath, [
+    "diff",
+    "--name-only",
+    "--no-renames",
+    "-z",
+    session.baselineCommit,
+  ]));
+  const untracked = splitNull(await git(session.worktreePath, [
+    "ls-files",
+    "--others",
+    "--exclude-standard",
+    "-z",
+  ]));
+  session.initialChangedFiles = [...new Set([...changed, ...untracked])];
+  session.baselineFiles = {};
+  const backupRoot = vscode.Uri.joinPath(
+    storageRoot,
+    session.baselinesFolder,
+    session.id,
+  );
+  await vscode.workspace.fs.createDirectory(backupRoot);
+  for (const relative of session.initialChangedFiles) {
+    const current = await fileState(
+      safePath(session.worktreePath, relative),
+    );
+    if (!current.exists || !current.bytes) {
+      session.baselineFiles[relative] = { existed: false };
+      continue;
+    }
+    const backupName = createHash("sha256").update(relative).digest("hex");
+    await vscode.workspace.fs.writeFile(
+      vscode.Uri.joinPath(backupRoot, backupName),
+      current.bytes,
+    );
+    session.baselineFiles[relative] = {
+      existed: true,
+      hash: hashBytes(current.bytes),
+      backupName,
+    };
+  }
+}
+
+async function linkNodeModules(
+  root: string,
+  worktree: string,
+  onLog?: (message: string) => void,
+): Promise<void> {
+  const source = path.join(root, "node_modules");
+  const target = path.join(worktree, "node_modules");
+  try {
+    const stat = await vscode.workspace.fs.stat(vscode.Uri.file(source));
+    if ((stat.type & vscode.FileType.Directory) === 0) {
+      return;
+    }
+  } catch {
+    return;
+  }
+  try {
+    const { symlink } = await import("node:fs/promises");
+    await symlink(source, target, process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    onLog?.(
+      `[${new Date().toISOString()}] Could not link node_modules: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
+/**
+ * Create a detached git worktree, overlay dirty main-tree files, capture baselines,
+ * and symlink node_modules. Cursor SDK state paths stay short via a home-dir checkout.
+ */
+export async function prepareIsolatedWorktree(
+  options: PrepareIsolatedWorktreeOptions,
+): Promise<IsolatedWorktreeSession> {
+  const pathEscapeLabel = options.pathEscapeLabel ?? "isolated worktree";
+  await vscode.workspace.fs.createDirectory(options.storageRoot);
+  const worktreesRoot = path.join(homedir(), ...options.worktreesHomeSegment.split(/[/\\]+/));
+  await vscode.workspace.fs.createDirectory(vscode.Uri.file(worktreesRoot));
+  const worktree = path.join(worktreesRoot, options.id);
+  await git(options.root, ["worktree", "add", "--detach", worktree, "HEAD"]);
+  await overlayCurrentWorkspace(
+    options.root,
+    worktree,
+    options.isExcluded,
+    pathEscapeLabel,
+  );
+  const baselineCommit = (await git(worktree, ["rev-parse", "HEAD"])).trim();
+  const session: IsolatedWorktreeSession = {
+    id: options.id,
+    root: options.root,
+    worktreePath: worktree,
+    baselineCommit,
+    baselineFiles: {},
+    initialChangedFiles: [],
+    baselinesFolder: options.baselinesFolder,
+  };
+  await captureBaseline(session, options.storageRoot);
+  await linkNodeModules(options.root, worktree, options.onLog);
+  return session;
+}
+
+export async function readIsolatedBaseline(
+  session: IsolatedWorktreeSession,
+  storageRoot: vscode.Uri,
+  relative: string,
+  missingBaselineMessage?: (relative: string) => string,
+): Promise<{ exists: boolean; bytes?: Uint8Array }> {
+  const snapshot = session.baselineFiles[relative];
+  if (snapshot) {
+    if (!snapshot.existed || !snapshot.backupName) {
+      return { exists: false };
+    }
+    try {
+      const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(
+        storageRoot,
+        session.baselinesFolder,
+        session.id,
+        snapshot.backupName,
+      ));
+      return { exists: true, bytes };
+    } catch {
+      throw new Error(
+        missingBaselineMessage?.(relative)
+          ?? `The isolated baseline for ${relative} is unavailable.`,
+      );
+    }
+  }
+  try {
+    return {
+      exists: true,
+      bytes: await gitBytes(session.worktreePath, [
+        "show",
+        `${session.baselineCommit}:${relative}`,
+      ]),
+    };
+  } catch {
+    return { exists: false };
+  }
+}
+
+export async function collectIsolatedChanges(
+  session: IsolatedWorktreeSession,
+  storageRoot: vscode.Uri,
+  options?: {
+    isExcluded?: (relative: string) => boolean;
+    missingBaselineMessage?: (relative: string) => string;
+    pathEscapeLabel?: string;
+  },
+): Promise<Array<IsolatedChange & { excluded: boolean }>> {
+  const pathEscapeLabel = options?.pathEscapeLabel ?? "isolated worktree";
+  const changed = splitNull(await git(session.worktreePath, [
+    "diff",
+    "--name-only",
+    "--no-renames",
+    "-z",
+    session.baselineCommit,
+  ]));
+  const untracked = splitNull(await git(session.worktreePath, [
+    "ls-files",
+    "--others",
+    "--exclude-standard",
+    "-z",
+  ]));
+  const paths = [...new Set([
+    ...session.initialChangedFiles,
+    ...changed,
+    ...untracked,
+  ])];
+
+  const result: Array<IsolatedChange & { excluded: boolean }> = [];
+  for (const relative of paths) {
+    const baseline = await readIsolatedBaseline(
+      session,
+      storageRoot,
+      relative,
+      options?.missingBaselineMessage,
+    );
+    const current = await fileState(
+      safePath(session.worktreePath, relative, pathEscapeLabel),
+    );
+    const unchanged = baseline.exists === current.exists
+      && (!baseline.exists
+        || Boolean(
+          baseline.bytes
+          && current.bytes
+          && hashBytes(baseline.bytes) === hashBytes(current.bytes),
+        ));
+    if (unchanged) {
+      continue;
+    }
+    const kind = !baseline.exists ? "added" : !current.exists ? "deleted" : "modified";
+    const stats = lineDiffCounts(baseline.bytes, current.bytes);
+    result.push({
+      relative,
+      kind,
+      ...stats,
+      excluded: options?.isExcluded?.(relative) === true,
+    });
+  }
+  return result.sort((left, right) => left.relative.localeCompare(right.relative));
+}
+
+export async function applyIsolatedChange(
+  session: IsolatedWorktreeSession,
+  storageRoot: vscode.Uri,
+  change: Pick<IsolatedChange, "relative">,
+  options?: {
+    conflictMessage?: string;
+    unavailableMessage?: string;
+    missingBaselineMessage?: (relative: string) => string;
+    pathEscapeLabel?: string;
+    autoMerge?: boolean;
+  },
+): Promise<"applied" | "merged" | "already-applied"> {
+  const pathEscapeLabel = options?.pathEscapeLabel ?? "isolated worktree";
+  if (!session.worktreePath || !session.baselineCommit) {
+    throw new Error(options?.unavailableMessage ?? "The isolated worktree is unavailable.");
+  }
+  const baseline = await readIsolatedBaseline(
+    session,
+    storageRoot,
+    change.relative,
+    options?.missingBaselineMessage,
+  );
+
+  const mainFile = safePath(session.root, change.relative, pathEscapeLabel);
+  const currentMain = await fileState(mainFile);
+  const proposed = safePath(session.worktreePath, change.relative, pathEscapeLabel);
+  const proposedState = await fileState(proposed);
+  const unchanged = canApplyAgainstBaseline(
+    {
+      exists: baseline.exists,
+      hash: baseline.bytes ? hashBytes(baseline.bytes) : undefined,
+    },
+    {
+      exists: currentMain.exists,
+      hash: currentMain.bytes ? hashBytes(currentMain.bytes) : undefined,
+    },
+  );
+  if (!unchanged) {
+    const alreadyApplied = currentMain.exists === proposedState.exists
+      && (!currentMain.exists || Boolean(
+        currentMain.bytes
+        && proposedState.bytes
+        && hashBytes(currentMain.bytes) === hashBytes(proposedState.bytes),
+      ));
+    if (alreadyApplied) {
+      return "already-applied";
+    }
+    if (
+      options?.autoMerge
+      && baseline.exists
+      && baseline.bytes
+      && currentMain.exists
+      && currentMain.bytes
+      && proposedState.exists
+      && proposedState.bytes
+    ) {
+      const merged = await threeWayMergeBytes(
+        currentMain.bytes,
+        baseline.bytes,
+        proposedState.bytes,
+        change.relative,
+      );
+      if (merged.clean && merged.bytes) {
+        await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(mainFile)));
+        await vscode.workspace.fs.writeFile(vscode.Uri.file(mainFile), merged.bytes);
+        return "merged";
+      }
+    }
+    throw new Error(
+      options?.conflictMessage
+        ?? "The file changed after the isolated task started. Review and merge it manually.",
+    );
+  }
+
+  if (proposedState.exists) {
+    await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(mainFile)));
+    await vscode.workspace.fs.copy(
+      vscode.Uri.file(proposed),
+      vscode.Uri.file(mainFile),
+      { overwrite: true },
+    );
+  } else if (currentMain.exists) {
+    await vscode.workspace.fs.delete(vscode.Uri.file(mainFile), { recursive: false });
+  }
+  return "applied";
+}
+
+export async function applyIsolatedChanges(
+  session: IsolatedWorktreeSession,
+  storageRoot: vscode.Uri,
+  changes: readonly Pick<IsolatedChange, "relative">[],
+  options?: {
+    conflictMessage?: string;
+    unavailableMessage?: string;
+    missingBaselineMessage?: (relative: string) => string;
+    pathEscapeLabel?: string;
+    skip?: (change: Pick<IsolatedChange, "relative">) => boolean;
+    autoMerge?: boolean;
+  },
+): Promise<{
+  applied: string[];
+  merged: string[];
+  conflicts: Array<{ relative: string; error: string }>;
+}> {
+  const applied: string[] = [];
+  const merged: string[] = [];
+  const conflicts: Array<{ relative: string; error: string }> = [];
+  for (const change of changes) {
+    if (options?.skip?.(change)) {
+      continue;
+    }
+    try {
+      const outcome = await applyIsolatedChange(session, storageRoot, change, options);
+      applied.push(change.relative);
+      if (outcome === "merged") {
+        merged.push(change.relative);
+      }
+    } catch (error) {
+      conflicts.push({
+        relative: change.relative,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return { applied, merged, conflicts };
+}
+
+export interface PreparedAiConflict {
+  relative: string;
+  expectedMainHash: string;
+}
+
+/**
+ * Put a textual conflict into the isolated worktree for a follow-up agent.
+ * The main workspace is read only and remains free of conflict markers.
+ */
+export async function prepareAiConflictResolution(
+  session: IsolatedWorktreeSession,
+  storageRoot: vscode.Uri,
+  relative: string,
+  options?: {
+    missingBaselineMessage?: (relative: string) => string;
+    pathEscapeLabel?: string;
+  },
+): Promise<PreparedAiConflict | undefined> {
+  const pathEscapeLabel = options?.pathEscapeLabel ?? "isolated worktree";
+  const baseline = await readIsolatedBaseline(
+    session,
+    storageRoot,
+    relative,
+    options?.missingBaselineMessage,
+  );
+  const mainFile = safePath(session.root, relative, pathEscapeLabel);
+  const proposedFile = safePath(session.worktreePath, relative, pathEscapeLabel);
+  const currentMain = await fileState(mainFile);
+  const proposed = await fileState(proposedFile);
+  if (
+    !baseline.exists
+    || !baseline.bytes
+    || !currentMain.exists
+    || !currentMain.bytes
+    || !proposed.exists
+    || !proposed.bytes
+  ) {
+    return undefined;
+  }
+  const merge = await threeWayMergeBytes(
+    currentMain.bytes,
+    baseline.bytes,
+    proposed.bytes,
+    relative,
+  );
+  if (merge.clean || !merge.bytes || !hasConflictMarkers(merge.bytes)) {
+    return undefined;
+  }
+  await vscode.workspace.fs.writeFile(vscode.Uri.file(proposedFile), merge.bytes);
+  return {
+    relative,
+    expectedMainHash: hashBytes(currentMain.bytes),
+  };
+}
+
+/** Apply an AI-resolved worktree file only while its reviewed workspace input is current. */
+export async function applyAiConflictResolution(
+  session: IsolatedWorktreeSession,
+  prepared: PreparedAiConflict,
+  options?: {
+    changedMessage?: string;
+    markersMessage?: string;
+    pathEscapeLabel?: string;
+  },
+): Promise<void> {
+  const pathEscapeLabel = options?.pathEscapeLabel ?? "isolated worktree";
+  const mainFile = safePath(session.root, prepared.relative, pathEscapeLabel);
+  const proposedFile = safePath(session.worktreePath, prepared.relative, pathEscapeLabel);
+  const currentMain = await fileState(mainFile);
+  if (
+    !currentMain.exists
+    || !currentMain.bytes
+    || hashBytes(currentMain.bytes) !== prepared.expectedMainHash
+  ) {
+    throw new Error(
+      options?.changedMessage
+        ?? "The workspace file changed during AI conflict resolution.",
+    );
+  }
+  const resolved = await fileState(proposedFile);
+  if (!resolved.exists || !resolved.bytes || hasConflictMarkers(resolved.bytes)) {
+    throw new Error(
+      options?.markersMessage
+        ?? "The AI did not remove every conflict marker.",
+    );
+  }
+  await vscode.workspace.fs.writeFile(vscode.Uri.file(mainFile), resolved.bytes);
+}
+
+export async function cleanupIsolatedWorktree(
+  session: IsolatedWorktreeSession | undefined,
+  storageRoot: vscode.Uri,
+  onLog?: (message: string) => void,
+): Promise<void> {
+  if (!session?.worktreePath) {
+    return;
+  }
+  const worktree = session.worktreePath;
+  try {
+    try {
+      const { unlink } = await import("node:fs/promises");
+      await unlink(path.join(worktree, "node_modules"));
+    } catch {
+      // node_modules may not have been linked.
+    }
+    await git(session.root, ["worktree", "remove", "--force", worktree]);
+    await git(session.root, ["worktree", "prune"]);
+    try {
+      await vscode.workspace.fs.delete(vscode.Uri.joinPath(
+        storageRoot,
+        session.baselinesFolder,
+        session.id,
+      ), { recursive: true });
+    } catch {
+      // The baseline directory may already have been cleaned up.
+    }
+  } catch (error) {
+    onLog?.(
+      `[${new Date().toISOString()}] Could not remove worktree ${worktree}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+}
+
+/** Map a path under the isolated worktree to the corresponding main-workspace path. */
+export function mapWorktreePathToRoot(
+  absolutePath: string,
+  session: IsolatedWorktreeSession,
+): string {
+  const resolved = path.resolve(absolutePath);
+  const worktree = path.resolve(session.worktreePath);
+  if (resolved === worktree || isInside(worktree, resolved)) {
+    const relative = path.relative(worktree, resolved);
+    return path.resolve(session.root, relative);
+  }
+  return resolved;
+}

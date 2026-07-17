@@ -50,3 +50,22 @@ test("multi-root paths resolve folder-prefixed and preferred roots", () => {
     "C:/abs/file.ts",
   );
 });
+
+function matchFolderUri(folders, uriString) {
+  if (!uriString) {
+    return undefined;
+  }
+  return folders.find(
+    (folder) => folder.uri === uriString || folder.fsPath === uriString,
+  );
+}
+
+test("persisted chat workspace URI matches the intended multi-root folder", () => {
+  const folders = [
+    { name: "app", uri: "file:///C:/ws/app", fsPath: "C:/ws/app" },
+    { name: "api", uri: "file:///C:/ws/api", fsPath: "C:/ws/api" },
+  ];
+  assert.equal(matchFolderUri(folders, "file:///C:/ws/api")?.name, "api");
+  assert.equal(matchFolderUri(folders, "C:/ws/app")?.name, "app");
+  assert.equal(matchFolderUri(folders, "file:///C:/ws/other"), undefined);
+});

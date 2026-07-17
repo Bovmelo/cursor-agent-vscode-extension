@@ -6,6 +6,26 @@ Run [Cursor](https://cursor.com) agents from the VS Code sidebar with your Curso
 
 日本語は下の [日本語](#日本語) を参照してください。
 
+## See it in action
+
+### Run independent agents in parallel
+
+![Parallel agents running in the VS Code sidebar](media/marketplace-parallel-agents.png)
+
+Start another conversation while the current agent keeps working, then switch between live runs from the parallel-agent bar.
+
+### Let Supervisor work in isolation, then review the diff
+
+![AI Supervisor isolated worktree, diff review, and apply flow](media/marketplace-supervisor-review.png)
+
+Supervisor runs in a detached Git worktree and returns per-file diffs, reasons, and apply/discard controls.
+
+### Restore checkpoints without losing a dirty baseline
+
+![Checkpoint restore preserving pre-existing dirty files](media/marketplace-checkpoint-restore.png)
+
+Change sessions distinguish your pre-existing uncommitted work from AI edits, so restore removes only the agent's changes.
+
 ## Features
 
 - Local Cursor Agent for the current workspace
@@ -14,7 +34,7 @@ Run [Cursor](https://cursor.com) agents from the VS Code sidebar with your Curso
 - Profiles: Agent, Plan, Multitask (SDK subagents)
 - Image context (PNG, JPEG, GIF, WebP)
 - Project Skills and `.cursor/mcp.json` MCP servers
-- Permission modes (auto-review / full access)
+- Permission modes (Windows Safe worktree / auto-review / full access)
 - `@` file search, drag-and-drop (hold Shift while dragging) / paste file references
 - Active editor and selection context
 - Conversation history across restarts
@@ -23,7 +43,7 @@ Run [Cursor](https://cursor.com) agents from the VS Code sidebar with your Curso
 - AI Supervisor inbox with Observe and Autonomous modes
 - Concurrent normal-chat agents across separate conversations
 - Isolated Git worktree execution with conflict-safe, per-file apply/discard
-- Multi-root workspace support for chat cwd, file search, Skills, MCP, and commands
+- Multi-root workspace support for chat cwd, file search, Skills, MCP, and commands (footer can pick and pin a folder per chat)
 - Preview-and-accept inline code generation instead of immediate edits
 - AI Quick Fix actions for editor diagnostics
 - Automatic validation with optional bounded self-repair
@@ -39,7 +59,7 @@ Run [Cursor](https://cursor.com) agents from the VS Code sidebar with your Curso
 
 ### Parallel chat agents
 
-Each conversation owns an independent Cursor agent and run. Start a task, click the prominent **Start parallel agent** button in the parallel-agent bar, and send another task to run both at the same time. The button is disabled with a limit indicator when every parallel slot is occupied. The bar lists running and queued conversations, switches to any task with one click, and stops only the selected agent. Completed, failed, and stopped parallel tasks remain as review-pending chips until you open that conversation and then leave it. Returning to history also shows **Running** or **Queued** badges and restores live output. Messages inside one conversation still run in order. Configure `cursorSubscription.maxParallelChatAgents` (default: 3, maximum: 8) to set the limit. Concurrent calls may consume Cursor plan quota simultaneously. Give editing agents separate files or scopes when possible because two agents writing the same file can conflict.
+Each conversation owns an independent Cursor agent and run. Start a task, click the prominent **Start parallel agent** button in the parallel-agent bar, and send another task to run both at the same time. The button is disabled with a limit indicator when every parallel slot is occupied. The bar lists running and queued conversations, switches to any task with one click, and stops only the selected agent. Completed, failed, and stopped parallel tasks remain as review-pending chips until you open that conversation and then leave it. Returning to history also shows **Running** or **Queued** badges and restores live output. Messages inside one conversation still run in order. Configure `cursorSubscription.maxParallelChatAgents` (default: 3, maximum: 8) to set the limit. Concurrent calls may consume Cursor plan quota simultaneously. Parallel edits to the same file use a three-way merge when their changed hunks do not overlap. For overlapping text edits, a confirmation dialog can send the conflict back to AI to infer both sides' intent and resolve it; the result is applied only after marker and concurrent-change safety checks.
 
 ### AI Supervisor
 
@@ -62,6 +82,12 @@ Additional commands:
 - Experimental inline completions can be enabled with `cursorSubscription.enableInlineCompletions`.
 
 Open **Cursor: Open AI Feature Settings** or use the gear button in the chat header to enable or disable these features. `cursorSubscription.enableAiNativeFeatures` is the master switch; core chat remains available when it is off. Each AI-native feature can also be controlled individually.
+
+## Windows safety
+
+Cursor's local SDK sandbox is unavailable on Windows. The extension therefore defaults Windows to **Safe worktree** mode: Auto-review remains enabled, normal agent edits run in a detached Git worktree, and completed changes are applied only with conflict checks. A first-run modal and a non-dismissible chat banner disclose the limitation. Safe worktree mode reduces accidental workspace edits, but it is not an OS security boundary: tools can still access the host filesystem and network. **Auto-review** (direct workspace) and **Full access** require an explicit warning confirmation when selected.
+
+Safe worktree mode requires the workspace to be a Git repository. Plan mode is read-only and does not create a worktree.
 
 ## Requirements
 
@@ -97,6 +123,8 @@ The API key is stored in VS Code SecretStorage (not in settings or the workspace
 
 Anysphere / Cursor 非提携の**非公式**拡張機能です。公式 TypeScript SDK（公開ベータ）を使い、VS Code のサイドバーから Cursor Agent を実行します。
 
+上の画面例では、並列 Agent の実行、Supervisor の分離実行から差分適用まで、未コミットの作業を保護したチェックポイント復元を確認できます。
+
 ### できること
 
 - ワークスペース対象のローカル Cursor Agent
@@ -104,6 +132,7 @@ Anysphere / Cursor 非提携の**非公式**拡張機能です。公式 TypeScri
 - モデル選択（検索、Thinking / Context / Effort、既定は Auto）
 - 実行プロファイル: Agent / Plan / Multitask
 - 画像コンテキスト、Skills、`.cursor/mcp.json` の MCP
+- 実行権限モード（Windows安全worktree / 自動レビュー / フルアクセス）
 - `@` ファイル参照、D&D / 貼り付け、選択範囲の添付
 - 会話履歴の復元、コミットメッセージ生成
 - ファイルごとの変更確認、検証、レビューを通して実行する Autopilot 変更セッション
@@ -123,7 +152,7 @@ Anysphere / Cursor 非提携の**非公式**拡張機能です。公式 TypeScri
 
 ### AIネイティブ機能
 
-通常チャットは会話ごとに独立したCursor AgentとRunを持ちます。処理中に **並列Agent** バーの目立つ **並列Agentを起動** ボタンを押して別の指示を送ると、両方を同時実行できます。上限到達時はボタンが無効になり、現在数と上限を確認できます。バーには実行中・待機中の会話が常時表示され、クリックで即座に切り替え、×ボタンでそのAgentだけを停止できます。並列タスクが完了・失敗・停止した場合は「確認待ち」として残り、その会話を一度開いて別の会話または画面へ移動した時点で消えます。履歴にも **実行中** または **待機中** と表示され、会話へ戻ると途中の出力も復元されます。同一会話内のメッセージは従来どおり順番に処理します。同時数は `cursorSubscription.maxParallelChatAgents`（初期値3、最大8）で設定できます。同時呼び出しはCursorの利用枠を並行して消費する場合があります。同じファイルを複数Agentが編集すると競合し得るため、編集対象は分けてください。
+通常チャットは会話ごとに独立したCursor AgentとRunを持ちます。処理中に **並列Agent** バーの目立つ **並列Agentを起動** ボタンを押して別の指示を送ると、両方を同時実行できます。上限到達時はボタンが無効になり、現在数と上限を確認できます。バーには実行中・待機中の会話が常時表示され、クリックで即座に切り替え、×ボタンでそのAgentだけを停止できます。並列タスクが完了・失敗・停止した場合は「確認待ち」として残り、その会話を一度開いて別の会話または画面へ移動した時点で消えます。履歴にも **実行中** または **待機中** と表示され、会話へ戻ると途中の出力も復元されます。同一会話内のメッセージは従来どおり順番に処理します。同時数は `cursorSubscription.maxParallelChatAgents`（初期値3、最大8）で設定できます。同時呼び出しはCursorの利用枠を並行して消費する場合があります。同じファイルへの並行編集も、変更箇所が重ならなければ3-wayマージで自動統合します。テキスト変更が重なった場合は確認ダイアログからAIへ戻し、双方の意図を推測して解決できます。競合マーカーの除去と解決中の再変更を確認できたファイルだけを適用します。
 
 **AI Supervisor受信箱**は、保存時のエラーと手動で追加した目標をタスクとして管理します。**監視**モードでは問題検出と受信箱への追加だけを行うため、検出自体はCursorの利用枠を消費しません。**自律実行**モードでは、待機時間、1時間あたりのAI実行数、実行時間、変更ファイル数、変更行数の上限内でタスクを自動実行します。
 
@@ -136,6 +165,12 @@ Anysphere / Cursor 非提携の**非公式**拡張機能です。公式 TypeScri
 セッション開始時にワークスペース専用のチェックポイントを保存するため、開始前から未コミットだったファイルも保護したまま、個別のAI編集またはセッション全体を復元できます。変更確定後、検証コマンドを npm の `validate`、`compile`、`lint`、`test` から自動検出します。`cursorSubscription.verificationCommands` で上書きできます。検証失敗時の自動修正は追加の利用枠を消費する場合があるため、初期状態では無効です。
 
 チャット上部の歯車ボタン、または **Cursor: AI機能の設定を開く** から機能別にオン・オフできます。マスタースイッチを無効にしても基本チャットは引き続き利用できます。
+
+### Windowsでの安全性
+
+WindowsではCursorローカルSDKのサンドボックスを利用できません。そのため、この拡張機能はWindowsで**安全worktree**を既定にします。自動レビューを維持したまま通常のAgent編集を分離Git worktreeで実行し、完了した変更は競合確認後に適用します。初回警告への確認が必要で、チャットにはOS隔離がないことを示す閉じられない警告を常時表示します。
+
+安全worktreeはワークスペースへの意図しない編集を抑えますが、OSのセキュリティ境界ではありません。ツールはホストのファイルシステムとネットワークへアクセスできます。ワークスペース直接実行の**自動レビュー**または**フルアクセス**へ切り替える際は、明示確認が必要です。安全worktreeにはGitリポジトリが必要です。読み取り専用のPlanモードではworktreeを作成しません。
 
 ### 必要なもの
 

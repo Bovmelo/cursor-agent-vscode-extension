@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Persist each chat's workspace folder in multi-root workspaces, and let the footer label pick a different root
+- Automatically three-way merge non-overlapping parallel-agent edits, with confirmed AI-assisted resolution for overlapping text conflicts
+- Default Windows to Safe worktree mode, require a first-run sandbox warning acknowledgement, and keep the no-OS-isolation warning visible
+
 ## 0.1.13
 
 - Show token usage on the chat home view (today, last 7 days, chat vs Supervisor, conversation totals)

@@ -20,6 +20,32 @@ export function resolveWorkspaceFolder(
   return vscode.workspace.workspaceFolders?.[0];
 }
 
+/** Resolve a persisted folder URI against the current multi-root workspace. */
+export function workspaceFolderFromUri(
+  uriString: string | undefined,
+): vscode.WorkspaceFolder | undefined {
+  if (!uriString) {
+    return undefined;
+  }
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  try {
+    const target = vscode.Uri.parse(uriString);
+    return folders.find(
+      (folder) =>
+        folder.uri.toString() === target.toString()
+        || folder.uri.fsPath === target.fsPath,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+export function defaultWorkspaceFolder(
+  uri?: vscode.Uri,
+): vscode.WorkspaceFolder | undefined {
+  return resolveWorkspaceFolder(uri) ?? vscode.workspace.workspaceFolders?.[0];
+}
+
 export function configurationFor(
   section: string,
   uri?: vscode.Uri,

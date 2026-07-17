@@ -4,6 +4,12 @@ import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import * as vscode from "vscode";
+import {
+  baselineKey,
+  fileIdentity,
+  isPathInside,
+  worktreeMatchesProposed,
+} from "./safety.js";
 
 const execAsync = promisify(execCallback);
 const execFileAsync = promisify(execFileCallback);
@@ -89,18 +95,7 @@ function compactOutput(value: string): string {
 }
 
 function isInside(root: string, candidate: string): boolean {
-  const relative = path.relative(path.resolve(root), path.resolve(candidate));
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
-function baselineKey(relative: string): string {
-  const normalized = relative.replaceAll("\\", "/");
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-}
-
-function fileIdentity(file: string): string {
-  const absolute = path.resolve(file);
-  return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+  return isPathInside(root, candidate);
 }
 
 async function gitStatusIsClean(root: string): Promise<boolean> {
@@ -320,8 +315,8 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     }
     const restrict = restrictToCandidateHints && candidateHints.length > 0;
     const postRunChanges = restrict ? [] : await listWorkspaceChanges(session.root);
-    const postRunIdentities = new Set(postRunChanges.map(fileIdentity));
-    const hintIdentities = new Set(candidateHints.map(fileIdentity));
+    const postRunIdentities = new Set(postRunChanges.map((file) => fileIdentity(file)));
+    const hintIdentities = new Set(candidateHints.map((file) => fileIdentity(file)));
     const candidates = new Map<string, string>();
     for (const file of [...postRunChanges, ...candidateHints]) {
       if (isInside(session.root, file)) {
@@ -872,12 +867,20 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
         const current = await readWorktreeState(file);
         const relative = path.relative(session.root, file).replaceAll("\\", "/");
         const indexEntry = await readIndexEntry(session.root, relative);
-        if (
-          current.existed !== proposed.worktreeExisted
-          || current.hash !== proposed.worktreeHash
-          || indexEntry?.mode !== proposed.indexMode
-          || indexEntry?.oid !== proposed.indexOid
-        ) {
+        if (!worktreeMatchesProposed(
+          {
+            existed: current.existed,
+            hash: current.hash,
+            indexMode: indexEntry?.mode,
+            indexOid: indexEntry?.oid,
+          },
+          {
+            existed: proposed.worktreeExisted,
+            hash: proposed.worktreeHash,
+            indexMode: proposed.indexMode,
+            indexOid: proposed.indexOid,
+          },
+        )) {
           throw new Error(this.japanese
             ? `${vscode.workspace.asRelativePath(file)} はAI編集後に変更されたため、自動復元を中止しました。`
             : `${vscode.workspace.asRelativePath(file)} changed after the AI edit, so automatic restore was cancelled.`);

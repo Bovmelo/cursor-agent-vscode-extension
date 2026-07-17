@@ -33,6 +33,9 @@ jobs:
             exit 1
           fi
 
+      - name: Compile, validate webview, and run tests
+        run: npm run validate
+
       - name: Package VSIX
         run: npm run package
 

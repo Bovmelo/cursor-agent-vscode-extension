@@ -1,10 +1,10 @@
 import { readFileSync } from "node:fs";
 
-const source = readFileSync(new URL("../out/extension.js", import.meta.url), "utf8");
+const source = readFileSync(new URL("../out/webviewController.js", import.meta.url), "utf8");
 const marker = "return /* html */ `<!doctype html>";
 const markerIndex = source.indexOf(marker);
 if (markerIndex < 0) {
-  throw new Error("Could not find the webview HTML template in out/extension.js");
+  throw new Error("Could not find the webview HTML template in out/webviewController.js");
 }
 
 const templateStart = markerIndex + "return /* html */ ".length;
@@ -24,6 +24,7 @@ const render = new Function(
   "webview",
   "extensionVersion",
   "MAX_DROPPED_FILE_BYTES",
+  "SUPPORTS_LOCAL_SANDBOX",
   `return ${templateLiteral};`,
 );
 const html = render(
@@ -35,6 +36,7 @@ const html = render(
   { cspSource: "test-csp-source" },
   "0.0.0",
   20 * 1024 * 1024,
+  false,
 );
 const inlineScripts = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)]
   .map((match) => match[1])

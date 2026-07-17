@@ -1,16 +1,24 @@
-import { execFile as execFileCallback } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { homedir } from "node:os";
 import * as path from "node:path";
-import { promisify } from "node:util";
 import * as vscode from "vscode";
 import { runVerification, type VerificationResult } from "./aiNative.js";
+import {
+  applyIsolatedChange,
+  cleanupIsolatedWorktree,
+  collectIsolatedChanges,
+  isInside,
+  normalizedRelative,
+  prepareIsolatedWorktree,
+  readIsolatedBaseline,
+  runGit,
+  safePath,
+  type IsolatedBaselineFile,
+  type IsolatedWorktreeSession,
+} from "./isolatedWorktree.js";
 import { configurationFor, resolveWorkspaceFolder } from "./workspaceFolder.js";
 
-const execFileAsync = promisify(execFileCallback);
 const TASKS_KEY = "cursorSubscription.supervisorTasks";
 const MAX_TASKS = 50;
-const MAX_GIT_OUTPUT = 32 * 1024 * 1024;
 
 export type SupervisorMode = "off" | "observe" | "autonomous";
 export type SupervisorTaskStatus =
@@ -34,11 +42,7 @@ export interface SupervisorChange {
   decision?: "applied" | "discarded";
 }
 
-export interface SupervisorBaselineFile {
-  existed: boolean;
-  hash?: string;
-  backupName?: string;
-}
+export type SupervisorBaselineFile = IsolatedBaselineFile;
 
 export interface SupervisorTask {
   id: string;
@@ -100,63 +104,6 @@ type SupervisorExecutor = (
   prompt: string,
 ) => Promise<SupervisorExecutionResult | undefined>;
 
-function hashBytes(bytes: Uint8Array): string {
-  return createHash("sha256").update(bytes).digest("hex");
-}
-
-function normalizedRelative(value: string): string {
-  return value.replaceAll("\\", "/").replace(/^\.\//, "");
-}
-
-function isInside(root: string, candidate: string): boolean {
-  const relative = path.relative(path.resolve(root), path.resolve(candidate));
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
-function safePath(root: string, relative: string): string {
-  const candidate = path.resolve(root, relative);
-  if (!isInside(root, candidate)) {
-    throw new Error(`Path escapes the AI Supervisor workspace: ${relative}`);
-  }
-  return candidate;
-}
-
-function splitNull(value: string): string[] {
-  return value.split("\0").filter((item) => item.length > 0).map(normalizedRelative);
-}
-
-function lineDiffCounts(
-  baseline: Uint8Array | undefined,
-  proposed: Uint8Array | undefined,
-): { added: number; deleted: number } {
-  const before = baseline ? Buffer.from(baseline) : Buffer.alloc(0);
-  const after = proposed ? Buffer.from(proposed) : Buffer.alloc(0);
-  if (before.includes(0) || after.includes(0)) {
-    return { added: 0, deleted: 0 };
-  }
-  const beforeLines = before.length === 0 ? [] : before.toString("utf8").split(/\r?\n/);
-  const afterLines = after.length === 0 ? [] : after.toString("utf8").split(/\r?\n/);
-  if (beforeLines.length * afterLines.length > 2_000_000) {
-    return { added: afterLines.length, deleted: beforeLines.length };
-  }
-  const previous = new Uint32Array(afterLines.length + 1);
-  const current = new Uint32Array(afterLines.length + 1);
-  for (const beforeLine of beforeLines) {
-    for (let column = 1; column <= afterLines.length; column += 1) {
-      current[column] = beforeLine === afterLines[column - 1]
-        ? previous[column - 1] + 1
-        : Math.max(previous[column], current[column - 1]);
-    }
-    previous.set(current);
-    current.fill(0);
-  }
-  const common = previous[afterLines.length];
-  return {
-    added: afterLines.length - common,
-    deleted: beforeLines.length - common,
-  };
-}
-
 function globRegex(pattern: string): RegExp {
   let source = normalizedRelative(pattern.trim());
   const optionalPrefix = source.startsWith("**/");
@@ -178,49 +125,6 @@ function globRegex(pattern: string): RegExp {
     }
   }
   return new RegExp(`^${optionalPrefix ? "(?:.*/)?" : ""}${result}$`, "i");
-}
-
-async function git(root: string, args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync("git", args, {
-    cwd: root,
-    windowsHide: true,
-    maxBuffer: MAX_GIT_OUTPUT,
-    encoding: "utf8",
-  });
-  return stdout;
-}
-
-async function gitBytes(root: string, args: string[]): Promise<Buffer> {
-  return new Promise<Buffer>((resolve, reject) => {
-    execFileCallback(
-      "git",
-      args,
-      {
-        cwd: root,
-        windowsHide: true,
-        maxBuffer: MAX_GIT_OUTPUT,
-        encoding: "buffer",
-      },
-      (error, stdout) => {
-        if (error) {
-          reject(error);
-        } else {
-          resolve(Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout));
-        }
-      },
-    );
-  });
-}
-
-async function fileState(file: string): Promise<{ exists: boolean; bytes?: Uint8Array }> {
-  try {
-    return {
-      exists: true,
-      bytes: await vscode.workspace.fs.readFile(vscode.Uri.file(file)),
-    };
-  } catch {
-    return { exists: false };
-  }
 }
 
 export class AiSupervisorController
@@ -1155,7 +1059,7 @@ vscode.CodeLensProvider, vscode.Disposable {
       return cached;
     }
     try {
-      const root = path.resolve((await git(candidate, ["rev-parse", "--show-toplevel"])).trim());
+      const root = path.resolve((await runGit(candidate, ["rev-parse", "--show-toplevel"])).trim());
       this.repoRoots.set(key, root);
       return root;
     } catch {
@@ -1243,228 +1147,102 @@ vscode.CodeLensProvider, vscode.Disposable {
     ].filter((line): line is string => typeof line === "string").join("\n");
   }
 
+  private taskSession(task: SupervisorTask): IsolatedWorktreeSession | undefined {
+    if (!task.worktreePath || !task.baselineCommit) {
+      return undefined;
+    }
+    return {
+      id: task.id,
+      root: task.root,
+      worktreePath: task.worktreePath,
+      baselineCommit: task.baselineCommit,
+      baselineFiles: task.baselineFiles ?? {},
+      initialChangedFiles: task.initialChangedFiles ?? [],
+      baselinesFolder: "supervisor-baselines",
+    };
+  }
+
   private async prepareWorktree(task: SupervisorTask): Promise<string> {
     if (task.worktreePath) {
       await this.cleanupWorktree(task);
     }
-    await vscode.workspace.fs.createDirectory(this.storageRoot);
     // Cursor SDK derives its SQLite state path from cwd. A VS Code
     // workspaceStorage path can exceed Windows MAX_PATH after that expansion,
     // so keep the isolated checkout in a deliberately short home-directory path.
-    const worktreesRoot = path.join(homedir(), ".cursor-supervisor", "worktrees");
-    await vscode.workspace.fs.createDirectory(vscode.Uri.file(worktreesRoot));
-    const worktree = path.join(worktreesRoot, task.id);
-    await git(task.root, ["worktree", "add", "--detach", worktree, "HEAD"]);
-    task.worktreePath = worktree;
-    await this.overlayCurrentWorkspace(task.root, worktree);
-    task.baselineCommit = (await git(worktree, ["rev-parse", "HEAD"])).trim();
-    await this.captureBaseline(task);
-    await this.linkNodeModules(task.root, worktree);
+    const session = await prepareIsolatedWorktree({
+      id: task.id,
+      root: task.root,
+      storageRoot: this.storageRoot,
+      worktreesHomeSegment: ".cursor-supervisor/worktrees",
+      baselinesFolder: "supervisor-baselines",
+      isExcluded: (relative) => this.isExcluded(relative),
+      pathEscapeLabel: "AI Supervisor",
+      onLog: (message) => this.output.appendLine(
+        message.replace("Could not link node_modules", "AI Supervisor could not link node_modules"),
+      ),
+    });
+    task.worktreePath = session.worktreePath;
+    task.baselineCommit = session.baselineCommit;
+    task.baselineFiles = session.baselineFiles;
+    task.initialChangedFiles = session.initialChangedFiles;
     await this.persist();
-    return worktree;
-  }
-
-  private async overlayCurrentWorkspace(root: string, worktree: string): Promise<void> {
-    const tracked = splitNull(await git(root, ["ls-files", "-z"]));
-    const untracked = splitNull(await git(root, ["ls-files", "--others", "--exclude-standard", "-z"]));
-    for (const relative of new Set([...tracked, ...untracked])) {
-      if (this.isExcluded(relative)) {
-        continue;
-      }
-      const source = safePath(root, relative);
-      const target = safePath(worktree, relative);
-      const state = await fileState(source);
-      if (!state.exists) {
-        try {
-          await vscode.workspace.fs.delete(vscode.Uri.file(target), { recursive: false });
-        } catch {
-          // The detached worktree may already reflect the deletion.
-        }
-        continue;
-      }
-      await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(target)));
-      await vscode.workspace.fs.copy(
-        vscode.Uri.file(source),
-        vscode.Uri.file(target),
-        { overwrite: true },
-      );
-    }
-  }
-
-  private async captureBaseline(task: SupervisorTask): Promise<void> {
-    if (!task.worktreePath || !task.baselineCommit) {
-      return;
-    }
-    const changed = splitNull(await git(task.worktreePath, [
-      "diff", "--name-only", "--no-renames", "-z", task.baselineCommit,
-    ]));
-    const untracked = splitNull(await git(task.worktreePath, [
-      "ls-files", "--others", "--exclude-standard", "-z",
-    ]));
-    task.initialChangedFiles = [...new Set([...changed, ...untracked])];
-    task.baselineFiles = {};
-    const backupRoot = vscode.Uri.joinPath(
-      this.storageRoot,
-      "supervisor-baselines",
-      task.id,
-    );
-    await vscode.workspace.fs.createDirectory(backupRoot);
-    for (const relative of task.initialChangedFiles) {
-      const current = await fileState(safePath(task.worktreePath, relative));
-      if (!current.exists || !current.bytes) {
-        task.baselineFiles[relative] = { existed: false };
-        continue;
-      }
-      const backupName = createHash("sha256").update(relative).digest("hex");
-      await vscode.workspace.fs.writeFile(
-        vscode.Uri.joinPath(backupRoot, backupName),
-        current.bytes,
-      );
-      task.baselineFiles[relative] = {
-        existed: true,
-        hash: hashBytes(current.bytes),
-        backupName,
-      };
-    }
-  }
-
-  private async linkNodeModules(root: string, worktree: string): Promise<void> {
-    const source = path.join(root, "node_modules");
-    const target = path.join(worktree, "node_modules");
-    try {
-      const stat = await vscode.workspace.fs.stat(vscode.Uri.file(source));
-      if ((stat.type & vscode.FileType.Directory) === 0) {
-        return;
-      }
-    } catch {
-      return;
-    }
-    try {
-      const { symlink } = await import("node:fs/promises");
-      await symlink(source, target, process.platform === "win32" ? "junction" : "dir");
-    } catch (error) {
-      this.output.appendLine(
-        `[${new Date().toISOString()}] AI Supervisor could not link node_modules: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
+    return session.worktreePath;
   }
 
   private async collectChanges(task: SupervisorTask): Promise<SupervisorChange[]> {
-    if (!task.worktreePath || !task.baselineCommit) {
+    const session = this.taskSession(task);
+    if (!session) {
       return [];
     }
-    const changed = splitNull(await git(task.worktreePath, [
-      "diff", "--name-only", "--no-renames", "-z", task.baselineCommit,
-    ]));
-    const untracked = splitNull(await git(task.worktreePath, [
-      "ls-files", "--others", "--exclude-standard", "-z",
-    ]));
-    const paths = [...new Set([
-      ...(task.initialChangedFiles ?? []),
-      ...changed,
-      ...untracked,
-    ])];
-
-    const result: SupervisorChange[] = [];
-    for (const relative of paths) {
-      const baseline = await this.readBaseline(task, relative);
-      const current = await fileState(safePath(task.worktreePath, relative));
-      const unchanged = baseline.exists === current.exists
-        && (!baseline.exists
-          || Boolean(
-            baseline.bytes
-            && current.bytes
-            && hashBytes(baseline.bytes) === hashBytes(current.bytes),
-          ));
-      if (unchanged) {
-        continue;
-      }
-      const kind = !baseline.exists ? "added" : !current.exists ? "deleted" : "modified";
-      const stats = lineDiffCounts(baseline.bytes, current.bytes);
-      result.push({
-        relative,
-        kind,
-        ...stats,
-        excluded: this.isExcluded(relative),
-      });
-    }
-    return result.sort((left, right) => left.relative.localeCompare(right.relative));
+    return collectIsolatedChanges(session, this.storageRoot, {
+      isExcluded: (relative) => this.isExcluded(relative),
+      pathEscapeLabel: "AI Supervisor",
+      missingBaselineMessage: (relative) => this.text(
+        `The Supervisor baseline for ${relative} is unavailable.`,
+        `${relative} のSupervisorベースラインを利用できません。`,
+      ),
+    });
   }
 
   private async readBaseline(
     task: SupervisorTask,
     relative: string,
   ): Promise<{ exists: boolean; bytes?: Uint8Array }> {
-    const snapshot = task.baselineFiles?.[relative];
-    if (snapshot) {
-      if (!snapshot.existed || !snapshot.backupName) {
-        return { exists: false };
-      }
-      try {
-        const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(
-          this.storageRoot,
-          "supervisor-baselines",
-          task.id,
-          snapshot.backupName,
-        ));
-        return { exists: true, bytes };
-      } catch {
-        throw new Error(this.text(
-          `The Supervisor baseline for ${relative} is unavailable.`,
-          `${relative} のSupervisorベースラインを利用できません。`,
-        ));
-      }
-    }
-    if (!task.worktreePath || !task.baselineCommit) {
+    const session = this.taskSession(task);
+    if (!session) {
       return { exists: false };
     }
-    try {
-      return {
-        exists: true,
-        bytes: await gitBytes(task.worktreePath, [
-          "show", `${task.baselineCommit}:${relative}`,
-        ]),
-      };
-    } catch {
-      return { exists: false };
-    }
+    return readIsolatedBaseline(
+      session,
+      this.storageRoot,
+      relative,
+      (pathRelative) => this.text(
+        `The Supervisor baseline for ${pathRelative} is unavailable.`,
+        `${pathRelative} のSupervisorベースラインを利用できません。`,
+      ),
+    );
   }
 
   private async applyOne(task: SupervisorTask, change: SupervisorChange): Promise<void> {
-    if (!task.worktreePath || !task.baselineCommit) {
+    const session = this.taskSession(task);
+    if (!session) {
       throw new Error(this.text("The isolated worktree is unavailable.", "隔離worktreeを利用できません。"));
     }
-    const baseline = await this.readBaseline(task, change.relative);
-
-    const mainFile = safePath(task.root, change.relative);
-    const currentMain = await fileState(mainFile);
-    const unchanged = baseline.exists
-      ? currentMain.exists
-        && currentMain.bytes
-        && baseline.bytes
-        && hashBytes(currentMain.bytes) === hashBytes(baseline.bytes)
-      : !currentMain.exists;
-    if (!unchanged) {
-      throw new Error(this.text(
+    await applyIsolatedChange(session, this.storageRoot, change, {
+      pathEscapeLabel: "AI Supervisor",
+      unavailableMessage: this.text(
+        "The isolated worktree is unavailable.",
+        "隔離worktreeを利用できません。",
+      ),
+      conflictMessage: this.text(
         "The file changed after the Supervisor task started. Review and merge it manually.",
         "Supervisor開始後にファイルが変更されています。手動で確認してマージしてください。",
-      ));
-    }
-
-    const proposed = safePath(task.worktreePath, change.relative);
-    const proposedState = await fileState(proposed);
-    if (proposedState.exists) {
-      await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(mainFile)));
-      await vscode.workspace.fs.copy(
-        vscode.Uri.file(proposed),
-        vscode.Uri.file(mainFile),
-        { overwrite: true },
-      );
-    } else if (currentMain.exists) {
-      await vscode.workspace.fs.delete(vscode.Uri.file(mainFile), { recursive: false });
-    }
+      ),
+      missingBaselineMessage: (relative) => this.text(
+        `The Supervisor baseline for ${relative} is unavailable.`,
+        `${relative} のSupervisorベースラインを利用できません。`,
+      ),
+    });
   }
 
   private async finishDecisions(task: SupervisorTask): Promise<void> {
@@ -1507,38 +1285,17 @@ vscode.CodeLensProvider, vscode.Disposable {
   }
 
   private async cleanupWorktree(task: SupervisorTask): Promise<void> {
-    const worktree = task.worktreePath;
-    if (!worktree) {
-      return;
-    }
-    try {
-      try {
-        const { unlink } = await import("node:fs/promises");
-        await unlink(path.join(worktree, "node_modules"));
-      } catch {
-        // node_modules may not have been linked.
-      }
-      await git(task.root, ["worktree", "remove", "--force", worktree]);
-      await git(task.root, ["worktree", "prune"]);
-      task.worktreePath = undefined;
-      task.baselineCommit = undefined;
-      task.baselineFiles = undefined;
-      task.initialChangedFiles = undefined;
-      try {
-        await vscode.workspace.fs.delete(vscode.Uri.joinPath(
-          this.storageRoot,
-          "supervisor-baselines",
-          task.id,
-        ), { recursive: true });
-      } catch {
-        // The baseline directory may already have been cleaned up.
-      }
-    } catch (error) {
-      this.output.appendLine(
-        `[${new Date().toISOString()}] AI Supervisor could not remove worktree ${worktree}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    }
+    const session = this.taskSession(task);
+    await cleanupIsolatedWorktree(
+      session,
+      this.storageRoot,
+      (message) => this.output.appendLine(
+        message.replace("Could not remove worktree", "AI Supervisor could not remove worktree"),
+      ),
+    );
+    task.worktreePath = undefined;
+    task.baselineCommit = undefined;
+    task.baselineFiles = undefined;
+    task.initialChangedFiles = undefined;
   }
 }
