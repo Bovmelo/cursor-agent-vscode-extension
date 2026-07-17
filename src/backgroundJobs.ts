@@ -1,10 +1,17 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import type { ModelParameterValue, ModelSelection } from "@cursor/sdk";
 import * as vscode from "vscode";
 import type { BackgroundJob, BackgroundWorkerInput } from "./backgroundJobTypes.js";
+import {
+  backgroundWorkerProtocolPaths,
+  isAuthenticatedWorkerHeartbeat,
+  WORKER_STARTUP_GRACE_MS,
+  type BackgroundWorkerCancellation,
+  type BackgroundWorkerHeartbeat,
+} from "./backgroundWorkerProtocol.js";
 import {
   cleanupIsolatedWorktree,
   collectIsolatedChanges,
@@ -149,6 +156,8 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
     });
     const jobFile = path.join(this.jobsRoot, `${id}.json`);
     const now = Date.now();
+    const maxMinutes = vscode.workspace.getConfiguration("cursorSubscription", workspace.uri)
+      .get<number>("backgroundMaxRunMinutes", 240);
     const job: BackgroundJob = {
       id,
       title: prompt.trim().split(/\r?\n/u)[0].slice(0, 80),
@@ -160,6 +169,8 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
       status: "starting",
       createdAt: now,
       updatedAt: now,
+      workerToken: randomUUID(),
+      maxMinutes,
     };
     this.jobs.set(id, job);
     await this.save(job);
@@ -168,8 +179,7 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
         apiKey,
         model: this.selectedModel(),
         approvalMode: this.context.globalState.get<string>(APPROVAL_MODE_KEY, "auto-review"),
-        maxMinutes: vscode.workspace.getConfiguration("cursorSubscription", workspace.uri)
-          .get<number>("backgroundMaxRunMinutes", 240),
+        maxMinutes,
       });
       this.changed.fire(undefined);
       void vscode.window.showInformationMessage(this.text(
@@ -209,6 +219,7 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
       await this.applyJob(job, applyable);
       job.status = "applied";
       await cleanupIsolatedWorktree(job.session, this.storageRoot, (message) => this.output.appendLine(message));
+      await this.cleanupWorkerProtocol(job);
       await this.save(job);
     } catch (error) {
       job.status = "completed";
@@ -224,12 +235,15 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
     if (!job || !["starting", "running"].includes(job.status)) {
       return;
     }
-    if (job.pid) {
-      try {
-        process.kill(job.pid, "SIGTERM");
-      } catch {
-        // It may have finished between polling and cancellation.
-      }
+    if (job.workerToken) {
+      const cancellation: BackgroundWorkerCancellation = {
+        token: job.workerToken,
+        requestedAt: Date.now(),
+      };
+      const target = backgroundWorkerProtocolPaths(job.jobFile).cancellation;
+      const temporary = `${target}.host.tmp`;
+      await writeFile(temporary, JSON.stringify(cancellation), "utf8");
+      await rename(temporary, target);
     }
     job.status = "cancelled";
     await this.save(job);
@@ -243,6 +257,7 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
       return;
     }
     await cleanupIsolatedWorktree(job.session, this.storageRoot, (message) => this.output.appendLine(message));
+    await this.cleanupWorkerProtocol(job);
     job.status = "discarded";
     await this.save(job);
     await this.auditJob(job, "background.discard");
@@ -303,9 +318,13 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
     for (const [id, known] of this.jobs) {
       try {
         const current = JSON.parse(await readFile(known.jobFile, "utf8")) as BackgroundJob;
-        if (current.status === "running" && current.pid && !this.processIsAlive(current.pid)) {
+        if (
+          ["starting", "running"].includes(current.status)
+          && Date.now() - current.createdAt > WORKER_STARTUP_GRACE_MS
+          && !(await this.hasAuthenticatedHeartbeat(current))
+        ) {
           current.status = "error";
-          current.error = "The detached background worker exited before reporting a result.";
+          current.error = "The detached background worker stopped responding before reporting a result.";
           await this.save(current);
         }
         if (current.updatedAt !== known.updatedAt || current.status !== known.status) {
@@ -331,7 +350,7 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
 
   private launch(job: BackgroundJob, input: BackgroundWorkerInput): void {
     const worker = path.join(this.context.extensionUri.fsPath, "out", "backgroundWorker.js");
-    const child = spawn(process.execPath, [worker, job.jobFile], {
+    const child = spawn(process.execPath, [worker, job.jobFile, job.workerToken ?? ""], {
       detached: true,
       windowsHide: true,
       stdio: ["pipe", "ignore", "ignore"],
@@ -348,13 +367,22 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
     child.unref();
   }
 
-  private processIsAlive(pid: number): boolean {
+  private async hasAuthenticatedHeartbeat(job: BackgroundJob): Promise<boolean> {
     try {
-      process.kill(pid, 0);
-      return true;
+      const raw = await readFile(backgroundWorkerProtocolPaths(job.jobFile).heartbeat, "utf8");
+      const heartbeat = JSON.parse(raw) as BackgroundWorkerHeartbeat;
+      return isAuthenticatedWorkerHeartbeat(job.workerToken, job.pid, heartbeat);
     } catch {
       return false;
     }
+  }
+
+  private async cleanupWorkerProtocol(job: BackgroundJob): Promise<void> {
+    const files = backgroundWorkerProtocolPaths(job.jobFile);
+    await Promise.all([
+      unlink(files.heartbeat).catch(() => undefined),
+      unlink(files.cancellation).catch(() => undefined),
+    ]);
   }
 
   private async save(job: BackgroundJob): Promise<void> {

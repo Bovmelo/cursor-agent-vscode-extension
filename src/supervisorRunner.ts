@@ -24,7 +24,11 @@ interface ActiveSupervisorRun {
   agent?: CursorAgent;
   run?: CursorRun;
   cancelRequested: boolean;
+  interrupt?: (error: Error) => void;
 }
+
+class SupervisorCancelledError extends Error {}
+class SupervisorDeadlineError extends Error {}
 
 export class SupervisorAgentRunner implements vscode.Disposable {
   private readonly activeRuns = new Map<string, ActiveSupervisorRun>();
@@ -57,8 +61,9 @@ export class SupervisorAgentRunner implements vscode.Disposable {
       }
       active.cancelRequested = true;
       if (active.run?.supports("cancel")) {
-        await active.run.cancel();
+        void active.run.cancel().catch(() => {});
       }
+      active.interrupt?.(new SupervisorCancelledError("The Supervisor run was cancelled."));
     }));
   }
 
@@ -125,28 +130,43 @@ export class SupervisorAgentRunner implements vscode.Disposable {
     let executionTimedOut = false;
     let executionTimer: ReturnType<typeof setTimeout> | undefined;
     let assistantText = "";
+    let rejectInterrupt: ((error: Error) => void) | undefined;
+    const interrupt = new Promise<never>((_, reject) => {
+      rejectInterrupt = reject;
+    });
+    active.interrupt = (error) => rejectInterrupt?.(error);
+    const maximumMinutes = vscode.workspace
+      .getConfiguration("cursorSubscription")
+      .get<number>("supervisorMaxRunMinutes", 15);
+    executionTimer = setTimeout(() => {
+      executionTimedOut = true;
+      active.cancelRequested = true;
+      this.output.appendLine(
+        `[${new Date().toISOString()}] Cancelling Supervisor task ${task.id} after its time budget expired.`,
+      );
+      if (active.run?.supports("cancel")) {
+        void active.run.cancel().catch(() => {});
+      }
+      active.interrupt?.(new SupervisorDeadlineError("Supervisor execution deadline expired."));
+    }, Math.max(1, maximumMinutes) * 60 * 1000);
+    const withinBudget = <T>(operation: PromiseLike<T>): Promise<T> =>
+      Promise.race([Promise.resolve(operation), interrupt]);
     try {
-      active.agent = await this.createAgent(apiKey, worktreePath, task.title);
-      const run = await active.agent.send(prompt, {
+      const agentPromise = this.createAgent(apiKey, worktreePath, task.title);
+      void agentPromise.then((agent) => {
+        if (active.cancelRequested && active.agent !== agent) {
+          void this.disposeAgentBounded(agent);
+        }
+      }).catch(() => {});
+      active.agent = await withinBudget(agentPromise);
+      const run = await withinBudget(active.agent.send(prompt, {
         model: this.selectedModelSelection(),
         mode: "agent",
-      });
+      }));
       active.run = run;
       if (active.cancelRequested && run.supports("cancel")) {
-        await run.cancel();
+        void run.cancel().catch(() => {});
       }
-      const maximumMinutes = vscode.workspace
-        .getConfiguration("cursorSubscription")
-        .get<number>("supervisorMaxRunMinutes", 15);
-      executionTimer = setTimeout(() => {
-        executionTimedOut = true;
-        this.output.appendLine(
-          `[${new Date().toISOString()}] Cancelling Supervisor run ${run.id} after its time budget expired.`,
-        );
-        if (run.supports("cancel")) {
-          void run.cancel();
-        }
-      }, Math.max(1, maximumMinutes) * 60 * 1000);
 
       const eventStream = run.stream();
       const resultPromise = run.wait();
@@ -162,6 +182,7 @@ export class SupervisorAgentRunner implements vscode.Disposable {
             (error: unknown) => ({ type: "streamError" as const, error }),
           ),
           terminalSignal,
+          interrupt,
         ]);
         if (outcome.type === "result") {
           result = outcome.result;
@@ -190,7 +211,7 @@ export class SupervisorAgentRunner implements vscode.Disposable {
           }
         }
       }
-      result ??= await resultPromise;
+      result ??= await withinBudget(resultPromise);
       if (executionTimedOut) {
         return {
           status: "error",
@@ -219,6 +240,18 @@ export class SupervisorAgentRunner implements vscode.Disposable {
           || this.text("The Supervisor run failed.", "Supervisor実行に失敗しました。"),
       };
     } catch (error) {
+      if (executionTimedOut || error instanceof SupervisorDeadlineError) {
+        return {
+          status: "error",
+          error: this.text(
+            "AI Supervisor stopped after reaching its execution-time budget.",
+            "AI Supervisorは実行時間の上限に達したため停止しました。",
+          ),
+        };
+      }
+      if (error instanceof SupervisorCancelledError || active.cancelRequested) {
+        return { status: "cancelled" };
+      }
       const message = error instanceof Error ? error.message : String(error);
       this.output.appendLine(
         `[${new Date().toISOString()}] AI Supervisor runner error: ${message}`,
@@ -228,8 +261,9 @@ export class SupervisorAgentRunner implements vscode.Disposable {
       if (executionTimer) {
         clearTimeout(executionTimer);
       }
+      active.interrupt = undefined;
       active.run = undefined;
-      await this.disposeAgent(active.agent);
+      await this.disposeAgentBounded(active.agent);
       active.agent = undefined;
       this.activeRuns.delete(task.id);
     }
@@ -355,6 +389,22 @@ export class SupervisorAgentRunner implements vscode.Disposable {
   private async disposeAgent(agent: CursorAgent | undefined): Promise<void> {
     if (agent) {
       await agent[Symbol.asyncDispose]();
+    }
+  }
+
+  private async disposeAgentBounded(agent: CursorAgent | undefined): Promise<void> {
+    if (!agent) {
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      this.disposeAgent(agent).catch(() => {}),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 5_000);
+      }),
+    ]);
+    if (timer) {
+      clearTimeout(timer);
     }
   }
 

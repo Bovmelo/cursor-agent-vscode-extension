@@ -1,7 +1,8 @@
 import { execFile as execFileCallback } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
 import * as vscode from "vscode";
-import { slugifyBranchTitle } from "./pureUtils.js";
+import { branchStartsAtBase, slugifyBranchTitle } from "./pureUtils.js";
 import { minimalShellEnv } from "./shellEnv.js";
 
 const execFileAsync = promisify(execFileCallback);
@@ -34,37 +35,98 @@ export async function createBranchCommitAndPullRequest(options: {
   const baseBranch = options.baseBranch?.trim()
     || vscode.workspace.getConfiguration("cursorSubscription").get<string>("defaultBaseBranch", "main")
     || "main";
-  const stamp = new Date().toISOString().slice(0, 10).replaceAll("-", "");
-  const branch = `cursor/${stamp}-${slugifyBranchTitle(title)}`;
-
-  await run(root, "git", ["checkout", "-b", branch]);
-  if (options.files && options.files.length > 0) {
-    await run(root, "git", ["add", "--", ...options.files]);
-  } else {
-    await run(root, "git", ["add", "-A"]);
+  if (baseBranch.startsWith("-")) {
+    throw new Error("The pull-request base branch is invalid.");
   }
-  const status = await run(root, "git", ["status", "--porcelain"]);
-  if (!status.stdout.trim()) {
+  const stamp = new Date().toISOString().slice(0, 10).replaceAll("-", "");
+  const branch = `cursor/${stamp}-${slugifyBranchTitle(title)}-${randomUUID().slice(0, 6)}`;
+
+  const originalBranch = (await run(root, "git", ["rev-parse", "--abbrev-ref", "HEAD"]))
+    .stdout.trim();
+  if (!originalBranch || originalBranch === "HEAD") {
     throw new Error(
       japanese
-        ? "コミットする変更がありません。"
-        : "There are no changes to commit.",
+        ? "PRを作成する前に、名前付きのGitブランチへ切り替えてください。"
+        : "Switch to a named Git branch before creating a pull request.",
     );
   }
-  await run(root, "git", ["commit", "-m", title.slice(0, 72)]);
-  await run(root, "git", ["push", "-u", "origin", "HEAD"]);
+  const originalHead = (await run(root, "git", ["rev-parse", "HEAD"])).stdout.trim();
+  const baseHead = (await run(root, "git", [
+    "rev-parse",
+    "--verify",
+    "--end-of-options",
+    `${baseBranch}^{commit}`,
+  ])).stdout.trim();
+  if (!branchStartsAtBase(originalHead, baseHead)) {
+    throw new Error(
+      japanese
+        ? `現在のHEADは基点ブランチ ${baseBranch} と一致しません。基点ブランチへ切り替えて更新してから再実行してください。`
+        : `The current HEAD does not match base branch ${baseBranch}. Switch to and update the base branch, then try again.`,
+    );
+  }
 
-  const prArgs = [
-    "pr",
-    "create",
-    "--title",
-    title.slice(0, 120),
-    "--body",
-    options.body?.trim() || title,
-    "--base",
-    baseBranch,
-  ];
-  const pr = await run(root, "gh", prArgs);
-  const url = pr.stdout.trim().split(/\r?\n/).find((line) => /^https?:\/\//.test(line));
-  return { branch, url };
+  const statusArgs = ["status", "--porcelain", "--untracked-files=all"];
+  if (options.files?.length) {
+    statusArgs.push("--", ...options.files);
+  }
+  const pending = await run(root, "git", statusArgs);
+  if (!pending.stdout.trim()) {
+    throw new Error(
+      japanese ? "コミットする変更がありません。" : "There are no changes to commit.",
+    );
+  }
+  if (options.files?.length) {
+    const alreadyStaged = await run(root, "git", ["diff", "--cached", "--name-only"]);
+    if (alreadyStaged.stdout.trim()) {
+      throw new Error(
+        japanese
+          ? "対象外の変更を誤って含めないよう、既にステージ済みの変更を解除してから再実行してください。"
+          : "Unstage existing changes before creating the pull request so unrelated files cannot be included.",
+      );
+    }
+  }
+  const originalIndexTree = (await run(root, "git", ["write-tree"])).stdout.trim();
+  let commitCreated = false;
+
+  try {
+    await run(root, "git", ["checkout", "-b", branch, baseBranch]);
+    if (options.files && options.files.length > 0) {
+      await run(root, "git", ["add", "--", ...options.files]);
+    } else {
+      await run(root, "git", ["add", "-A"]);
+    }
+    const staged = await run(root, "git", ["diff", "--cached", "--name-only"]);
+    if (!staged.stdout.trim()) {
+      throw new Error(
+        japanese ? "コミットする変更がありません。" : "There are no changes to commit.",
+      );
+    }
+    await run(root, "git", ["commit", "-m", title.slice(0, 72)]);
+    commitCreated = true;
+    await run(root, "git", ["push", "-u", "origin", "HEAD"]);
+
+    const pr = await run(root, "gh", [
+      "pr",
+      "create",
+      "--title",
+      title.slice(0, 120),
+      "--body",
+      options.body?.trim() || title,
+      "--base",
+      baseBranch,
+      "--head",
+      branch,
+    ]);
+    const url = pr.stdout.trim().split(/\r?\n/).find((line) => /^https?:\/\//.test(line));
+    return { branch, url };
+  } catch (error) {
+    const currentHead = await run(root, "git", ["rev-parse", "HEAD"])
+      .then((result) => result.stdout.trim(), () => "");
+    if (!commitCreated && currentHead === originalHead) {
+      await run(root, "git", ["read-tree", originalIndexTree]).catch(() => undefined);
+      await run(root, "git", ["checkout", originalBranch]).catch(() => undefined);
+      await run(root, "git", ["branch", "-D", branch]).catch(() => undefined);
+    }
+    throw error;
+  }
 }

@@ -160,6 +160,7 @@ import {
   shouldMigrateToSafeWorktree,
   shouldUseIsolatedWorktree,
   shouldCancelOnInterrupt,
+  safeResolvePathResolved,
   takeNextQueuedMessage,
   type SafetyApprovalMode,
 } from "./safety.js";
@@ -1161,6 +1162,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }),
       fileWatcher,
       fileWatcher.onDidCreate(invalidateWorkspaceFiles),
+      fileWatcher.onDidChange(invalidateWorkspaceFiles),
       fileWatcher.onDidDelete(invalidateWorkspaceFiles),
     );
   }
@@ -1327,11 +1329,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (!configuredPath || path.isAbsolute(configuredPath)) {
       throw new Error("cursorSubscription.auditSharedLogPath must be workspace-relative.");
     }
-    const target = path.resolve(workspace.uri.fsPath, configuredPath);
-    const relative = path.relative(workspace.uri.fsPath, target);
-    if (relative.startsWith("..") || path.isAbsolute(relative)) {
-      throw new Error("The shared audit log path escapes the workspace.");
-    }
+    const target = await safeResolvePathResolved(workspace.uri.fsPath, configuredPath);
     await mkdir(path.dirname(target), { recursive: true });
     await appendFile(target, `${JSON.stringify(entry)}\n`, "utf8");
   }
@@ -6173,7 +6171,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       void Promise.all([
         this.publishWorkspaceFileIndex(generation),
         this.publishIntegrationIndex(generation),
-      ]);
+      ]).catch((error) => {
+        this.output.appendLine(
+          `[${new Date().toISOString()}] Could not refresh the workspace index: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
       this.postWorkspaceLabel();
     }, WORKSPACE_INDEX_DEBOUNCE_MS);
   }
@@ -7206,7 +7210,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (!workspace) {
       return;
     }
-    const uri = vscode.Uri.joinPath(workspace.uri, ".cursor", "skills");
+    const uri = vscode.Uri.file(
+      await safeResolvePathResolved(workspace.uri.fsPath, ".cursor/skills"),
+    );
     await vscode.workspace.fs.createDirectory(uri);
     await vscode.commands.executeCommand("revealInExplorer", uri);
   }
@@ -7219,8 +7225,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (!workspace) {
       return;
     }
-    const directory = vscode.Uri.joinPath(workspace.uri, ".cursor");
-    const uri = vscode.Uri.joinPath(directory, "mcp.json");
+    const directory = vscode.Uri.file(
+      await safeResolvePathResolved(workspace.uri.fsPath, ".cursor"),
+    );
+    const uri = vscode.Uri.file(
+      await safeResolvePathResolved(workspace.uri.fsPath, ".cursor/mcp.json"),
+    );
     await vscode.workspace.fs.createDirectory(directory);
     try {
       await vscode.workspace.fs.stat(uri);

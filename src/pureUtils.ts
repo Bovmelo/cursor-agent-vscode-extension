@@ -6,6 +6,10 @@ export function slugifyBranchTitle(value: string): string {
     .slice(0, 48) || "change";
 }
 
+export function branchStartsAtBase(currentHead: string, baseHead: string): boolean {
+  return currentHead.trim() === baseHead.trim();
+}
+
 export function expandCommandBody(body: string, trailingText: string): string {
   const extra = trailingText.trim();
   if (!extra) {

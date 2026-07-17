@@ -20,7 +20,7 @@
   },
   "homepage": "https://github.com/ark4ez/cursor-agent-vscode-extension#readme",
   "engines": {
-    "vscode": "^1.100.0"
+    "vscode": "^1.101.0"
   },
   "categories": [
     "AI"
@@ -72,6 +72,7 @@
     "validate": "npm run compile && npm run validate:webview && node --test test/*.test.mjs",
     "vscode:prepublish": "npm run validate",
     "package": "vsce package",
+    "package:target": "vsce package --target",
     "publish": "vsce publish"
   },
   "contributes": {

@@ -1,8 +1,17 @@
-import { rename, readFile, writeFile } from "node:fs/promises";
+import { readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { Agent, type LocalAgentOptions, type RunResult } from "@cursor/sdk";
-import type { BackgroundJob, BackgroundWorkerInput } from "./backgroundJobTypes.js";
+import type { BackgroundJob, BackgroundJobStatus, BackgroundWorkerInput } from "./backgroundJobTypes.js";
+import {
+  backgroundWorkerProtocolPaths,
+  isAuthenticatedWorkerCancellation,
+  type BackgroundWorkerCancellation,
+  type BackgroundWorkerHeartbeat,
+} from "./backgroundWorkerProtocol.js";
 
 const SUPPORTS_LOCAL_SANDBOX = process.platform !== "win32";
+const HEARTBEAT_INTERVAL_MS = 5_000;
+const CANCELLATION_POLL_MS = 1_000;
+const HARD_CANCEL_GRACE_MS = 5_000;
 
 async function readStandardInput(): Promise<string> {
   const chunks: Buffer[] = [];
@@ -23,22 +32,67 @@ async function saveJob(job: BackgroundJob): Promise<void> {
   await rename(temporary, job.jobFile);
 }
 
+async function saveTerminalJob(
+  jobFile: string,
+  workerToken: string,
+  status: BackgroundJobStatus,
+  update: Partial<Pick<BackgroundJob, "assistantText" | "usage" | "error">> = {},
+): Promise<void> {
+  const latest = await loadJob(jobFile);
+  if (latest.workerToken !== workerToken) {
+    return;
+  }
+  latest.status = status;
+  Object.assign(latest, update);
+  await saveJob(latest);
+}
+
+async function cancellationRequested(jobFile: string, workerToken: string): Promise<boolean> {
+  try {
+    const file = backgroundWorkerProtocolPaths(jobFile).cancellation;
+    const cancellation = JSON.parse(await readFile(file, "utf8")) as BackgroundWorkerCancellation;
+    return isAuthenticatedWorkerCancellation(workerToken, cancellation);
+  } catch {
+    return false;
+  }
+}
+
 async function main(): Promise<void> {
   const jobFile = process.argv[2];
-  if (!jobFile) {
-    throw new Error("Background job file argument is missing.");
+  const workerToken = process.argv[3];
+  if (!jobFile || !workerToken) {
+    throw new Error("Background worker job file or identity token is missing.");
   }
   const input = JSON.parse(await readStandardInput()) as BackgroundWorkerInput;
-  // Keep the API key only long enough to create the agent, then drop our copy.
   let apiKey: string | undefined = input.apiKey;
   input.apiKey = "";
   const model = input.model;
   const approvalMode = input.approvalMode;
   const maxMinutes = input.maxMinutes;
   const job = await loadJob(jobFile);
+  if (job.workerToken !== workerToken) {
+    throw new Error("Background worker identity does not match the job.");
+  }
   job.pid = process.pid;
   job.status = "running";
   await saveJob(job);
+
+  const protocol = backgroundWorkerProtocolPaths(jobFile);
+  let heartbeatQueue = Promise.resolve();
+  const queueHeartbeat = (): void => {
+    heartbeatQueue = heartbeatQueue.catch(() => {}).then(async () => {
+      const heartbeat: BackgroundWorkerHeartbeat = {
+        token: workerToken,
+        pid: process.pid,
+        updatedAt: Date.now(),
+      };
+      const temporary = `${protocol.heartbeat}.${process.pid}.tmp`;
+      await writeFile(temporary, JSON.stringify(heartbeat), "utf8");
+      await rename(temporary, protocol.heartbeat);
+    });
+  };
+  queueHeartbeat();
+  const heartbeatTimer = setInterval(queueHeartbeat, HEARTBEAT_INTERVAL_MS);
 
   const local: LocalAgentOptions = {
     cwd: job.session.worktreePath,
@@ -50,18 +104,50 @@ async function main(): Promise<void> {
   };
   let agent: Awaited<ReturnType<typeof Agent.create>> | undefined;
   let run: Awaited<ReturnType<Awaited<ReturnType<typeof Agent.create>>["send"]>> | undefined;
-  let cancelled = false;
-  const cancel = (): void => {
-    cancelled = true;
+  let cancellationReason: "requested" | "timeout" | undefined;
+  let hardExitTimer: ReturnType<typeof setTimeout> | undefined;
+  const requestCancellation = (reason: "requested" | "timeout"): void => {
+    cancellationReason ??= reason;
     if (run?.supports("cancel")) {
-      void run.cancel();
+      void run.cancel().catch(() => {});
+    }
+    if (!hardExitTimer) {
+      void saveTerminalJob(
+        jobFile,
+        workerToken,
+        cancellationReason === "timeout" ? "error" : "cancelled",
+        cancellationReason === "timeout"
+          ? { error: "The background agent exceeded its execution-time budget." }
+          : {},
+      ).catch(() => {});
+      hardExitTimer = setTimeout(() => {
+        process.exit(cancellationReason === "timeout" ? 124 : 130);
+      }, HARD_CANCEL_GRACE_MS);
     }
   };
-  process.once("SIGTERM", cancel);
-  process.once("SIGINT", cancel);
+  process.once("SIGTERM", () => requestCancellation("requested"));
+  process.once("SIGINT", () => requestCancellation("requested"));
 
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  let cancellationCheck = Promise.resolve();
+  const checkCancellation = (): Promise<void> => {
+    cancellationCheck = cancellationCheck.catch(() => {}).then(async () => {
+      if (await cancellationRequested(jobFile, workerToken)) {
+        requestCancellation("requested");
+      }
+    });
+    return cancellationCheck;
+  };
+  const cancellationTimer = setInterval(() => void checkCancellation(), CANCELLATION_POLL_MS);
+  const executionTimer = setTimeout(
+    () => requestCancellation("timeout"),
+    Math.max(1, maxMinutes) * 60 * 1000,
+  );
+
   try {
+    await checkCancellation();
+    if (cancellationReason) {
+      return;
+    }
     if (!apiKey) {
       throw new Error("Background worker API key is missing.");
     }
@@ -72,22 +158,19 @@ async function main(): Promise<void> {
       name: `Background: ${job.title}`,
     });
     apiKey = undefined;
-    if (cancelled) {
-      job.status = "cancelled";
-      await saveJob(job);
+    if (cancellationReason) {
       return;
     }
     run = await agent.send(job.prompt, { model, mode: "agent" });
-    if (cancelled && run.supports("cancel")) {
-      await run.cancel();
+    if (cancellationReason && run.supports("cancel")) {
+      await run.cancel().catch(() => {});
     }
-    timer = setTimeout(cancel, Math.max(1, maxMinutes) * 60 * 1000);
     let assistantText = "";
     const stream = run.stream();
     const resultPromise = run.wait();
     const terminal = resultPromise.then((result) => ({ type: "result" as const, result }));
     let result: RunResult | undefined;
-    while (!result) {
+    while (!result && !cancellationReason) {
       const next = await Promise.race([
         stream.next().then((event) => ({ type: "event" as const, event })),
         terminal,
@@ -108,41 +191,84 @@ async function main(): Promise<void> {
         }
       }
     }
+    if (cancellationReason) {
+      await saveTerminalJob(
+        jobFile,
+        workerToken,
+        cancellationReason === "timeout" ? "error" : "cancelled",
+        cancellationReason === "timeout"
+          ? { error: "The background agent exceeded its execution-time budget." }
+          : {},
+      );
+      return;
+    }
     result ??= await resultPromise;
-    job.assistantText = assistantText;
-    job.usage = result.usage;
-    if (cancelled || result.status === "cancelled") {
-      job.status = "cancelled";
+    if (result.status === "cancelled") {
+      await saveTerminalJob(jobFile, workerToken, "cancelled", {
+        assistantText,
+        usage: result.usage,
+      });
     } else if (result.status === "finished") {
-      job.status = "completed";
+      await saveTerminalJob(jobFile, workerToken, "completed", {
+        assistantText,
+        usage: result.usage,
+        error: undefined,
+      });
     } else {
-      job.status = "error";
-      job.error = result.error?.message || "The background agent failed.";
+      await saveTerminalJob(jobFile, workerToken, "error", {
+        assistantText,
+        usage: result.usage,
+        error: result.error?.message || "The background agent failed.",
+      });
     }
-    await saveJob(job);
+  } catch (error) {
+    if (cancellationReason) {
+      await saveTerminalJob(
+        jobFile,
+        workerToken,
+        cancellationReason === "timeout" ? "error" : "cancelled",
+        cancellationReason === "timeout"
+          ? { error: "The background agent exceeded its execution-time budget." }
+          : {},
+      );
+      return;
+    }
+    throw error;
   } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
+    clearTimeout(executionTimer);
+    clearInterval(cancellationTimer);
+    clearInterval(heartbeatTimer);
+    await cancellationCheck.catch(() => {});
     if (agent) {
       await agent[Symbol.asyncDispose]().catch(() => {});
     }
+    if (hardExitTimer) {
+      clearTimeout(hardExitTimer);
+    }
+    await heartbeatQueue.catch(() => {});
+    await Promise.all([
+      unlink(protocol.heartbeat).catch(() => undefined),
+      unlink(protocol.cancellation).catch(() => undefined),
+    ]);
   }
 }
 
 void main().catch(async (error) => {
   const jobFile = process.argv[2];
-  if (!jobFile) {
+  const workerToken = process.argv[3];
+  if (!jobFile || !workerToken) {
     process.exitCode = 1;
     return;
   }
   try {
     const job = await loadJob(jobFile);
-    job.status = "error";
-    job.error = error instanceof Error ? error.message : String(error);
-    await saveJob(job);
+    if (job.workerToken === workerToken && job.status !== "cancelled") {
+      job.status = "error";
+      job.error = error instanceof Error ? error.message : String(error);
+      await saveJob(job);
+    }
   } catch {
-    // The parent will report an unreadable job file.
+    // The parent will report an unreadable or unresponsive job file.
   }
   process.exitCode = 1;
 });

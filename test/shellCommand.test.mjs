@@ -46,13 +46,26 @@ test("toExecFileInvocation routes Windows batch files through cmd.exe", () => {
   assert.deepEqual(toExecFileInvocation(node), node);
 });
 
-test("runConfiguredCommand can spawn npm without EINVAL", async () => {
-  const { stdout } = await runConfiguredCommand("npm -v", {
-    cwd: process.cwd(),
-    timeout: 60_000,
-    maxBuffer: 1024 * 1024,
-  });
-  assert.match(stdout.trim(), /^\d+\.\d+/);
+test("runConfiguredCommand can spawn a platform command without EINVAL", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "cursor-command-"));
+  try {
+    const script = path.join(root, process.platform === "win32" ? "probe.cmd" : "probe.mjs");
+    await writeFile(
+      script,
+      process.platform === "win32" ? "@echo 1.2.3\r\n" : "console.log('1.2.3');\n",
+    );
+    const command = process.platform === "win32"
+      ? `"${script}"`
+      : `"${process.execPath}" "${script}"`;
+    const { stdout } = await runConfiguredCommand(command, {
+      cwd: root,
+      timeout: 60_000,
+      maxBuffer: 1024 * 1024,
+    });
+    assert.equal(stdout.trim(), "1.2.3");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("minimalShellEnv forwards only an allowlisted subset", () => {

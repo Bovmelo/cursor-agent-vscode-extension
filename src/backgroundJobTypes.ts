@@ -23,6 +23,8 @@ export interface BackgroundJob {
   createdAt: number;
   updatedAt: number;
   pid?: number;
+  workerToken?: string;
+  maxMinutes?: number;
   assistantText?: string;
   error?: string;
   usage?: TokenUsage;
