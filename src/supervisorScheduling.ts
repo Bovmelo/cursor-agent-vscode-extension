@@ -76,13 +76,22 @@ export function overlappingTaskIds(
   tasks: readonly SchedulableSupervisorTask[],
 ): string[] {
   const claims = new Set(supervisorFileClaims(task));
-  if (claims.size === 0) {
-    return [];
-  }
-  return tasks
+  const active = tasks
     .filter((candidate) => candidate.id !== task.id)
-    .filter((candidate) => ["running", "review", "blocked", "applying"].includes(candidate.status))
-    .filter((candidate) => supervisorFileClaims(candidate).some((file) => claims.has(file)))
+    .filter((candidate) => ["running", "review", "blocked", "applying"].includes(candidate.status));
+  // Tasks without file claims can touch arbitrary paths; serialize them against
+  // every active task (and block scoped tasks while an unscoped run is active).
+  if (claims.size === 0) {
+    return active.map((candidate) => candidate.id);
+  }
+  return active
+    .filter((candidate) => {
+      const otherClaims = supervisorFileClaims(candidate);
+      if (otherClaims.length === 0) {
+        return true;
+      }
+      return otherClaims.some((file) => claims.has(file));
+    })
     .map((candidate) => candidate.id);
 }
 
@@ -103,10 +112,21 @@ export function selectRunnableSupervisorTasks(
     if (selected.length >= Math.max(0, maximum)) {
       break;
     }
+    const candidateClaims = supervisorFileClaims(candidate);
+    // Unscoped tasks may touch any path; never batch them with other work.
+    if (candidateClaims.length === 0) {
+      if (selected.length === 0 && overlappingTaskIds(candidate, tasks).length === 0) {
+        selected.push(candidate);
+      }
+      continue;
+    }
+    if (selected.some((entry) => supervisorFileClaims(entry).length === 0)) {
+      continue;
+    }
     const selectedClaims = new Set(selected.flatMap(supervisorFileClaims));
     if (
       overlappingTaskIds(candidate, tasks).length === 0
-      && supervisorFileClaims(candidate).every((claim) => !selectedClaims.has(claim))
+      && candidateClaims.every((claim) => !selectedClaims.has(claim))
     ) {
       selected.push(candidate);
     }

@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+function isPathInside(root, candidate) {
+  const relative = candidate.replaceAll("\\", "/").slice(root.replaceAll("\\", "/").length);
+  const normalizedRoot = root.replaceAll("\\", "/").replace(/\/$/, "");
+  const normalizedCandidate = candidate.replaceAll("\\", "/");
+  return normalizedCandidate === normalizedRoot
+    || normalizedCandidate.startsWith(`${normalizedRoot}/`);
+}
+
 function resolveAbsoluteInWorkspace(
   filePath,
   folders,
@@ -11,7 +19,8 @@ function resolveAbsoluteInWorkspace(
   }
   const isAbsolute = /^([a-zA-Z]:[\\/]|\\\\|\/)/.test(filePath);
   if (isAbsolute) {
-    return filePath.replaceAll("\\", "/");
+    const absolute = filePath.replaceAll("\\", "/");
+    return folders.some((folder) => isPathInside(folder.root, absolute)) ? absolute : undefined;
   }
   const slash = filePath.replaceAll("\\", "/");
   const slashIndex = slash.indexOf("/");
@@ -20,7 +29,8 @@ function resolveAbsoluteInWorkspace(
     const rest = slash.slice(slashIndex + 1);
     const folder = folders.find((candidate) => candidate.name === folderName);
     if (folder) {
-      return `${folder.root.replaceAll("\\", "/")}/${rest}`;
+      const absolute = `${folder.root.replaceAll("\\", "/")}/${rest}`;
+      return isPathInside(folder.root, absolute) ? absolute : undefined;
     }
   }
   const ordered = preferredName
@@ -29,7 +39,13 @@ function resolveAbsoluteInWorkspace(
       ...folders.filter((folder) => folder.name !== preferredName),
     ]
     : folders;
-  return `${ordered[0].root.replaceAll("\\", "/")}/${slash}`;
+  for (const folder of ordered) {
+    const absolute = `${folder.root.replaceAll("\\", "/")}/${slash}`;
+    if (isPathInside(folder.root, absolute) && !slash.includes("..")) {
+      return absolute;
+    }
+  }
+  return undefined;
 }
 
 test("multi-root paths resolve folder-prefixed and preferred roots", () => {
@@ -46,8 +62,16 @@ test("multi-root paths resolve folder-prefixed and preferred roots", () => {
     "C:/ws/api/src/main.ts",
   );
   assert.equal(
+    resolveAbsoluteInWorkspace("C:/ws/api/src/main.ts", folders),
+    "C:/ws/api/src/main.ts",
+  );
+  assert.equal(
     resolveAbsoluteInWorkspace("C:/abs/file.ts", folders),
-    "C:/abs/file.ts",
+    undefined,
+  );
+  assert.equal(
+    resolveAbsoluteInWorkspace("../escape.ts", folders, "api"),
+    undefined,
   );
 });
 

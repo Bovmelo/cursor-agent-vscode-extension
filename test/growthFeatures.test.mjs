@@ -7,13 +7,16 @@ import {
 import {
   attachSubtasks,
   buildOrchestratorDetail,
+  buildOrchestratorPlanPrompt,
   buildSynthesisPrompt,
   createOrchestratorExperiment,
   extractSubagentName,
+  launchOrchestratorSubtasks,
   markSubtaskConversation,
   markSubtaskStatus,
   orchestratorSummaries,
   parseOrchestratorSubtasks,
+  resolveOrchestratorPlan,
 } from "../out/orchestrator.js";
 import {
   parseSupervisorReviewVerdict,
@@ -116,6 +119,95 @@ test("orchestrator parses subtasks and advances through synthesis", () => {
   assert.equal(extractSubagentName({}), undefined);
 });
 
+test("orchestrator accepts fenced and embedded JSON subtask lists", () => {
+  const fenced = parseOrchestratorSubtasks([
+    "Here is the plan:",
+    "```json",
+    '[{"title":"A","prompt":"do A"}]',
+    "```",
+  ].join("\n"));
+  assert.deepEqual(fenced, [{ title: "A", prompt: "do A" }]);
+
+  const embedded = parseOrchestratorSubtasks(
+    'Plan: [{"title":"B","prompt":"handle [nested] text"}] done.',
+  );
+  assert.deepEqual(embedded, [{ title: "B", prompt: "handle [nested] text" }]);
+
+  const taggedSecond = parseOrchestratorSubtasks([
+    "<ORCHESTRATOR_SUBTASKS>not-json</ORCHESTRATOR_SUBTASKS>",
+    "<ORCHESTRATOR_SUBTASKS>",
+    '[{"title":"C","prompt":"do C"}]',
+    "</ORCHESTRATOR_SUBTASKS>",
+  ].join("\n"));
+  assert.deepEqual(taggedSecond, [{ title: "C", prompt: "do C" }]);
+
+  const taggedBeatsIncidental = parseOrchestratorSubtasks([
+    '[{"title":"Wrong","prompt":"ignore"}]',
+    "<ORCHESTRATOR_SUBTASKS>",
+    '[{"title":"Right","prompt":"keep"}]',
+    "</ORCHESTRATOR_SUBTASKS>",
+  ].join("\n"));
+  assert.deepEqual(taggedBeatsIncidental, [{ title: "Right", prompt: "keep" }]);
+});
+
+test("launchOrchestratorSubtasks skips work when concurrency is zero", async () => {
+  const events = [];
+  await launchOrchestratorSubtasks(
+    ["a"],
+    async () => {
+      events.push("persist");
+    },
+    async () => {
+      events.push("launch");
+    },
+    0,
+  );
+  assert.deepEqual(events, ["persist"]);
+});
+
+test("orchestrator retries malformed plans once then falls back to execution", () => {
+  let experiment = createOrchestratorExperiment("fix the bug");
+  const retry = resolveOrchestratorPlan(experiment, "I will create a plan.");
+  assert.equal(retry.kind, "retry");
+  assert.equal(retry.experiment.planAttempts, 2);
+  assert.match(retry.kind === "retry" ? retry.prompt : "", /Return only this exact structure/);
+
+  experiment = retry.experiment;
+  const fallback = resolveOrchestratorPlan(experiment, "Still no JSON.");
+  assert.equal(fallback.kind, "ready");
+  assert.equal(fallback.kind === "ready" && fallback.usedFallback, true);
+  assert.equal(fallback.experiment.status, "running");
+  assert.equal(fallback.experiment.subtasks[0]?.prompt, "fix the bug");
+  assert.match(buildOrchestratorPlanPrompt("request"), /<ORCHESTRATOR_SUBTASKS>/);
+});
+
+test("orchestrator persists conversation ids before bounded parallel launches", async () => {
+  const events = [];
+  let active = 0;
+  let maximumActive = 0;
+
+  await launchOrchestratorSubtasks(
+    ["a", "b", "c"],
+    async () => {
+      events.push("persist");
+    },
+    async (id) => {
+      assert.equal(events[0], "persist");
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      events.push(`start:${id}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      events.push(`finish:${id}`);
+      active -= 1;
+    },
+    2,
+  );
+
+  assert.equal(maximumActive, 2);
+  assert.deepEqual(events.slice(0, 3), ["persist", "start:a", "start:b"]);
+  assert.equal(events.indexOf("start:c") > events.indexOf("finish:a"), true);
+});
+
 test("audit log appends and formats markdown", () => {
   const entries = appendAuditEntry(undefined, {
     action: "supervisor.apply",
@@ -214,6 +306,21 @@ test("Plan artifacts parse executable checkpoint steps", () => {
     { title: "Schema", prompt: "Add the schema" },
     { title: "UI", prompt: "Build the UI" },
   ]);
+});
+
+test("Plan artifacts accept fenced and embedded JSON steps", () => {
+  const fenced = parseExecutionPlanSteps([
+    "Here is the plan:",
+    "```json",
+    '[{"title":"API","prompt":"Implement the API"}]',
+    "```",
+  ].join("\n"));
+  assert.deepEqual(fenced, [{ title: "API", prompt: "Implement the API" }]);
+
+  const embedded = parseExecutionPlanSteps(
+    'Plan: [{"title":"UI","prompt":"Render [nested] content"}] done.',
+  );
+  assert.deepEqual(embedded, [{ title: "UI", prompt: "Render [nested] content" }]);
 });
 
 test("monthly token and estimated cost budgets aggregate the current month", () => {

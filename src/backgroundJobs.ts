@@ -11,6 +11,9 @@ import {
   prepareIsolatedWorktree,
   type IsolatedChange,
 } from "./isolatedWorktree.js";
+import { runConfiguredHooks } from "./hooks.js";
+import { createExcludedPathMatcher } from "./sensitivePaths.js";
+import { minimalShellEnv } from "./shellEnv.js";
 import { pickWorkspaceFolder } from "./workspaceFolder.js";
 
 const API_KEY_SECRET = "cursorSubscription.apiKey";
@@ -67,8 +70,16 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
     }
-    // Detached workers intentionally outlive the extension host.
+    // Detached workers intentionally outlive the extension host unless
+    // cancelAllRunning is invoked (e.g. API key revocation).
     this.changed.dispose();
+  }
+
+  public async cancelAllRunning(): Promise<void> {
+    const running = [...this.jobs.values()].filter((job) =>
+      ["starting", "running"].includes(job.status)
+    );
+    await Promise.all(running.map((job) => this.cancel(job.id)));
   }
 
   public refresh(): void {
@@ -131,6 +142,9 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
       worktreesHomeSegment: ".cursor-background/worktrees",
       baselinesFolder: "background-baselines",
       pathEscapeLabel: "background agent",
+      isExcluded: createExcludedPathMatcher(workspace.uri),
+      beforeCaptureBaseline: (worktreePath) =>
+        runConfiguredHooks("preEdit", worktreePath, this.output),
       onLog: (message) => this.output.appendLine(message),
     });
     const jobFile = path.join(this.jobsRoot, `${id}.json`);
@@ -179,11 +193,20 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
     await this.save(job);
     this.changed.fire(undefined);
     try {
+      const isExcluded = createExcludedPathMatcher(vscode.Uri.file(job.workspaceRoot));
       const changes = await collectIsolatedChanges(job.session, this.storageRoot, {
         pathEscapeLabel: "background agent",
+        isExcluded,
         missingBaselineMessage: (relative) => `Background baseline is unavailable for ${relative}.`,
       });
-      await this.applyJob(job, changes);
+      const applyable = changes.filter((change) => !change.excluded);
+      if (applyable.length === 0) {
+        throw new Error(this.text(
+          "No non-excluded changes were available to apply.",
+          "適用可能な（除外されていない）変更がありません。",
+        ));
+      }
+      await this.applyJob(job, applyable);
       job.status = "applied";
       await cleanupIsolatedWorktree(job.session, this.storageRoot, (message) => this.output.appendLine(message));
       await this.save(job);
@@ -312,7 +335,7 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
       detached: true,
       windowsHide: true,
       stdio: ["pipe", "ignore", "ignore"],
-      env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+      env: { ...minimalShellEnv(), ELECTRON_RUN_AS_NODE: "1" },
     });
     child.once("error", (error) => {
       this.output.appendLine(`[${new Date().toISOString()}] Background worker failed: ${error.message}`);

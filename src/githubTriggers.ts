@@ -1,6 +1,7 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
+import { minimalShellEnv } from "./shellEnv.js";
 
 const execFileAsync = promisify(execFileCallback);
 
@@ -142,7 +143,13 @@ export async function scanCurrentGitHubPullRequest(root: string): Promise<GitHub
       "--json",
       "number,title,url,comments,reviews,statusCheckRollup",
     ],
-    { cwd: root, windowsHide: true, timeout: 30_000, maxBuffer: 8 * 1024 * 1024 },
+    {
+      cwd: root,
+      windowsHide: true,
+      timeout: 30_000,
+      maxBuffer: 8 * 1024 * 1024,
+      env: minimalShellEnv(),
+    },
   );
   const snapshot = JSON.parse(stdout) as GitHubPrSnapshot;
   if (snapshot.number) {
@@ -150,7 +157,13 @@ export async function scanCurrentGitHubPullRequest(root: string): Promise<GitHub
       const { stdout: inlineRaw } = await execFileAsync(
         "gh",
         ["api", `repos/{owner}/{repo}/pulls/${snapshot.number}/comments`],
-        { cwd: root, windowsHide: true, timeout: 30_000, maxBuffer: 8 * 1024 * 1024 },
+        {
+          cwd: root,
+          windowsHide: true,
+          timeout: 30_000,
+          maxBuffer: 8 * 1024 * 1024,
+          env: minimalShellEnv(),
+        },
       );
       const inlineComments = JSON.parse(inlineRaw) as Array<{
         id?: number | string;

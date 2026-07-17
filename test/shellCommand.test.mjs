@@ -1,0 +1,76 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { parseCommandLine } from "../out/shellCommand.js";
+import { minimalShellEnv } from "../out/shellEnv.js";
+import { isPathInside, resolveCanonicalPath, safeResolvePathResolved } from "../out/safety.js";
+import { mkdtemp, mkdir, symlink, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
+
+test("parseCommandLine tokenizes quotes and rejects shell metacharacters", () => {
+  assert.deepEqual(parseCommandLine("npm test"), {
+    file: process.platform === "win32" ? "npm.cmd" : "npm",
+    args: ["test"],
+  });
+  assert.deepEqual(parseCommandLine('node "./scripts/run.js" --flag'), {
+    file: "node",
+    args: ["./scripts/run.js", "--flag"],
+  });
+  assert.throws(() => parseCommandLine("npm test && rm -rf /"), /shell metacharacters/i);
+  assert.throws(() => parseCommandLine("echo $(whoami)"), /shell metacharacters/i);
+  assert.throws(() => parseCommandLine("cat file | grep x"), /shell metacharacters/i);
+  assert.throws(() => parseCommandLine("echo 'unterminated"), /unmatched quote/i);
+});
+
+test("minimalShellEnv forwards only an allowlisted subset", () => {
+  const env = minimalShellEnv();
+  assert.ok(env.PATH || env.Path);
+  assert.equal(env.AWS_SECRET_ACCESS_KEY, undefined);
+  assert.equal(env.GITHUB_TOKEN, undefined);
+  assert.equal(env.CURSOR_API_KEY, undefined);
+});
+
+test("safeResolvePathResolved rejects symlink escapes outside root", async () => {
+  if (process.platform === "win32") {
+    // Symlink creation may require elevation on Windows CI; skip when unavailable.
+    const root = await mkdtemp(path.join(tmpdir(), "cursor-safe-root-"));
+    const outside = await mkdtemp(path.join(tmpdir(), "cursor-safe-out-"));
+    try {
+      await writeFile(path.join(outside, "secret.txt"), "secret");
+      try {
+        await symlink(outside, path.join(root, "link"), "junction");
+      } catch {
+        return;
+      }
+      await assert.rejects(
+        () => safeResolvePathResolved(root, "link/secret.txt"),
+        /Path escapes/,
+      );
+      assert.equal(
+        isPathInside(root, path.join(root, "link", "secret.txt")),
+        true,
+      );
+      const canonical = await resolveCanonicalPath(path.join(root, "link", "secret.txt"));
+      assert.equal(isPathInside(root, canonical), false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+    return;
+  }
+
+  const root = await mkdtemp(path.join(tmpdir(), "cursor-safe-root-"));
+  const outside = await mkdtemp(path.join(tmpdir(), "cursor-safe-out-"));
+  try {
+    await writeFile(path.join(outside, "secret.txt"), "secret");
+    await mkdir(path.join(root, "nested"), { recursive: true });
+    await symlink(outside, path.join(root, "nested", "link"), "dir");
+    await assert.rejects(
+      () => safeResolvePathResolved(root, "nested/link/secret.txt"),
+      /Path escapes/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});

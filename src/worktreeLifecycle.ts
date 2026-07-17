@@ -1,8 +1,9 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdir, readFile, realpath, stat, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
+import { minimalShellEnv } from "./shellEnv.js";
 
 const execFileAsync = promisify(execFileCallback);
 const MAX_GIT_OUTPUT = 32 * 1024 * 1024;
@@ -34,6 +35,7 @@ export async function runGit(root: string, args: string[]): Promise<string> {
     windowsHide: true,
     maxBuffer: MAX_GIT_OUTPUT,
     encoding: "utf8",
+    env: minimalShellEnv(),
   });
   return stdout;
 }
@@ -176,13 +178,16 @@ export async function withManagedWorktree<T>(
   }
 }
 
+/**
+ * Intentionally does not junction/symlink host `node_modules` into the worktree.
+ * A writable link would let agent edits mutate the main workspace before apply.
+ */
 export async function linkManagedNodeModules(
   root: string,
   worktreePath: string,
   onLog?: (message: string) => void,
 ): Promise<void> {
   const source = path.join(root, "node_modules");
-  const target = path.join(worktreePath, "node_modules");
   try {
     const sourceStat = await stat(source);
     if (!sourceStat.isDirectory()) {
@@ -191,15 +196,9 @@ export async function linkManagedNodeModules(
   } catch {
     return;
   }
-  try {
-    await symlink(source, target, process.platform === "win32" ? "junction" : "dir");
-  } catch (error) {
-    onLog?.(
-      `[${new Date().toISOString()}] Could not link node_modules: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
-  }
+  onLog?.(
+    `[${new Date().toISOString()}] Skipping node_modules link into ${worktreePath} to preserve worktree isolation.`,
+  );
 }
 
 function parseWorktreePaths(porcelain: string): string[] {

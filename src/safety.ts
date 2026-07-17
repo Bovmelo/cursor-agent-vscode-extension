@@ -1,10 +1,50 @@
 import { createHash } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import * as path from "node:path";
 
 /** True when `candidate` is equal to or under `root`. */
 export function isPathInside(root: string, candidate: string): boolean {
   const relative = path.relative(path.resolve(root), path.resolve(candidate));
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+/**
+ * Resolve symlinks when possible. For missing paths, canonicalize the longest
+ * existing ancestor and rejoin the remainder so apply targets cannot escape via
+ * intermediate symlinks.
+ */
+export async function resolveCanonicalPath(candidate: string): Promise<string> {
+  const absolute = path.resolve(candidate);
+  try {
+    return await realpath(absolute);
+  } catch {
+    let current = absolute;
+    const missing: string[] = [];
+    while (true) {
+      const parent = path.dirname(current);
+      if (parent === current) {
+        return absolute;
+      }
+      missing.unshift(path.basename(current));
+      try {
+        return path.join(await realpath(parent), ...missing);
+      } catch {
+        current = parent;
+      }
+    }
+  }
+}
+
+/** Symlink-aware containment check for apply / open boundaries. */
+export async function isPathInsideResolved(
+  root: string,
+  candidate: string,
+): Promise<boolean> {
+  const [rootReal, candidateReal] = await Promise.all([
+    resolveCanonicalPath(root),
+    resolveCanonicalPath(candidate),
+  ]);
+  return isPathInside(rootReal, candidateReal);
 }
 
 /** Reject absolute paths and any relative segment that escapes with `..`. */
@@ -36,6 +76,21 @@ export function safeResolvePath(root: string, relative: string): string {
   }
   const candidate = path.resolve(root, relative);
   if (!isPathInside(root, candidate)) {
+    throw new Error(`Path escapes the workspace: ${relative}`);
+  }
+  return candidate;
+}
+
+/**
+ * Lexical safeResolvePath plus symlink/realpath containment.
+ * Prefer this on write paths (apply, overlay, baseline).
+ */
+export async function safeResolvePathResolved(
+  root: string,
+  relative: string,
+): Promise<string> {
+  const candidate = safeResolvePath(root, relative);
+  if (!(await isPathInsideResolved(root, candidate))) {
     throw new Error(`Path escapes the workspace: ${relative}`);
   }
   return candidate;
@@ -358,6 +413,7 @@ export type WebviewIncomingType =
   | "pickBestOfNWinner"
   | "compareBestOfN"
   | "openOrchestrator"
+  | "startOrchestrate"
   | "estimateContext"
   | "getContext"
   | "selectModel"
@@ -371,6 +427,7 @@ export type WebviewIncomingType =
   | "clearApiKey"
   | "openDashboard"
   | "openSettings"
+  | "openExternal"
   | "pickWorkspaceFolder";
 
 const WEBVIEW_TYPES = new Set<string>([
@@ -397,6 +454,7 @@ const WEBVIEW_TYPES = new Set<string>([
   "pickBestOfNWinner",
   "compareBestOfN",
   "openOrchestrator",
+  "startOrchestrate",
   "estimateContext",
   "getContext",
   "selectModel",
@@ -410,6 +468,7 @@ const WEBVIEW_TYPES = new Set<string>([
   "clearApiKey",
   "openDashboard",
   "openSettings",
+  "openExternal",
   "pickWorkspaceFolder",
 ]);
 
@@ -461,8 +520,13 @@ export function parseWebviewMessage(raw: unknown): ParsedWebviewMessage | undefi
   const requiresPrompt = type === "send"
     || type === "queueMessage"
     || type === "interruptMessage"
-    || type === "startBestOfN";
+    || type === "startBestOfN"
+    || type === "startOrchestrate";
   if (requiresPrompt && typeof message.prompt !== "string") {
+    return undefined;
+  }
+
+  if (type === "openExternal" && typeof message.path !== "string") {
     return undefined;
   }
 

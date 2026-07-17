@@ -29,6 +29,12 @@ async function main(): Promise<void> {
     throw new Error("Background job file argument is missing.");
   }
   const input = JSON.parse(await readStandardInput()) as BackgroundWorkerInput;
+  // Keep the API key only long enough to create the agent, then drop our copy.
+  let apiKey: string | undefined = input.apiKey;
+  input.apiKey = "";
+  const model = input.model;
+  const approvalMode = input.approvalMode;
+  const maxMinutes = input.maxMinutes;
   const job = await loadJob(jobFile);
   job.pid = process.pid;
   job.status = "running";
@@ -36,9 +42,9 @@ async function main(): Promise<void> {
 
   const local: LocalAgentOptions = {
     cwd: job.session.worktreePath,
-    autoReview: input.approvalMode !== "full-access",
+    autoReview: approvalMode !== "full-access",
     sandboxOptions: {
-      enabled: SUPPORTS_LOCAL_SANDBOX && input.approvalMode !== "full-access",
+      enabled: SUPPORTS_LOCAL_SANDBOX && approvalMode !== "full-access",
     },
     settingSources: ["all"],
   };
@@ -56,22 +62,26 @@ async function main(): Promise<void> {
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
+    if (!apiKey) {
+      throw new Error("Background worker API key is missing.");
+    }
     agent = await Agent.create({
-      apiKey: input.apiKey,
-      model: input.model,
+      apiKey,
+      model,
       local,
       name: `Background: ${job.title}`,
     });
+    apiKey = undefined;
     if (cancelled) {
       job.status = "cancelled";
       await saveJob(job);
       return;
     }
-    run = await agent.send(job.prompt, { model: input.model, mode: "agent" });
+    run = await agent.send(job.prompt, { model, mode: "agent" });
     if (cancelled && run.supports("cancel")) {
       await run.cancel();
     }
-    timer = setTimeout(cancel, Math.max(1, input.maxMinutes) * 60 * 1000);
+    timer = setTimeout(cancel, Math.max(1, maxMinutes) * 60 * 1000);
     let assistantText = "";
     const stream = run.stream();
     const resultPromise = run.wait();

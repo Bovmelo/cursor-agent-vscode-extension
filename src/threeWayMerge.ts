@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { minimalShellEnv } from "./shellEnv.js";
 
 const MAX_MERGE_OUTPUT = 32 * 1024 * 1024;
 
@@ -12,13 +13,8 @@ export interface ThreeWayMergeResult {
 }
 
 export function hasConflictMarkers(bytes: Uint8Array): boolean {
-  let state: "outside" | "ours" | "theirs" = "outside";
   for (const line of Buffer.from(bytes).toString("utf8").split(/\r?\n/)) {
-    if (state === "outside" && /^<<<<<<<(?: .*)?$/.test(line)) {
-      state = "ours";
-    } else if (state === "ours" && line === "=======") {
-      state = "theirs";
-    } else if (state === "theirs" && /^>>>>>>>(?: .*)?$/.test(line)) {
+    if (/^<<<<<<<(?: .*)?$/.test(line) || line === "=======" || /^>>>>>>>(?: .*)?$/.test(line)) {
       return true;
     }
   }
@@ -75,6 +71,7 @@ export async function threeWayMergeBytes(
           windowsHide: true,
           encoding: "buffer",
           maxBuffer: MAX_MERGE_OUTPUT,
+          env: minimalShellEnv(),
         },
         (error, stdout) => {
           if (!error) {

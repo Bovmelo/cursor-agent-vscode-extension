@@ -2,7 +2,9 @@ import {
   Agent,
   type AgentDefinition,
   type LocalAgentOptions,
+  type McpServerConfig,
   type ModelSelection,
+  type SettingSource,
 } from "@cursor/sdk";
 import * as vscode from "vscode";
 import type { Conversation } from "./chatTypes.js";
@@ -23,6 +25,8 @@ export interface CreateAgentRequest {
   roots: string[];
   workspaceName: string;
   conversation: Conversation;
+  settingSources?: SettingSource[];
+  mcpServers?: Record<string, McpServerConfig>;
 }
 
 /** Encapsulates Cursor SDK agent creation, resume, and sandbox fallback policy. */
@@ -32,7 +36,14 @@ export class AgentFactory {
   public constructor(private readonly options: AgentFactoryOptions) {}
 
   public async createOrResume(request: CreateAgentRequest): Promise<CursorAgent> {
-    const { apiKey, roots, workspaceName, conversation } = request;
+    const {
+      apiKey,
+      roots,
+      workspaceName,
+      conversation,
+      settingSources = ["all"],
+      mcpServers,
+    } = request;
     const cwd = roots.length === 1 ? roots[0] : roots;
     const approvalMode = this.options.selectedApprovalMode();
     const local: LocalAgentOptions = {
@@ -41,7 +52,7 @@ export class AgentFactory {
       sandboxOptions: {
         enabled: this.options.supportsLocalSandbox && approvalMode !== "full-access",
       },
-      settingSources: ["all"],
+      settingSources,
     };
     if (approvalMode !== "full-access" && !this.options.supportsLocalSandbox) {
       this.options.notifySandboxUnavailable();
@@ -55,6 +66,7 @@ export class AgentFactory {
             apiKey,
             local: localOptions,
             agents,
+            mcpServers,
           });
         } catch (error) {
           if (this.isSandboxUnavailableError(error)) {
@@ -69,6 +81,7 @@ export class AgentFactory {
         model: this.options.selectedModel(),
         local: localOptions,
         agents,
+        mcpServers,
         name: `VS Code: ${workspaceName}`,
       });
       conversation.agentId = agent.agentId;

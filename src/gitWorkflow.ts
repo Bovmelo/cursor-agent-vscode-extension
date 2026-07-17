@@ -2,6 +2,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import * as vscode from "vscode";
 import { slugifyBranchTitle } from "./pureUtils.js";
+import { minimalShellEnv } from "./shellEnv.js";
 
 const execFileAsync = promisify(execFileCallback);
 
@@ -15,6 +16,7 @@ async function run(
     encoding: "utf8",
     maxBuffer: 4 * 1024 * 1024,
     windowsHide: true,
+    env: minimalShellEnv(),
   });
 }
 

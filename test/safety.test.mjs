@@ -295,10 +295,11 @@ test("parallel edits on the same hunk remain unresolved", async () => {
   assert.equal(hasConflictMarkers(result.bytes), true);
 });
 
-test("conflict marker detection only flags complete marker lines", () => {
+test("conflict marker detection flags marker lines including orphans", () => {
   assert.equal(hasConflictMarkers(Buffer.from("<<<<<<< workspace\na\n=======\nb\n>>>>>>> agent\n")), true);
   assert.equal(hasConflictMarkers(Buffer.from("const prefix = '<<<<<<<';\n")), false);
-  assert.equal(hasConflictMarkers(Buffer.from("heading\n=======\nbody\n")), false);
+  assert.equal(hasConflictMarkers(Buffer.from("heading\n=======\nbody\n")), true);
+  assert.equal(hasConflictMarkers(Buffer.from("<<<<<<< leftover\n")), true);
 });
 
 test("webview message schema validation accepts known shapes and rejects junk", () => {
@@ -349,4 +350,21 @@ test("webview message schema validation accepts known shapes and rejects junk", 
 
   const pickWorkspace = parseWebviewMessage({ type: "pickWorkspaceFolder" });
   assert.equal(pickWorkspace?.type, "pickWorkspaceFolder");
+
+  assert.equal(parseWebviewMessage({ type: "startOrchestrate" }), undefined);
+  const orchestrate = parseWebviewMessage({
+    type: "startOrchestrate",
+    prompt: "plan this",
+    files: ["a.ts"],
+  });
+  assert.equal(orchestrate?.type, "startOrchestrate");
+  assert.equal(orchestrate?.prompt, "plan this");
+  assert.deepEqual(orchestrate?.files, ["a.ts"]);
+
+  assert.equal(parseWebviewMessage({ type: "openExternal" }), undefined);
+  const external = parseWebviewMessage({
+    type: "openExternal",
+    path: "https://example.com",
+  });
+  assert.equal(external?.path, "https://example.com");
 });

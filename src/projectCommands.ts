@@ -9,6 +9,7 @@ export interface ProjectCommand {
   description: string;
   body: string;
   source: "project" | "user";
+  workspaceFolderName?: string;
 }
 
 const MAX_COMMANDS = 100;
@@ -68,6 +69,7 @@ async function readCommandFile(
 async function loadCommandsFromDirectory(
   directory: vscode.Uri,
   source: "project" | "user",
+  workspaceFolderName?: string,
 ): Promise<ProjectCommand[]> {
   let entries: [string, vscode.FileType][];
   try {
@@ -85,7 +87,7 @@ async function loadCommandsFromDirectory(
       source,
     );
     if (command) {
-      commands.push(command);
+      commands.push({ ...command, workspaceFolderName });
     }
     if (commands.length >= MAX_COMMANDS) {
       break;
@@ -108,6 +110,7 @@ export async function loadProjectCommands(
     for (const command of await loadCommandsFromDirectory(
       vscode.Uri.joinPath(workspace.uri, ".cursor", "commands"),
       "project",
+      workspace.name,
     )) {
       if (!byId.has(command.id)) {
         byId.set(command.id, command);
@@ -123,6 +126,20 @@ export async function loadProjectCommands(
   }
 
   return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+
+export function filterEnabledProjectCommands(
+  commands: readonly ProjectCommand[],
+  disabledIntegrationIds: ReadonlySet<string>,
+): ProjectCommand[] {
+  return commands.filter((command) => {
+    if (command.source !== "project" || !command.workspaceFolderName) {
+      return true;
+    }
+    return !disabledIntegrationIds.has(
+      `command:${command.workspaceFolderName}:${command.id}`,
+    );
+  });
 }
 
 export function expandProjectCommand(

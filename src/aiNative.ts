@@ -1,4 +1,4 @@
-import { exec as execCallback, execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
@@ -10,10 +10,28 @@ import {
   isPathInside,
   worktreeMatchesProposed,
 } from "./safety.js";
+import { runConfiguredCommand } from "./shellCommand.js";
+import { minimalShellEnv } from "./shellEnv.js";
 
-const execAsync = promisify(execCallback);
 const execFileAsync = promisify(execFileCallback);
 const MAX_VERIFICATION_OUTPUT = 24_000;
+
+function gitExecOptions(
+  cwd: string,
+  extra?: { maxBuffer?: number },
+): {
+  cwd: string;
+  windowsHide: true;
+  env: NodeJS.ProcessEnv;
+  maxBuffer?: number;
+} {
+  return {
+    cwd,
+    windowsHide: true,
+    env: minimalShellEnv(),
+    ...extra,
+  };
+}
 
 export type ChangeSessionPhase =
   | "observe"
@@ -124,7 +142,7 @@ async function gitStatusIsClean(root: string): Promise<boolean> {
     const { stdout } = await execFileAsync(
       "git",
       ["status", "--porcelain", "--untracked-files=all"],
-      { cwd: root, windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
+      gitExecOptions(root, { maxBuffer: 4 * 1024 * 1024 }),
     );
     return stdout.trim().length === 0;
   } catch {
@@ -137,7 +155,7 @@ async function isTrackedInHead(root: string, relative: string): Promise<boolean>
     await execFileAsync(
       "git",
       ["cat-file", "-e", `HEAD:${relative}`],
-      { cwd: root, windowsHide: true },
+      gitExecOptions(root),
     );
     return true;
   } catch {
@@ -153,7 +171,7 @@ async function readIndexEntry(
     const { stdout } = await execFileAsync(
       "git",
       ["ls-files", "--stage", "--", relative],
-      { cwd: root, windowsHide: true, maxBuffer: 1024 * 1024 },
+      gitExecOptions(root, { maxBuffer: 1024 * 1024 }),
     );
     const match = stdout.match(/^(\d+)\s+([0-9a-f]+)\s+\d+\t/);
     return match ? { mode: match[1], oid: match[2] } : undefined;
@@ -514,7 +532,7 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       const { stdout } = await execFileAsync(
         "git",
         ["show", `${session.headOid ?? "HEAD"}:${relative}`],
-        { cwd: session.root, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
+        gitExecOptions(session.root, { maxBuffer: 8 * 1024 * 1024 }),
       );
       return stdout;
     } catch {
@@ -647,14 +665,14 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
         await execFileAsync(
           "git",
           ["restore", `--source=${session.headOid ?? "HEAD"}`, "--staged", "--worktree", "--", relative],
-          { cwd: session.root, windowsHide: true },
+          gitExecOptions(session.root),
         );
         restored.push(file);
       } else {
         await execFileAsync(
           "git",
           ["rm", "--cached", "--ignore-unmatch", "--", relative],
-          { cwd: session.root, windowsHide: true },
+          gitExecOptions(session.root),
         );
         await this.deleteWorktreeFile(file);
         removed.push(file);
@@ -931,13 +949,13 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       const { stdout: headOid } = await execFileAsync(
         "git",
         ["rev-parse", "HEAD"],
-        { cwd: session.root, windowsHide: true },
+        gitExecOptions(session.root),
       );
       session.headOid = headOid.trim();
       const { stdout: unmerged } = await execFileAsync(
         "git",
         ["ls-files", "--unmerged"],
-        { cwd: session.root, windowsHide: true, maxBuffer: 1024 * 1024 },
+        gitExecOptions(session.root, { maxBuffer: 1024 * 1024 }),
       );
       if (unmerged.trim()) {
         throw new Error("Cannot checkpoint an unmerged Git index.");
@@ -1015,13 +1033,13 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       await execFileAsync(
         "git",
         ["update-index", "--add", "--cacheinfo", `${baseline.indexMode},${baseline.indexOid},${baseline.relative}`],
-        { cwd: session.root, windowsHide: true },
+        gitExecOptions(session.root),
       );
     } else {
       await execFileAsync(
         "git",
         ["rm", "--cached", "--ignore-unmatch", "--", baseline.relative],
-        { cwd: session.root, windowsHide: true },
+        gitExecOptions(session.root),
       );
     }
   }
@@ -1087,7 +1105,7 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       await execFileAsync(
         "git",
         ["cat-file", "-e", `${session.headOid ?? "HEAD"}:${relative}`],
-        { cwd: session.root, windowsHide: true },
+        gitExecOptions(session.root),
       );
       return true;
     } catch {
@@ -1100,7 +1118,7 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       await execFileAsync(
         "git",
         ["check-ignore", "-q", "--", relative],
-        { cwd: root, windowsHide: true },
+        gitExecOptions(root),
       );
       return true;
     } catch (error) {
@@ -1182,6 +1200,12 @@ export async function runVerification(
   configuredCommands: readonly string[],
   output: vscode.OutputChannel,
 ): Promise<VerificationResult> {
+  if (!vscode.workspace.isTrusted) {
+    output.appendLine(
+      `[${new Date().toISOString()}] Skipping verification in an untrusted workspace.`,
+    );
+    return { success: true, skipped: true, steps: [] };
+  }
   const commands = configuredCommands.length > 0
     ? [...configuredCommands]
     : await detectVerificationCommands(root);
@@ -1190,13 +1214,27 @@ export async function runVerification(
   }
 
   const steps: VerificationStep[] = [];
-  for (const command of commands) {
+  const maxCommands = 20;
+  const totalStartedAt = Date.now();
+  for (const command of commands.slice(0, maxCommands)) {
+    if (typeof command !== "string" || !command.trim()) {
+      continue;
+    }
+    if (Date.now() - totalStartedAt > 15 * 60_000) {
+      steps.push({
+        command: "(budget)",
+        stage: "other",
+        success: false,
+        output: "Verification total time budget exceeded.",
+        durationMs: Date.now() - totalStartedAt,
+      });
+      break;
+    }
     const startedAt = Date.now();
     output.appendLine(`[${new Date().toISOString()}] Verification: ${command}`);
     try {
-      const { stdout, stderr } = await execAsync(command, {
+      const { stdout, stderr } = await runConfiguredCommand(command, {
         cwd: root,
-        windowsHide: true,
         timeout: 180_000,
         maxBuffer: 8 * 1024 * 1024,
       });
@@ -1294,7 +1332,7 @@ export async function listWorkspaceChanges(root: string): Promise<string[]> {
     const { stdout } = await execFileAsync(
       "git",
       ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-      { cwd: root, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
+      gitExecOptions(root, { maxBuffer: 8 * 1024 * 1024 }),
     );
     const entries = stdout.split("\0");
     const files: string[] = [];

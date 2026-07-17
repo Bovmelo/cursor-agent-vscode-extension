@@ -167,6 +167,9 @@ export class WebviewController {
           copyMessage: "メッセージをコピー",
           copied: "コピーしました",
           featureSettings: "AI機能の設定",
+          moreMenu: "その他",
+          expandParallel: "並列Agentを展開",
+          collapseParallel: "並列Agentを折りたたむ",
           soundSettings: "通知と音の設定",
           completionNotification: "処理完了の通知",
           soundWhileRunning: "処理中の音",
@@ -329,6 +332,9 @@ export class WebviewController {
           copyMessage: "Copy message",
           copied: "Copied",
           featureSettings: "AI feature settings",
+          moreMenu: "More",
+          expandParallel: "Expand parallel agents",
+          collapseParallel: "Collapse parallel agents",
           soundSettings: "Notification and sound settings",
           completionNotification: "Run completion notifications",
           soundWhileRunning: "While running",
@@ -416,8 +422,8 @@ export class WebviewController {
     .header {
       display: flex;
       align-items: center;
-      gap: 4px;
-      padding: 10px 14px 8px;
+      gap: 2px;
+      padding: 6px 8px 4px;
     }
     .brand {
       font-size: 11px;
@@ -443,9 +449,51 @@ export class WebviewController {
     }
     .icon-btn:hover { background: var(--vscode-toolbar-hoverBackground); }
     .icon-btn svg { width: 15px; height: 15px; }
-    .sound-control { position: relative; }
+    .sound-control,
+    .more-control { position: relative; }
     #soundButton.active,
+    #moreButton.active,
     #findInChatButton.active { background: var(--vscode-toolbar-hoverBackground); }
+    #moreMenu {
+      position: absolute;
+      top: calc(100% + 4px);
+      right: 0;
+      z-index: 32;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      width: 230px;
+      padding: 6px;
+      color: var(--vscode-menu-foreground, var(--vscode-foreground));
+      background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
+      border: 1px solid var(--vscode-menu-border, var(--vscode-widget-border, transparent));
+      border-radius: 8px;
+      box-shadow: 0 4px 14px var(--vscode-widget-shadow, rgba(0, 0, 0, .3));
+    }
+    #moreMenu[hidden] { display: none; }
+    .more-menu-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      min-height: 30px;
+      padding: 5px 8px;
+      border: 0;
+      border-radius: 5px;
+      color: inherit;
+      background: transparent;
+      font: inherit;
+      font-size: 12px;
+      text-align: left;
+      cursor: pointer;
+    }
+    .more-menu-item:hover { background: var(--vscode-menu-selectionBackground); }
+    .more-menu-item svg { width: 14px; height: 14px; flex: none; }
+    .more-menu-separator {
+      height: 1px;
+      margin: 4px 0;
+      background: var(--vscode-menu-separatorBackground, var(--vscode-panel-border));
+    }
     #chatFindBar {
       display: flex;
       align-items: center;
@@ -508,19 +556,17 @@ export class WebviewController {
       outline: 1px solid var(--vscode-editor-findMatchBorder, transparent);
     }
     #soundMenu {
-      position: absolute;
-      top: calc(100% + 4px);
-      right: 0;
       z-index: 30;
-      width: 220px;
+      width: 100%;
+      margin-top: 2px;
       padding: 6px;
       color: var(--vscode-menu-foreground, var(--vscode-foreground));
-      background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
+      background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
       border: 1px solid var(--vscode-menu-border, var(--vscode-widget-border, transparent));
       border-radius: 8px;
-      box-shadow: 0 4px 14px var(--vscode-widget-shadow, rgba(0, 0, 0, .3));
     }
     #soundMenu[hidden] { display: none; }
+    .more-control .sound-control { width: 100%; }
     .sound-menu-title {
       padding: 3px 7px 6px;
       color: var(--muted);
@@ -572,7 +618,7 @@ export class WebviewController {
     /* ---- Parallel agents ---- */
     #parallelBar {
       flex: none;
-      padding: 6px 10px 8px;
+      padding: 2px 8px 4px;
       border-top: 1px solid var(--vscode-widget-border, transparent);
       border-bottom: 1px solid var(--vscode-widget-border, transparent);
       background: var(--vscode-sideBarSectionHeader-background, transparent);
@@ -582,14 +628,22 @@ export class WebviewController {
       display: flex;
       align-items: center;
       gap: 6px;
-      min-height: 18px;
-      padding: 0 2px 5px;
+      width: 100%;
+      min-height: 26px;
+      margin: 0;
+      padding: 2px 4px;
       color: var(--muted);
+      background: transparent;
+      border: 0;
+      border-radius: 6px;
+      font: inherit;
       font-size: 10px;
       font-weight: 600;
       letter-spacing: .04em;
       text-transform: uppercase;
+      cursor: pointer;
     }
+    .parallel-bar-header:hover { background: var(--vscode-toolbar-hoverBackground); }
     #parallelBarCount {
       margin-left: auto;
       padding: 1px 6px;
@@ -598,7 +652,16 @@ export class WebviewController {
       border-radius: 9px;
       font-size: 10px;
       letter-spacing: 0;
+      text-transform: none;
     }
+    .parallel-chevron {
+      flex: none;
+      font-size: 10px;
+      transition: transform .12s ease;
+    }
+    #parallelBar.expanded .parallel-chevron { transform: rotate(90deg); }
+    #parallelBarBody { padding: 0 0 4px; }
+    #parallelBarBody[hidden] { display: none; }
     #parallelTaskList {
       display: flex;
       gap: 6px;
@@ -763,7 +826,7 @@ export class WebviewController {
     #scroller {
       flex: 1;
       overflow-y: auto;
-      padding: 4px 14px;
+      padding: 4px 8px;
       display: flex;
       flex-direction: column;
     }
@@ -1073,7 +1136,7 @@ export class WebviewController {
     }
     .user {
       align-self: flex-end;
-      max-width: 88%;
+      max-width: 94%;
       padding: 8px 28px 8px 12px;
       background: var(--vscode-input-background);
       border: 1px solid var(--vscode-input-border, transparent);
@@ -1305,8 +1368,8 @@ export class WebviewController {
     .composer-wrap {
       display: flex;
       flex-direction: column;
-      gap: 6px;
-      padding: 8px 12px 4px;
+      gap: 4px;
+      padding: 4px 8px 2px;
     }
     .card {
       position: relative;
@@ -1314,16 +1377,10 @@ export class WebviewController {
       border: 1px solid var(--vscode-panel-border);
       border-radius: var(--radius-card);
       box-shadow: 0 2px 10px rgba(0, 0, 0, .10);
-      padding: 10px 12px 8px;
+      padding: 8px 10px 6px;
     }
     .card:focus-within { border-color: var(--vscode-focusBorder); }
-    .drop-help {
-      margin: -1px 4px 0;
-      color: var(--muted);
-      font-size: 11px;
-      line-height: 1.3;
-      text-align: right;
-    }
+    .drop-help { display: none; }
     #dropHint {
       position: absolute;
       inset: 5px;
@@ -1616,6 +1673,8 @@ export class WebviewController {
       gap: 6px;
       padding-bottom: 6px;
     }
+    #contextRow[hidden] { display: none; }
+    #memoryChip { display: none !important; }
     .ctx-chip {
       display: inline-flex;
       align-items: center;
@@ -1668,14 +1727,15 @@ export class WebviewController {
     }
     .card-row .spacer { flex: 1; }
     #approvalSelect {
-      max-width: 108px;
-      padding: 2px 2px;
-      font-size: 12px;
-      color: var(--muted);
-      background: transparent;
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
       border: 0;
-      outline: none;
-      cursor: pointer;
     }
     #approvalSelect option {
       color: var(--vscode-dropdown-foreground);
@@ -1686,7 +1746,7 @@ export class WebviewController {
       display: inline-flex;
       align-items: center;
       gap: 4px;
-      max-width: 132px;
+      max-width: 120px;
       padding: 3px 4px;
       color: var(--muted);
       background: transparent;
@@ -1840,13 +1900,13 @@ export class WebviewController {
 
     /* Narrow sidebar (typical VS Code activity-bar width) */
     @media (max-width: 420px) {
-      .header { padding: 8px 10px 6px; gap: 2px; }
-      #scroller { padding: 4px 10px; }
-      #auth { margin: 4px 10px; padding: 10px; }
+      .header { padding: 6px 6px 4px; gap: 1px; }
+      #scroller { padding: 4px 6px; }
+      #auth { margin: 4px 8px; padding: 10px; }
       #auth .row { flex-wrap: wrap; }
-      .composer-wrap { padding: 6px 8px 2px; }
+      .composer-wrap { padding: 4px 6px 2px; }
       .card {
-        padding: 8px 8px 6px;
+        padding: 6px 8px 5px;
         border-radius: 12px;
       }
       .user { max-width: 100%; }
@@ -1856,18 +1916,16 @@ export class WebviewController {
       .task-time { font-size: 10px; }
 
       .card-row {
-        flex-wrap: wrap;
+        flex-wrap: nowrap;
         align-items: center;
-        row-gap: 6px;
-        column-gap: 6px;
+        gap: 4px;
       }
       .model-control { min-width: 0; }
-      #sendButton { margin-left: auto; }
-      #approvalSelect { max-width: min(96px, 28vw); }
-      #modelButton { max-width: min(110px, 34vw); }
-      #profileChip { max-width: 88px; }
+      #sendButton { margin-left: 0; }
+      #modelButton { max-width: min(96px, 36vw); }
+      #profileChip { max-width: 72px; }
       #authChip {
-        max-width: 7.2em;
+        max-width: 5.5em;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -1939,7 +1997,6 @@ export class WebviewController {
       }
       #runningIndicator { padding: 2px 5px; }
       #runningIndicator > span:not(.running-spinner) { display: none; }
-      #approvalSelect { max-width: 72px; }
       #modelButton { max-width: 84px; }
     }
     #sendButton {
@@ -1966,8 +2023,8 @@ export class WebviewController {
       display: flex;
       align-items: center;
       gap: 6px;
-      padding: 4px 16px 10px;
-      font-size: 12px;
+      padding: 2px 8px 6px;
+      font-size: 11px;
       color: var(--muted);
     }
     .footer svg { width: 13px; height: 13px; flex: none; }
@@ -2040,27 +2097,6 @@ export class WebviewController {
   <div class="header">
     <span class="brand">Cursor</span>
     <span class="spacer"></span>
-    <button id="featureSettingsButton" class="icon-btn" type="button" title="${ui.featureSettings}" aria-label="${ui.featureSettings}">
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="8" cy="8" r="2"/>
-        <path d="M6.5 1.6h3l.45 1.9 1.55.9 1.9-.5 1.5 2.6-1.45 1.2v1.8l1.45 1.2-1.5 2.6-1.9-.5-1.55.9L9.5 14.4h-3l-.45-1.9-1.55-.9-1.9.5-1.5-2.6 1.45-1.2V7.8L1.6 6.6l1.5-2.6 1.9.5 1.55-.9z"/>
-      </svg>
-    </button>
-    <div class="sound-control">
-      <button id="soundButton" class="icon-btn" type="button" title="${ui.soundSettings}" aria-label="${ui.soundSettings}" aria-expanded="false">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M2.5 6.2h2.3L8 3.5v9L4.8 9.8H2.5z"/>
-          <path d="M10.5 5.5a3.2 3.2 0 0 1 0 5M12.3 3.7a5.7 5.7 0 0 1 0 8.6"/>
-        </svg>
-      </button>
-      <div id="soundMenu" role="group" aria-label="${ui.soundSettings}" hidden>
-        <div class="sound-menu-title">${ui.soundSettings}</div>
-        <label class="sound-option"><input id="notificationToggle" type="checkbox"><span>${ui.completionNotification}</span></label>
-        <label class="sound-option"><input id="runningSoundToggle" type="checkbox"><span>${ui.soundWhileRunning}</span></label>
-        <label class="sound-option"><input id="completionSoundToggle" type="checkbox"><span>${ui.soundOnComplete}</span></label>
-        <label class="sound-option"><input id="errorSoundToggle" type="checkbox"><span>${ui.soundOnError}</span></label>
-      </div>
-    </div>
     <button id="findInChatButton" class="icon-btn" type="button" title="${ui.findInChat}" aria-label="${ui.findInChat}" hidden>
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="7" cy="7" r="4.2"/>
@@ -2079,12 +2115,48 @@ export class WebviewController {
         <path d="M13.5 8.5v4a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1h4"/>
       </svg>
     </button>
-    <button id="keyButton" class="icon-btn" type="button" title="${ui.setApiKey}">
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="5" cy="8" r="3"/>
-        <path d="M8 8h6M11 8v2M13.5 8v2"/>
-      </svg>
-    </button>
+    <div class="more-control">
+      <button id="moreButton" class="icon-btn" type="button" title="${ui.moreMenu}" aria-label="${ui.moreMenu}" aria-expanded="false">
+        <svg viewBox="0 0 16 16" fill="currentColor">
+          <circle cx="3.5" cy="8" r="1.3"/>
+          <circle cx="8" cy="8" r="1.3"/>
+          <circle cx="12.5" cy="8" r="1.3"/>
+        </svg>
+      </button>
+      <div id="moreMenu" role="menu" aria-label="${ui.moreMenu}" hidden>
+        <button id="featureSettingsButton" class="more-menu-item" type="button" role="menuitem">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="8" cy="8" r="2"/>
+            <path d="M6.5 1.6h3l.45 1.9 1.55.9 1.9-.5 1.5 2.6-1.45 1.2v1.8l1.45 1.2-1.5 2.6-1.9-.5-1.55.9L9.5 14.4h-3l-.45-1.9-1.55-.9-1.9.5-1.5-2.6 1.45-1.2V7.8L1.6 6.6l1.5-2.6 1.9.5 1.55-.9z"/>
+          </svg>
+          <span>${ui.featureSettings}</span>
+        </button>
+        <div class="sound-control">
+          <button id="soundButton" class="more-menu-item" type="button" role="menuitem" aria-expanded="false">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2.5 6.2h2.3L8 3.5v9L4.8 9.8H2.5z"/>
+              <path d="M10.5 5.5a3.2 3.2 0 0 1 0 5M12.3 3.7a5.7 5.7 0 0 1 0 8.6"/>
+            </svg>
+            <span>${ui.soundSettings}</span>
+          </button>
+          <div id="soundMenu" role="group" aria-label="${ui.soundSettings}" hidden>
+            <div class="sound-menu-title">${ui.soundSettings}</div>
+            <label class="sound-option"><input id="notificationToggle" type="checkbox"><span>${ui.completionNotification}</span></label>
+            <label class="sound-option"><input id="runningSoundToggle" type="checkbox"><span>${ui.soundWhileRunning}</span></label>
+            <label class="sound-option"><input id="completionSoundToggle" type="checkbox"><span>${ui.soundOnComplete}</span></label>
+            <label class="sound-option"><input id="errorSoundToggle" type="checkbox"><span>${ui.soundOnError}</span></label>
+          </div>
+        </div>
+        <div class="more-menu-separator"></div>
+        <button id="keyButton" class="more-menu-item" type="button" role="menuitem">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="5" cy="8" r="3"/>
+            <path d="M8 8h6M11 8v2M13.5 8v2"/>
+          </svg>
+          <span>${ui.setApiKey}</span>
+        </button>
+      </div>
+    </div>
   </div>
 
   <div id="sandboxBanner" role="alert" hidden>
@@ -2097,15 +2169,18 @@ export class WebviewController {
   </div>
 
   <div id="parallelBar" hidden>
-    <div class="parallel-bar-header">
+    <button id="parallelBarToggle" class="parallel-bar-header" type="button" aria-expanded="false" title="${ui.expandParallel}">
       <span id="parallelBarTitle">${ui.parallelAgents}</span>
       <span id="parallelBarCount"></span>
-    </div>
-    <button id="startParallelAgentButton" type="button">
-      <span class="parallel-launch-plus" aria-hidden="true">＋</span>
-      <span>${ui.launchParallelAgent}</span>
+      <span class="parallel-chevron" aria-hidden="true">▸</span>
     </button>
-    <div id="parallelTaskList"></div>
+    <div id="parallelBarBody" hidden>
+      <button id="startParallelAgentButton" type="button">
+        <span class="parallel-launch-plus" aria-hidden="true">＋</span>
+        <span>${ui.launchParallelAgent}</span>
+      </button>
+      <div id="parallelTaskList"></div>
+    </div>
   </div>
 
   <div id="auth">
@@ -2191,7 +2266,7 @@ export class WebviewController {
     <div class="card">
       <div id="dropHint" aria-live="polite">${ui.dropFiles}</div>
       <div id="contextPreviewRow" aria-label="${ui.contextPreview}" hidden></div>
-      <div id="contextRow">
+      <div id="contextRow" hidden>
         <span id="editorChip" class="ctx-chip" hidden>
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
             <path d="M9.5 1.5H4.5a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V4.5l-3-3z"/>
@@ -2211,7 +2286,7 @@ export class WebviewController {
       <textarea id="prompt" placeholder="${ui.prompt}" aria-label="${ui.promptLabel}" rows="2"></textarea>
       <div class="card-row">
         <div class="add-control">
-          <button id="attachButton" class="round-btn" type="button" title="${ui.addContextTools}" aria-expanded="false">
+          <button id="attachButton" class="round-btn" type="button" title="${ui.addContextTools} · ${ui.dropHelp}" aria-expanded="false">
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6">
               <path d="M8 3v10M3 8h10"/>
             </svg>
@@ -2223,7 +2298,7 @@ export class WebviewController {
         <button id="profileChip" type="button"></button>
         <button id="authChip" type="button" title="${ui.setApiKey}">${ui.apiKeyMissing}</button>
         <span class="spacer"></span>
-        <select id="approvalSelect" aria-label="${ui.approvalMode}">
+        <select id="approvalSelect" aria-label="${ui.approvalMode}" tabindex="-1">
           ${SUPPORTS_LOCAL_SANDBOX ? "" : `<option value="safe-worktree">${ui.safeWorktree}</option>`}
           <option value="auto-review">${ui.autoReview}</option>
           <option value="full-access">${ui.fullAccess}</option>
@@ -2280,6 +2355,7 @@ export class WebviewController {
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const i18n = ${JSON.stringify(ui)};
+    const SUPPORTS_LOCAL_SANDBOX = ${SUPPORTS_LOCAL_SANDBOX ? "true" : "false"};
     const messages = document.getElementById("messages");
     const home = document.getElementById("home");
     const tasks = document.getElementById("tasks");
@@ -2314,8 +2390,12 @@ export class WebviewController {
     const contextPreviewRow = document.getElementById("contextPreviewRow");
     const viewAll = document.getElementById("viewAll");
     const parallelBar = document.getElementById("parallelBar");
+    const parallelBarToggle = document.getElementById("parallelBarToggle");
+    const parallelBarBody = document.getElementById("parallelBarBody");
     const parallelBarTitle = document.getElementById("parallelBarTitle");
     const parallelBarCount = document.getElementById("parallelBarCount");
+    const moreButton = document.getElementById("moreButton");
+    const moreMenu = document.getElementById("moreMenu");
     const startParallelAgentButton = document.getElementById("startParallelAgentButton");
     const parallelTaskList = document.getElementById("parallelTaskList");
     const findInChatButton = document.getElementById("findInChatButton");
@@ -2430,10 +2510,33 @@ export class WebviewController {
     let queuedMessages = [];
     let followOutput = true;
 
+    let parallelBarExpanded = false;
+
+    function setMoreMenuOpen(open) {
+      moreMenu.hidden = !open;
+      moreButton.classList.toggle("active", open);
+      moreButton.setAttribute("aria-expanded", String(open));
+      if (!open) {
+        setSoundMenuOpen(false);
+      }
+    }
+
     function setSoundMenuOpen(open) {
       soundMenu.hidden = !open;
       soundButton.classList.toggle("active", open);
       soundButton.setAttribute("aria-expanded", String(open));
+    }
+
+    function setParallelBarExpanded(expanded) {
+      parallelBarExpanded = expanded;
+      parallelBar.classList.toggle("expanded", expanded);
+      parallelBarBody.hidden = !expanded;
+      parallelBarToggle.setAttribute("aria-expanded", String(expanded));
+      parallelBarToggle.title = expanded ? i18n.collapseParallel : i18n.expandParallel;
+    }
+
+    function updateContextRowVisibility() {
+      contextRow.hidden = editorChip.hidden;
     }
 
     function profileLabel(profile) {
@@ -2602,6 +2705,14 @@ export class WebviewController {
       return { text, profile: undefined, commandId: undefined, bestOfN: false, orchestrate: false };
     }
 
+    function approvalModeLabel(mode) {
+      return {
+        "safe-worktree": i18n.safeWorktree,
+        "auto-review": i18n.autoReview,
+        "full-access": i18n.fullAccess,
+      }[mode] || mode;
+    }
+
     function renderMainAddMenu() {
       addMenuContent.innerHTML = "";
       addMenuTitle(i18n.addContextTools);
@@ -2612,6 +2723,15 @@ export class WebviewController {
           closeAddMenu();
         },
       });
+      addMenuRow("◎", i18n.projectMemory, {
+        selected: includeProjectMemory,
+        meta: includeProjectMemory ? "✓" : "",
+        onClick: () => {
+          setIncludeProjectMemory(!includeProjectMemory);
+          requestContextPreview();
+          renderMainAddMenu();
+        },
+      });
       addMenuSeparator();
       for (const profile of ["agent", "plan", "multitask"]) {
         const icons = { agent: "A", plan: "☷", multitask: "⑂" };
@@ -2619,6 +2739,22 @@ export class WebviewController {
           selected: runProfile === profile,
           meta: runProfile === profile ? "✓" : "",
           onClick: () => selectRunProfile(profile),
+        });
+      }
+      addMenuSeparator();
+      addMenuTitle(i18n.approvalMode);
+      const approvalModes = SUPPORTS_LOCAL_SANDBOX
+        ? ["auto-review", "full-access"]
+        : ["safe-worktree", "auto-review", "full-access"];
+      for (const mode of approvalModes) {
+        addMenuRow("⚙", approvalModeLabel(mode), {
+          selected: approvalSelect.value === mode,
+          meta: approvalSelect.value === mode ? "✓" : "",
+          onClick: () => {
+            setApprovalMode(mode);
+            vscode.postMessage({ type: "selectApprovalMode", approvalMode: mode });
+            closeAddMenu();
+          },
         });
       }
       addMenuSeparator();
@@ -3776,6 +3912,7 @@ export class WebviewController {
       attach = value;
       updateProfileChip();
       editorChip.hidden = !attach;
+      updateContextRowVisibility();
       if (attach) vscode.postMessage({ type: "getContext" });
       requestContextPreview();
     }
@@ -4397,7 +4534,19 @@ export class WebviewController {
 
     function renderMarkdown(messageNode, raw) {
       const body = messageBody(messageNode);
-      body.innerHTML = DOMPurify.sanitize(marked.parse(raw));
+      body.innerHTML = DOMPurify.sanitize(marked.parse(raw), {
+        ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|[^a-z]|[a-z+.-]+(?:[^a-z+.\-:]|$))/i,
+      });
+      for (const anchor of body.querySelectorAll("a[href]")) {
+        const href = anchor.getAttribute("href") ?? "";
+        if (/^https?:\\/\\//i.test(href)) {
+          anchor.setAttribute("data-external-url", href);
+          anchor.setAttribute("href", "#");
+          anchor.setAttribute("title", href);
+        } else if (!anchor.hasAttribute("data-workspace-file")) {
+          anchor.removeAttribute("href");
+        }
+      }
       linkifyWorkspaceFiles(body);
       enhanceCodeBlocks(body);
       ensureMessageCopy(messageNode);
@@ -4889,8 +5038,18 @@ export class WebviewController {
       }
     });
     historyButton.addEventListener("click", () => vscode.postMessage({ type: "showHome" }));
-    featureSettingsButton.addEventListener("click", () => vscode.postMessage({ type: "openSettings" }));
-    soundButton.addEventListener("click", () => setSoundMenuOpen(soundMenu.hidden));
+    moreButton.addEventListener("click", () => setMoreMenuOpen(moreMenu.hidden));
+    featureSettingsButton.addEventListener("click", () => {
+      setMoreMenuOpen(false);
+      vscode.postMessage({ type: "openSettings" });
+    });
+    soundButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setSoundMenuOpen(soundMenu.hidden);
+    });
+    parallelBarToggle.addEventListener("click", () => {
+      setParallelBarExpanded(!parallelBarExpanded);
+    });
     notificationToggle.addEventListener("change", () => {
       vscode.postMessage({
         type: "setAlertSetting",
@@ -4987,13 +5146,13 @@ export class WebviewController {
     window.addEventListener("blur", () => {
       closeModelPicker();
       closeAddMenu();
-      setSoundMenuOpen(false);
+      setMoreMenuOpen(false);
     });
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {
         closeModelPicker();
         closeAddMenu();
-        setSoundMenuOpen(false);
+        setMoreMenuOpen(false);
       }
     });
     document.addEventListener("pointerdown", (event) => {
@@ -5003,8 +5162,8 @@ export class WebviewController {
       if (!addMenu.hidden && !document.querySelector(".add-control").contains(event.target)) {
         closeAddMenu();
       }
-      if (!soundMenu.hidden && !document.querySelector(".sound-control").contains(event.target)) {
-        setSoundMenuOpen(false);
+      if (!moreMenu.hidden && !document.querySelector(".more-control").contains(event.target)) {
+        setMoreMenuOpen(false);
       }
     });
     findInChatButton.addEventListener("click", () => openFindBar());
@@ -5044,9 +5203,16 @@ export class WebviewController {
         event.preventDefault();
         setSoundMenuOpen(false);
         soundButton.focus();
+      } else if (event.key === "Escape" && !moreMenu.hidden) {
+        event.preventDefault();
+        setMoreMenuOpen(false);
+        moreButton.focus();
       }
     });
-    document.getElementById("keyButton").addEventListener("click", () => vscode.postMessage({ type: "setApiKey" }));
+    document.getElementById("keyButton").addEventListener("click", () => {
+      setMoreMenuOpen(false);
+      vscode.postMessage({ type: "setApiKey" });
+    });
     authChip.addEventListener("click", () => vscode.postMessage({ type: "setApiKey" }));
     document.getElementById("connectButton").addEventListener("click", () => vscode.postMessage({ type: "setApiKey" }));
     document.getElementById("dashboardButton").addEventListener("click", () => vscode.postMessage({ type: "openDashboard" }));
@@ -5064,6 +5230,13 @@ export class WebviewController {
         void writeClipboard(text).then((ok) => {
           if (ok) flashCopied(copyBtn);
         });
+        return;
+      }
+
+      const external = el?.closest("[data-external-url]");
+      if (external instanceof HTMLElement && external.dataset.externalUrl) {
+        event.preventDefault();
+        vscode.postMessage({ type: "openExternal", path: external.dataset.externalUrl });
         return;
       }
 

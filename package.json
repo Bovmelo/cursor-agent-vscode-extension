@@ -35,6 +35,21 @@
   "extensionDependencies": [
     "vscode.git"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Chat remains available. Hooks, verification commands, autonomous Supervisor, auto-apply, auto-repair, and background agents stay disabled until the workspace is trusted.",
+      "restrictedConfigurations": [
+        "cursorSubscription.preEditCommands",
+        "cursorSubscription.postEditCommands",
+        "cursorSubscription.verificationCommands",
+        "cursorSubscription.autoVerify",
+        "cursorSubscription.autoRepair",
+        "cursorSubscription.supervisorMode",
+        "cursorSubscription.supervisorAutoApplySafeChanges"
+      ]
+    }
+  },
   "activationEvents": [
     "onView:cursorSubscription.chatView",
     "onView:cursorSubscription.changeSessions",

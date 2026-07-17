@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { isPathInside, isPathInsideResolved } from "./safety.js";
 
 export function resolveWorkspaceFolder(
   uri?: vscode.Uri,
@@ -89,6 +90,21 @@ export async function pickWorkspaceFolder(
   return picked?.folder;
 }
 
+function isInsideAnyWorkspaceFolder(absolute: string): boolean {
+  return (vscode.workspace.workspaceFolders ?? []).some((folder) =>
+    isPathInside(folder.uri.fsPath, absolute)
+  );
+}
+
+async function isInsideAnyWorkspaceFolderResolved(absolute: string): Promise<boolean> {
+  for (const folder of vscode.workspace.workspaceFolders ?? []) {
+    if (await isPathInsideResolved(folder.uri.fsPath, absolute)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function resolveAbsoluteInWorkspace(
   filePath: string,
   preferred?: vscode.WorkspaceFolder,
@@ -98,7 +114,8 @@ export function resolveAbsoluteInWorkspace(
     return undefined;
   }
   if (path.isAbsolute(filePath)) {
-    return path.resolve(filePath);
+    const absolute = path.resolve(filePath);
+    return isInsideAnyWorkspaceFolder(absolute) ? absolute : undefined;
   }
   const ordered = preferred
     ? [preferred, ...folders.filter((folder) => folder !== preferred)]
@@ -112,16 +129,28 @@ export function resolveAbsoluteInWorkspace(
     const rest = slash.slice(slashIndex + 1);
     const folder = folders.find((candidate) => candidate.name === folderName);
     if (folder) {
-      return path.resolve(folder.uri.fsPath, rest);
+      const absolute = path.resolve(folder.uri.fsPath, rest);
+      return isPathInside(folder.uri.fsPath, absolute) ? absolute : undefined;
     }
   }
 
   for (const folder of ordered) {
     const absolute = path.resolve(folder.uri.fsPath, filePath);
-    const rel = path.relative(folder.uri.fsPath, absolute);
-    if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
+    if (isPathInside(folder.uri.fsPath, absolute)) {
       return absolute;
     }
   }
-  return path.resolve(ordered[0].uri.fsPath, filePath);
+  return undefined;
+}
+
+/** Lexical resolve plus symlink/realpath containment. */
+export async function resolveAbsoluteInWorkspaceResolved(
+  filePath: string,
+  preferred?: vscode.WorkspaceFolder,
+): Promise<string | undefined> {
+  const absolute = resolveAbsoluteInWorkspace(filePath, preferred);
+  if (!absolute) {
+    return undefined;
+  }
+  return (await isInsideAnyWorkspaceFolderResolved(absolute)) ? absolute : undefined;
 }

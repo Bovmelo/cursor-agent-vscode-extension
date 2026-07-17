@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Harden remaining safety gaps: run hooks/verification via `execFile` (no shell), symlink-aware path containment, transactional isolated apply with rollback, shared chat/Supervisor apply queue and file ownership, unified sensitive-path defaults, and skip baseline backups for excluded paths
+- Scrub secret-like files from isolated worktrees before agents run, run pre-edit hooks for Supervisor/background worktrees, and drop background-worker API key copies after agent creation
+
 ## 0.1.17 - 2026-07-18
 
 - Show `/orchestrate` phase and agent board on the home view, group parallel-bar chips by experiment, and label SDK subagent names in tool progress

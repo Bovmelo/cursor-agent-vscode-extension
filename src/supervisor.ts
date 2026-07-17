@@ -22,6 +22,9 @@ import {
   overlappingTaskIds,
   selectRunnableSupervisorTasks,
 } from "./supervisorScheduling.js";
+import type { ApplyQueue, FileOwnershipCoordinator } from "./parallelOwnership.js";
+import { runConfiguredHooks } from "./hooks.js";
+import { createExcludedPathMatcher, excludedApplyGlobs, globRegex } from "./sensitivePaths.js";
 import { runGit } from "./worktreeLifecycle.js";
 import { configurationFor, resolveWorkspaceFolder } from "./workspaceFolder.js";
 
@@ -134,29 +137,6 @@ type SupervisorExecutor = (
   prompt: string,
 ) => Promise<SupervisorExecutionResult | undefined>;
 
-function globRegex(pattern: string): RegExp {
-  let source = normalizedRelative(pattern.trim());
-  const optionalPrefix = source.startsWith("**/");
-  if (optionalPrefix) {
-    source = source.slice(3);
-  }
-  let result = "";
-  for (let index = 0; index < source.length; index += 1) {
-    const character = source[index];
-    if (character === "*" && source[index + 1] === "*") {
-      result += ".*";
-      index += 1;
-    } else if (character === "*") {
-      result += "[^/]*";
-    } else if (character === "?") {
-      result += "[^/]";
-    } else {
-      result += character.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
-    }
-  }
-  return new RegExp(`^${optionalPrefix ? "(?:.*/)?" : ""}${result}$`, "i");
-}
-
 export class AiSupervisorController
 implements vscode.TreeDataProvider<SupervisorNode>, vscode.TextDocumentContentProvider,
 vscode.CodeLensProvider, vscode.Disposable {
@@ -174,7 +154,9 @@ vscode.CodeLensProvider, vscode.Disposable {
   private scheduler: ReturnType<typeof setTimeout> | undefined;
   private githubScheduler: ReturnType<typeof setTimeout> | undefined;
   private readonly activeRunIds = new Set<string>();
-  private applyQueue: Promise<void> = Promise.resolve();
+  private localApplyQueue: Promise<void> = Promise.resolve();
+  private sharedApplyQueue: ApplyQueue | undefined;
+  private fileOwnership: FileOwnershipCoordinator | undefined;
   private readonly statusBar: vscode.StatusBarItem;
   private treeView: vscode.TreeView<SupervisorNode> | undefined;
 
@@ -211,7 +193,6 @@ vscode.CodeLensProvider, vscode.Disposable {
     this.statusBar.name = "Cursor AI Supervisor";
     this.statusBar.show();
     this.updateStatusBar();
-
     this.disposables.push(
       this.statusBar,
       vscode.workspace.onDidSaveTextDocument((document) => {
@@ -243,6 +224,14 @@ vscode.CodeLensProvider, vscode.Disposable {
       }),
     );
     this.scheduleGitHubScan();
+  }
+
+  public setApplyCoordination(
+    applyQueue: ApplyQueue,
+    fileOwnership: FileOwnershipCoordinator,
+  ): void {
+    this.sharedApplyQueue = applyQueue;
+    this.fileOwnership = fileOwnership;
   }
 
   public setAuditSink(onAudit: (event: SupervisorAuditEvent) => void): void {
@@ -682,10 +671,16 @@ vscode.CodeLensProvider, vscode.Disposable {
       }
       return;
     }
-    if (!force && (
-      !vscode.workspace.isTrusted
-      || !this.configuration().get<boolean>("supervisorGitHubTrigger", false)
-    )) {
+    if (!vscode.workspace.isTrusted) {
+      if (force) {
+        void vscode.window.showWarningMessage(this.text(
+          "GitHub Supervisor scans require a trusted workspace.",
+          "GitHub Supervisorスキャンには信頼済みワークスペースが必要です。",
+        ));
+      }
+      return;
+    }
+    if (!force && !this.configuration().get<boolean>("supervisorGitHubTrigger", false)) {
       return;
     }
     const workspace = resolveWorkspaceFolder(vscode.window.activeTextEditor?.document.uri)
@@ -875,6 +870,15 @@ vscode.CodeLensProvider, vscode.Disposable {
   }
 
   public async runTask(target: SupervisorTaskTarget | string | undefined, automatic = false): Promise<void> {
+    if (!vscode.workspace.isTrusted) {
+      if (!automatic) {
+        void vscode.window.showWarningMessage(this.text(
+          "AI Supervisor runs require a trusted workspace.",
+          "AI Supervisorの実行には信頼済みワークスペースが必要です。",
+        ));
+      }
+      return;
+    }
     let taskId = typeof target === "string" ? target : target?.taskId;
     if (!taskId && !automatic) {
       const candidates = this.tasks.filter((task) =>
@@ -1059,7 +1063,7 @@ vscode.CodeLensProvider, vscode.Disposable {
 
       if (this.shouldAutoApply(task)) {
         await this.enqueueAutomaticApply(task.id);
-      } else {
+      } else if (!automatic) {
         const openLabel = this.text("Open inbox", "受信箱を開く");
         const answer = await vscode.window.showInformationMessage(
           this.text(
@@ -1071,6 +1075,10 @@ vscode.CodeLensProvider, vscode.Disposable {
         if (answer === openLabel) {
           await vscode.commands.executeCommand("cursorSubscription.supervisorTasks.focus");
         }
+      } else {
+        this.output.appendLine(
+          `[${new Date().toISOString()}] AI Supervisor prepared ${task.changes.length} change(s) for review (task ${task.id}).`,
+        );
       }
     } catch (error) {
       task.status = "failed";
@@ -1146,46 +1154,55 @@ vscode.CodeLensProvider, vscode.Disposable {
   }
 
   public async applyChange(target: SupervisorTaskTarget | undefined): Promise<void> {
-    const task = this.findTask(target?.taskId);
-    const change = task?.changes?.find((candidate) => candidate.relative === target?.relative);
-    if (!task || !change || change.decision) {
+    if (!vscode.workspace.isTrusted) {
+      void vscode.window.showWarningMessage(this.text(
+        "Applying AI Supervisor changes requires a trusted workspace.",
+        "AI Supervisorの変更適用には信頼済みワークスペースが必要です。",
+      ));
       return;
     }
-    if (change.excluded) {
-      const applyLabel = this.text("Apply anyway", "それでも適用");
-      const answer = await vscode.window.showWarningMessage(
-        this.text(
-          `${change.relative} matches an excluded path. Apply it anyway?`,
-          `${change.relative} は除外パスに一致します。それでも適用しますか？`,
-        ),
-        { modal: true },
-        applyLabel,
-      );
-      if (answer !== applyLabel) {
+    await this.enqueueApply(async () => {
+      const task = this.findTask(target?.taskId);
+      const change = task?.changes?.find((candidate) => candidate.relative === target?.relative);
+      if (!task || !change || change.decision) {
         return;
       }
-    }
-    task.status = "applying";
-    this.refresh();
-    try {
-      await this.applyOne(task, change);
-      change.decision = "applied";
-      this.emitAudit({
-        action: "supervisor.apply",
-        summary: `Applied ${change.relative}`,
-        files: [change.relative],
-        taskId: task.id,
-      });
-      await this.finishDecisions(task);
-    } catch (error) {
-      task.status = task.blockedReasons?.length ? "blocked" : "review";
-      const message = error instanceof Error ? error.message : String(error);
-      void vscode.window.showErrorMessage(message);
-    } finally {
-      task.updatedAt = Date.now();
-      await this.persist();
+      if (change.excluded) {
+        const applyLabel = this.text("Apply anyway", "それでも適用");
+        const answer = await vscode.window.showWarningMessage(
+          this.text(
+            `${change.relative} matches an excluded path. Apply it anyway?`,
+            `${change.relative} は除外パスに一致します。それでも適用しますか？`,
+          ),
+          { modal: true },
+          applyLabel,
+        );
+        if (answer !== applyLabel) {
+          return;
+        }
+      }
+      task.status = "applying";
       this.refresh();
-    }
+      try {
+        await this.applyOne(task, change);
+        change.decision = "applied";
+        this.emitAudit({
+          action: "supervisor.apply",
+          summary: `Applied ${change.relative}`,
+          files: [change.relative],
+          taskId: task.id,
+        });
+        await this.finishDecisions(task);
+      } catch (error) {
+        task.status = task.blockedReasons?.length ? "blocked" : "review";
+        const message = error instanceof Error ? error.message : String(error);
+        void vscode.window.showErrorMessage(message);
+      } finally {
+        task.updatedAt = Date.now();
+        await this.persist();
+        this.refresh();
+      }
+    });
   }
 
   public async discardChange(target: SupervisorTaskTarget | undefined): Promise<void> {
@@ -1208,61 +1225,73 @@ vscode.CodeLensProvider, vscode.Disposable {
   }
 
   public async applyAll(target: SupervisorTaskTarget | string | undefined, automatic = false): Promise<void> {
-    const taskId = typeof target === "string" ? target : target?.taskId;
-    const task = this.findTask(taskId);
-    if (!task?.changes?.length) {
+    if (!vscode.workspace.isTrusted) {
+      if (!automatic) {
+        void vscode.window.showWarningMessage(this.text(
+          "Applying AI Supervisor changes requires a trusted workspace.",
+          "AI Supervisorの変更適用には信頼済みワークスペースが必要です。",
+        ));
+      }
       return;
     }
-    if (!automatic) {
-      const applyLabel = this.text("Apply all", "すべて適用");
-      const warning = task.blockedReasons?.length
-        ? `\n\n${task.blockedReasons.join("\n")}`
-        : "";
-      const answer = await vscode.window.showWarningMessage(
-        this.text(
-          `Apply all pending AI Supervisor changes?${warning}`,
-          `AI Supervisorの確認待ち変更をすべて適用しますか？${warning}`,
-        ),
-        { modal: true },
-        applyLabel,
-      );
-      if (answer !== applyLabel) {
+    await this.enqueueApply(async () => {
+      const taskId = typeof target === "string" ? target : target?.taskId;
+      const task = this.findTask(taskId);
+      if (!task?.changes?.length) {
         return;
       }
-    }
-    task.status = "applying";
-    this.refresh();
-    const conflicts: string[] = [];
-    for (const change of task.changes.filter((candidate) => !candidate.decision)) {
-      if (change.excluded && automatic) {
-        continue;
+      if (!automatic) {
+        const applyLabel = this.text("Apply all", "すべて適用");
+        const warning = task.blockedReasons?.length
+          ? `\n\n${task.blockedReasons.join("\n")}`
+          : "";
+        const answer = await vscode.window.showWarningMessage(
+          this.text(
+            `Apply all pending AI Supervisor changes?${warning}`,
+            `AI Supervisorの確認待ち変更をすべて適用しますか？${warning}`,
+          ),
+          { modal: true },
+          applyLabel,
+        );
+        if (answer !== applyLabel) {
+          return;
+        }
       }
-      try {
-        await this.applyOne(task, change);
-        change.decision = "applied";
-      } catch (error) {
-        conflicts.push(`${change.relative}: ${error instanceof Error ? error.message : String(error)}`);
+      task.status = "applying";
+      this.refresh();
+      const conflicts: string[] = [];
+      for (const change of task.changes.filter((candidate) => !candidate.decision)) {
+        // Excluded paths always need an explicit per-file "Apply anyway" confirmation.
+        if (change.excluded) {
+          continue;
+        }
+        try {
+          await this.applyOne(task, change);
+          change.decision = "applied";
+        } catch (error) {
+          conflicts.push(`${change.relative}: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
-    }
-    if (conflicts.length > 0) {
-      task.status = task.blockedReasons?.length ? "blocked" : "review";
-      task.error = conflicts.join("\n");
-      void vscode.window.showWarningMessage(this.text(
-        `${conflicts.length} file(s) changed while AI was running and were not applied.`,
-        `${conflicts.length}ファイルがAI実行中に更新されたため適用しませんでした。`,
-      ));
-    } else {
-      this.emitAudit({
-        action: "supervisor.applyAll",
-        summary: `Applied all changes for ${task.title}`,
-        files: task.changes.filter((change) => change.decision === "applied").map((change) => change.relative),
-        taskId: task.id,
-      });
-    }
-    await this.finishDecisions(task);
-    task.updatedAt = Date.now();
-    await this.persist();
-    this.refresh();
+      if (conflicts.length > 0) {
+        task.status = task.blockedReasons?.length ? "blocked" : "review";
+        task.error = conflicts.join("\n");
+        void vscode.window.showWarningMessage(this.text(
+          `${conflicts.length} file(s) changed while AI was running and were not applied.`,
+          `${conflicts.length}ファイルがAI実行中に更新されたため適用しませんでした。`,
+        ));
+      } else {
+        this.emitAudit({
+          action: "supervisor.applyAll",
+          summary: `Applied all changes for ${task.title}`,
+          files: task.changes.filter((change) => change.decision === "applied").map((change) => change.relative),
+          taskId: task.id,
+        });
+      }
+      await this.finishDecisions(task);
+      task.updatedAt = Date.now();
+      await this.persist();
+      this.refresh();
+    });
   }
 
   public async discardAll(target: SupervisorTaskTarget | string | undefined): Promise<void> {
@@ -1542,11 +1571,18 @@ vscode.CodeLensProvider, vscode.Disposable {
   }
 
   private async enqueueAutomaticApply(taskId: string): Promise<void> {
-    const operation = this.applyQueue
-      .catch(() => {})
-      .then(() => this.applyAll({ taskId }, true));
-    this.applyQueue = operation;
-    await operation;
+    // applyAll already serializes through enqueueApply.
+    await this.applyAll({ taskId }, true);
+  }
+
+  private async enqueueApply(operation: () => Promise<void>): Promise<void> {
+    if (this.sharedApplyQueue) {
+      await this.sharedApplyQueue.run(operation);
+      return;
+    }
+    const queued = this.localApplyQueue.catch(() => {}).then(operation);
+    this.localApplyQueue = queued;
+    await queued;
   }
 
   private withinHourlyBudget(): boolean {
@@ -1555,23 +1591,16 @@ vscode.CodeLensProvider, vscode.Disposable {
     return this.tasks.filter((task) => (task.runStartedAt ?? 0) >= cutoff).length < maximum;
   }
 
-  private excludedPatterns(): RegExp[] {
-    return this.configuration()
-      .get<string[]>("supervisorExcludedGlobs", [])
-      .filter((pattern) => pattern.trim().length > 0)
-      .map(globRegex);
-  }
-
-  private isExcluded(relative: string): boolean {
-    const normalized = normalizedRelative(relative);
-    return this.excludedPatterns().some((pattern) => pattern.test(normalized));
+  private isExcluded(relative: string, root?: string): boolean {
+    const uri = root ? vscode.Uri.file(root) : resolveWorkspaceFolder()?.uri;
+    return createExcludedPathMatcher(uri)(normalizedRelative(relative));
   }
 
   private taskPrompt(task: SupervisorTask): string {
     const maximumFiles = this.configuration().get<number>("supervisorMaxFiles", 5);
     const maximumLines = this.configuration().get<number>("supervisorMaxChangedLines", 300);
     const maximumMinutes = this.configuration().get<number>("supervisorMaxRunMinutes", 15);
-    const exclusions = this.configuration().get<string[]>("supervisorExcludedGlobs", []);
+    const exclusions = excludedApplyGlobs(vscode.Uri.file(task.root));
     return [
       task.detail,
       task.dependencyIds?.length
@@ -1584,7 +1613,7 @@ vscode.CodeLensProvider, vscode.Disposable {
       `Keep the change within ${maximumFiles} files and approximately ${maximumLines} changed lines.`,
       `Finish within the ${maximumMinutes}-minute execution budget.`,
       exclusions.length > 0
-        ? `Do not modify paths matching: ${exclusions.join(", ")}.`
+        ? `Do not read or modify paths matching: ${exclusions.join(", ")}. Secret-like files are removed from this worktree.`
         : undefined,
       "Do not stop after explaining the fix; implement it and report validation and remaining risks.",
       "For every file you change, record one concise reason explaining why that file had to change.",
@@ -1651,8 +1680,10 @@ vscode.CodeLensProvider, vscode.Disposable {
       storageRoot: this.storageRoot,
       worktreesHomeSegment: ".cursor-supervisor/worktrees",
       baselinesFolder: "supervisor-baselines",
-      isExcluded: (relative) => this.isExcluded(relative),
+      isExcluded: (relative) => this.isExcluded(relative, task.root),
       pathEscapeLabel: "AI Supervisor",
+      beforeCaptureBaseline: (worktreePath) =>
+        runConfiguredHooks("preEdit", worktreePath, this.output),
       onLog: (message) => this.output.appendLine(
         message.replace("Could not link node_modules", "AI Supervisor could not link node_modules"),
       ),
@@ -1671,7 +1702,7 @@ vscode.CodeLensProvider, vscode.Disposable {
       return [];
     }
     return collectIsolatedChanges(session, this.storageRoot, {
-      isExcluded: (relative) => this.isExcluded(relative),
+      isExcluded: (relative) => this.isExcluded(relative, task.root),
       pathEscapeLabel: "AI Supervisor",
       missingBaselineMessage: (relative) => this.text(
         `The Supervisor baseline for ${relative} is unavailable.`,
@@ -1704,21 +1735,34 @@ vscode.CodeLensProvider, vscode.Disposable {
     if (!session) {
       throw new Error(this.text("The isolated worktree is unavailable.", "隔離worktreeを利用できません。"));
     }
-    await applyIsolatedChange(session, this.storageRoot, change, {
-      pathEscapeLabel: "AI Supervisor",
-      unavailableMessage: this.text(
-        "The isolated worktree is unavailable.",
-        "隔離worktreeを利用できません。",
-      ),
-      conflictMessage: this.text(
-        "The file changed after the Supervisor task started. Review and merge it manually.",
-        "Supervisor開始後にファイルが変更されています。手動で確認してマージしてください。",
-      ),
-      missingBaselineMessage: (relative) => this.text(
-        `The Supervisor baseline for ${relative} is unavailable.`,
-        `${relative} のSupervisorベースラインを利用できません。`,
-      ),
-    });
+    const lease = this.fileOwnership
+      ? await this.fileOwnership.acquire(
+        `supervisor:${task.id}`,
+        [
+          path.join(task.root, ".cursor-parallel-workspace-owner"),
+          path.join(task.root, change.relative),
+        ],
+      )
+      : undefined;
+    try {
+      await applyIsolatedChange(session, this.storageRoot, change, {
+        pathEscapeLabel: "AI Supervisor",
+        unavailableMessage: this.text(
+          "The isolated worktree is unavailable.",
+          "隔離worktreeを利用できません。",
+        ),
+        conflictMessage: this.text(
+          "The file changed after the Supervisor task started. Review and merge it manually.",
+          "Supervisor開始後にファイルが変更されています。手動で確認してマージしてください。",
+        ),
+        missingBaselineMessage: (relative) => this.text(
+          `The Supervisor baseline for ${relative} is unavailable.`,
+          `${relative} のSupervisorベースラインを利用できません。`,
+        ),
+      });
+    } finally {
+      lease?.release();
+    }
   }
 
   private async finishDecisions(task: SupervisorTask): Promise<void> {

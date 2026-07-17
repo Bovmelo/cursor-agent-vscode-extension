@@ -1,10 +1,8 @@
 import assert from "node:assert/strict";
 import {
   access,
-  lstat,
   mkdir,
   mkdtemp,
-  readFile,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -74,10 +72,10 @@ test("managed worktrees clean up preparation failures and dead-process orphans",
       worktreesRoot: managedRoot,
     });
     await linkManagedNodeModules(repository, orphanPath);
-    assert.equal((await lstat(path.join(orphanPath, "node_modules"))).isSymbolicLink(), true);
     assert.equal(
-      await readFile(path.join(orphanPath, "node_modules", "marker.txt"), "utf8"),
-      "linked\n",
+      await missing(path.join(orphanPath, "node_modules")),
+      true,
+      "managed worktrees must not expose the host dependency tree for agent writes",
     );
     assert.deepEqual(
       await cleanupOrphanedManagedWorktrees(repository, [homeSegment], undefined, {

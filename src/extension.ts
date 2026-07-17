@@ -9,10 +9,12 @@ import {
   AgentBusyError,
   Cursor,
   CursorAgentError,
+  type McpServerConfig,
   type ModelParameterValue,
   type ModelSelection,
   type RunResult,
   type SDKImage,
+  type SettingSource,
 } from "@cursor/sdk";
 import * as vscode from "vscode";
 import { AgentFactory } from "./agentFactory.js";
@@ -66,6 +68,7 @@ import {
 } from "./networkEnvironment.js";
 import {
   expandProjectCommand,
+  filterEnabledProjectCommands,
   loadProjectCommands,
   type ProjectCommand,
 } from "./projectCommands.js";
@@ -84,18 +87,25 @@ import {
 } from "./auditLog.js";
 import { IntegrationCatalogController } from "./integrationCatalogView.js";
 import {
-  attachSubtasks,
+  INTEGRATION_TOGGLE_KEY,
+  type IntegrationToggleState,
+} from "./integrationCatalog.js";
+import {
   buildOrchestratorDetail,
+  buildOrchestratorPlanPrompt,
   buildSynthesisPrompt,
   createOrchestratorExperiment,
   extractSubagentName,
+  launchOrchestratorSubtasks,
   markSubtaskConversation,
+  markSubtaskLaunch,
   markSubtaskStatus,
   orchestratorSummaries,
-  parseOrchestratorSubtasks,
+  resolveOrchestratorPlan,
   type OrchestratorActivity,
   type OrchestratorExperiment,
 } from "./orchestrator.js";
+import { createExcludedPathMatcher } from "./sensitivePaths.js";
 import { scanTodoAiComments } from "./todoScanner.js";
 import {
   createExecutionPlan,
@@ -118,7 +128,7 @@ import {
   type UsageSource,
   type UsageSummary,
 } from "./usageStats.js";
-import { pickWorkspaceFolder, resolveWorkspaceFolder, configurationFor, workspaceDisplayName, resolveAbsoluteInWorkspace, workspaceFolderFromUri, defaultWorkspaceFolder } from "./workspaceFolder.js";
+import { pickWorkspaceFolder, resolveWorkspaceFolder, configurationFor, workspaceDisplayName, resolveAbsoluteInWorkspace, resolveAbsoluteInWorkspaceResolved, workspaceFolderFromUri, defaultWorkspaceFolder } from "./workspaceFolder.js";
 import { WebviewController } from "./webviewController.js";
 import { cleanupOrphanedManagedWorktrees } from "./worktreeLifecycle.js";
 import { ApplyQueue, FileOwnershipCoordinator } from "./parallelOwnership.js";
@@ -204,6 +214,8 @@ export function activate(context: vscode.ExtensionContext): void {
     context.storageUri ?? context.globalStorageUri,
     () => configuredAiFeatureEnabled("enableChangeSessions"),
   );
+  const sharedApplyQueue = new ApplyQueue();
+  const sharedFileOwnership = new FileOwnershipCoordinator();
   const supervisor = new AiSupervisorController(
     context.workspaceState,
     context.storageUri ?? context.globalStorageUri,
@@ -211,6 +223,7 @@ export function activate(context: vscode.ExtensionContext): void {
     IS_JAPANESE,
     () => configuredAiFeatureEnabled("enableAiSupervisor"),
   );
+  supervisor.setApplyCoordination(sharedApplyQueue, sharedFileOwnership);
   const supervisorRunner = new SupervisorAgentRunner(context, output);
   const provider = new CursorChatProvider(
     context,
@@ -219,6 +232,7 @@ export function activate(context: vscode.ExtensionContext): void {
     changeSessions,
     reviewDiagnostics,
   );
+  provider.setApplyCoordination(sharedApplyQueue, sharedFileOwnership);
   const auditTimeline = new AuditTimelineController(context.workspaceState, IS_JAPANESE);
   provider.setAuditTimeline(auditTimeline);
   const backgroundJobs = new BackgroundJobsController(
@@ -231,6 +245,10 @@ export function activate(context: vscode.ExtensionContext): void {
       summary: `${action === "background.cancel" ? "Cancelled" : "Discarded"} background job: ${job.title}`,
     }),
   );
+  provider.setCredentialRevocationHandlers({
+    cancelBackgroundJobs: () => backgroundJobs.cancelAllRunning(),
+    cancelSupervisor: () => supervisorRunner.cancel(),
+  });
   const cleanupChatWorktrees = (folder: vscode.WorkspaceFolder): void => {
     void cleanupOrphanedManagedWorktrees(
       folder.uri.fsPath,
@@ -289,8 +307,8 @@ export function activate(context: vscode.ExtensionContext): void {
     void context.workspaceState.update(UNTRUSTED_WORKSPACE_WARNING_KEY, true);
     void vscode.window.showInformationMessage(
       localize(
-        "This workspace is not trusted. Autonomous Supervisor, auto-apply, auto-repair, and similar automation are restricted until you trust the workspace.",
-        "このワークスペースは信頼されていません。ワークスペースを信頼するまで、Autonomous Supervisor、自動適用、自動修復などの自動化は制限されます。",
+        "This workspace is not trusted. Autonomous Supervisor, auto-apply, auto-repair, hooks, verification, and similar automation are restricted until you trust the workspace.",
+        "このワークスペースは信頼されていません。ワークスペースを信頼するまで、Autonomous Supervisor、自動適用、自動修復、フック、検証などの自動化は制限されます。",
       ),
     );
   }
@@ -529,19 +547,27 @@ export function activate(context: vscode.ExtensionContext): void {
       provider.executeLastPlan()),
     vscode.commands.registerCommand("cursorSubscription.exportAuditLog", () =>
       provider.exportAuditLog()),
-    vscode.commands.registerCommand("cursorSubscription.refreshIntegrations", () =>
-      integrations.refresh()),
+    vscode.commands.registerCommand("cursorSubscription.refreshIntegrations", async () => {
+      await integrations.refresh();
+      await provider.refreshIntegrationIndex();
+    }),
     vscode.commands.registerCommand(
       "cursorSubscription.previewIntegration",
       (target?: string) => integrations.preview(target),
     ),
     vscode.commands.registerCommand(
       "cursorSubscription.enableIntegration",
-      (target?: string) => integrations.toggle(target, true),
+      async (target?: string) => {
+        await integrations.toggle(target, true);
+        await provider.refreshIntegrationIndex();
+      },
     ),
     vscode.commands.registerCommand(
       "cursorSubscription.disableIntegration",
-      (target?: string) => integrations.toggle(target, false),
+      async (target?: string) => {
+        await integrations.toggle(target, false);
+        await provider.refreshIntegrationIndex();
+      },
     ),
     vscode.commands.registerCommand(
       "cursorSubscription.openIntegration",
@@ -589,18 +615,25 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private readonly inlineCompletionCache = new Map<string, string>();
   private readonly inlineCompletionInFlight = new Map<string, Promise<string>>();
   private readonly inlineCompletionGeneration = new Map<string, number>();
-  private readonly fileOwnership = new FileOwnershipCoordinator();
-  private readonly parallelApplyQueue = new ApplyQueue();
+  private fileOwnership = new FileOwnershipCoordinator();
+  private parallelApplyQueue = new ApplyQueue();
   private auditTimeline?: AuditTimelineController;
   private auditWriteQueue: Promise<void> = Promise.resolve();
   private readonly previewContents = new Map<string, string>();
   private projectCommands: ProjectCommand[] = [];
+  private readonly skillIntegrationIdsByName = new Map<string, string[]>();
+  private readonly planArtifactRetries = new Map<string, number>();
   private bestOfNExperiments: BestOfNExperiment[];
   private readonly bestOfNArtifacts = new Map<
     string,
     { session: IsolatedWorktreeSession; changes: IsolatedChange[]; root: string }
   >();
   private orchestratorExperiments: OrchestratorExperiment[];
+  private orchestratorUpdateChain: Promise<void> = Promise.resolve();
+  private credentialRevocation?: {
+    cancelBackgroundJobs: () => Promise<void>;
+    cancelSupervisor: () => Promise<void>;
+  };
   /** Live tool activity for orchestrator-linked conversations (conversationId → activity). */
   private readonly orchestratorActivityByConversationId = new Map<string, OrchestratorActivity>();
   private executionPlans: ExecutionPlan[];
@@ -645,8 +678,29 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.executionPlans = context.workspaceState.get<ExecutionPlan[]>(EXECUTION_PLANS_KEY, []);
   }
 
+  public setApplyCoordination(
+    applyQueue: ApplyQueue,
+    fileOwnership: FileOwnershipCoordinator,
+  ): void {
+    this.parallelApplyQueue = applyQueue;
+    this.fileOwnership = fileOwnership;
+  }
+
   public setAuditTimeline(timeline: AuditTimelineController): void {
     this.auditTimeline = timeline;
+  }
+
+  public setCredentialRevocationHandlers(handlers: {
+    cancelBackgroundJobs: () => Promise<void>;
+    cancelSupervisor: () => Promise<void>;
+  }): void {
+    this.credentialRevocation = handlers;
+  }
+
+  private async withOrchestratorLock<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.orchestratorUpdateChain.then(fn);
+    this.orchestratorUpdateChain = run.then(() => undefined, () => undefined);
+    return run;
   }
 
   private get conversations(): Conversation[] {
@@ -669,24 +723,6 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
     view.webview.onDidReceiveMessage(
       async (raw: unknown) => {
-        if (raw && typeof raw === "object") {
-          const direct = raw as Record<string, unknown>;
-          if (direct.type === "startOrchestrate" && typeof direct.prompt === "string") {
-            await this.startOrchestrate(
-              direct.prompt.trim(),
-              direct.attachContext === true,
-              Array.isArray(direct.files)
-                ? direct.files.filter((file): file is string => typeof file === "string")
-                : [],
-              this.isRunProfile(direct.profile) ? direct.profile : "agent",
-              Array.isArray(direct.skills)
-                ? direct.skills.filter((skill): skill is string => typeof skill === "string")
-                : [],
-              direct.includeProjectMemory !== false,
-            );
-            return;
-          }
-        }
         const message = parseWebviewMessage(raw);
         if (!message) {
           return;
@@ -872,6 +908,22 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               );
             }
             break;
+          case "startOrchestrate":
+            if (typeof message.prompt === "string") {
+              await this.startOrchestrate(
+                message.prompt.trim(),
+                message.attachContext === true,
+                Array.isArray(message.files)
+                  ? message.files.filter((file): file is string => typeof file === "string")
+                  : [],
+                this.isRunProfile(message.profile) ? message.profile : "agent",
+                Array.isArray(message.skills)
+                  ? message.skills.filter((skill): skill is string => typeof skill === "string")
+                  : [],
+                message.includeProjectMemory !== false,
+              );
+            }
+            break;
           case "pickBestOfNWinner":
             if (typeof message.id === "string") {
               await this.pickBestOfNWinner(message.id);
@@ -924,6 +976,25 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           case "openDiff":
             if (typeof message.path === "string") {
               await this.openDiff(message.path);
+            }
+            break;
+          case "openExternal":
+            if (typeof message.path === "string") {
+              const url = message.path.trim();
+              if (/^https?:\/\//i.test(url)) {
+                const openLabel = localize("Open", "開く");
+                const answer = await vscode.window.showWarningMessage(
+                  localize(
+                    `Open this external link?\n${url}`,
+                    `この外部リンクを開きますか？\n${url}`,
+                  ),
+                  { modal: true },
+                  openLabel,
+                );
+                if (answer === openLabel) {
+                  await vscode.env.openExternal(vscode.Uri.parse(url));
+                }
+              }
             }
             break;
           case "sandboxLearnMore":
@@ -1086,6 +1157,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     await this.cancelAllChats();
     await this.disposeAgent();
     await this.context.secrets.store(API_KEY_SECRET, apiKey.trim());
+    await this.revokeStoredCredentials();
     await this.publishAuthState();
     void vscode.window.showInformationMessage(localize(
       "The Cursor API key was stored securely.",
@@ -1112,7 +1184,19 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     await this.cancelAllChats();
     await this.disposeAgent();
     await this.context.secrets.delete(API_KEY_SECRET);
+    await this.revokeStoredCredentials();
     await this.publishAuthState();
+  }
+
+  private async revokeStoredCredentials(): Promise<void> {
+    if (this.credentialRevocation) {
+      await this.credentialRevocation.cancelBackgroundJobs();
+      await this.credentialRevocation.cancelSupervisor();
+    }
+    for (const conversation of this.conversations) {
+      conversation.agentId = undefined;
+    }
+    await this.saveConversations();
   }
 
   public previewContentProvider(): vscode.TextDocumentContentProvider {
@@ -1223,7 +1307,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
   public async openAuditFile(_entry: AuditEntry, file: string): Promise<void> {
     const workspace = this.resolveChatWorkspace() ?? defaultWorkspaceFolder();
-    const absolute = resolveAbsoluteInWorkspace(file, workspace);
+    const absolute = await resolveAbsoluteInWorkspaceResolved(file, workspace);
     if (!absolute || !vscode.workspace.getWorkspaceFolder(vscode.Uri.file(absolute))) {
       void vscode.window.showWarningMessage(localize(
         "The audit entry points outside the open workspace and was not opened.",
@@ -1270,7 +1354,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             "バックグラウンドAgentの実行中にワークスペースが変更されました。",
           ),
           missingBaselineMessage: (relative) => `Background baseline is unavailable for ${relative}.`,
-          autoMerge: true,
+          autoMerge: false,
         });
       } finally {
         lease.release();
@@ -1506,13 +1590,43 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     )) {
       return;
     }
-    const steps = parseExecutionPlanSteps(assistantText);
+    let steps = parseExecutionPlanSteps(assistantText);
+    let usedFallback = false;
     if (steps.length === 0) {
-      return;
+      const retries = this.planArtifactRetries.get(conversationId) ?? 0;
+      if (retries < 1) {
+        this.planArtifactRetries.set(conversationId, retries + 1);
+        await this.enqueueMessage(
+          [
+            "Your previous Plan response omitted the required machine-readable steps.",
+            "Return only a JSON array inside <CURSOR_EXECUTION_PLAN>...</CURSOR_EXECUTION_PLAN>.",
+            'Each item must be {"title":"short title","prompt":"complete standalone implementation instruction"}.',
+            "Do not edit files.",
+          ].join("\n"),
+          false,
+          [],
+          "plan",
+          [],
+          false,
+          undefined,
+          false,
+          conversationId,
+        );
+        return;
+      }
+      steps = [{ title: "Execute request", prompt }];
+      usedFallback = true;
     }
+    this.planArtifactRetries.delete(conversationId);
     const plan = createExecutionPlan(prompt, conversationId, steps);
     this.executionPlans = [plan, ...this.executionPlans].slice(0, 20);
     await this.persistExecutionPlans();
+    if (usedFallback) {
+      void vscode.window.showWarningMessage(localize(
+        "The planner omitted executable JSON twice. Continuing with the original request as one checkpointed step.",
+        "プランナーが2回続けて実行用JSONを返さなかったため、元の依頼を1件のチェックポイント付きステップとして続行します。",
+      ));
+    }
     const executeLabel = localize("Execute steps", "ステップを実行");
     const answer = await vscode.window.showInformationMessage(
       localize(
@@ -1671,14 +1785,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.postView();
     this.postWorkspaceLabel();
 
-    const planPrompt = [
-      trimmed,
-      "",
-      "Break this request into parallel subtasks for independent agents.",
-      "Respond with a JSON array inside <ORCHESTRATOR_SUBTASKS>...</ORCHESTRATOR_SUBTASKS>.",
-      'Each item must be {"title":"short title","prompt":"full agent prompt"}.',
-      "Planning only: do not edit files.",
-    ].join("\n");
+    const planPrompt = buildOrchestratorPlanPrompt(trimmed);
 
     await this.enqueueMessage(
       planPrompt,
@@ -1943,133 +2050,230 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     progressState: "completed" | "stopped" | "error",
     assistantText: string,
   ): Promise<void> {
-    const planIndex = this.orchestratorExperiments.findIndex(
-      (experiment) =>
-        experiment.planConversationId === conversationId
-        && experiment.status === "planning",
-    );
-    if (planIndex >= 0) {
-      let experiment = this.orchestratorExperiments[planIndex];
-      if (progressState !== "completed") {
-        experiment = {
-          ...experiment,
-          status: "failed",
-          error: progressState === "stopped"
-            ? "Planning was stopped."
-            : "Planning failed.",
-        };
-        this.orchestratorExperiments[planIndex] = experiment;
-        await this.saveOrchestratorExperiments();
-        return;
-      }
-      const parsed = parseOrchestratorSubtasks(assistantText);
-      experiment = attachSubtasks(experiment, parsed);
-      if (experiment.status === "failed") {
-        this.orchestratorExperiments[planIndex] = experiment;
-        await this.saveOrchestratorExperiments();
-        void vscode.window.showWarningMessage(
-          localize(
-            experiment.error ?? "Orchestrator planning produced no subtasks.",
-            experiment.error ?? "オーケストレーターの計画でサブタスクが生成されませんでした。",
-          ),
-        );
-        return;
-      }
-      const workspaceFolderUri = this.resolveChatWorkspace()?.uri.toString();
-      for (const subtask of experiment.subtasks) {
-        const conversation: Conversation = {
-          id: randomUUID(),
-          title: makeConversationTitle(`[${subtask.title}] ${experiment.prompt}`),
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          workspaceFolderUri,
-          orchestratorExperimentId: experiment.id,
-          orchestratorRole: "subtask",
-          transcript: [],
-        };
-        this.conversations.unshift(conversation);
-        experiment = markSubtaskConversation(experiment, subtask.id, conversation.id);
-        await this.enqueueMessage(
-          subtask.prompt,
-          false,
-          [],
-          "agent",
-          [],
-          false,
-          undefined,
-          false,
-          conversation.id,
-        );
-      }
-      this.orchestratorExperiments[planIndex] = experiment;
-      await this.saveOrchestratorExperiments();
-      await this.saveConversations();
-      return;
-    }
-
-    const subtaskIndex = this.orchestratorExperiments.findIndex(
-      (experiment) =>
-        experiment.status === "running"
-        && experiment.subtasks.some((subtask) => subtask.conversationId === conversationId),
-    );
-    if (subtaskIndex >= 0) {
-      let experiment = markSubtaskStatus(
-        this.orchestratorExperiments[subtaskIndex],
-        conversationId,
-        progressState === "completed" ? "completed" : "failed",
+    return this.withOrchestratorLock(async () => {
+      const planIndex = this.orchestratorExperiments.findIndex(
+        (experiment) =>
+          experiment.planConversationId === conversationId
+          && experiment.status === "planning",
       );
-      if (experiment.status === "synthesizing") {
+      if (planIndex >= 0) {
+        let experiment = this.orchestratorExperiments[planIndex];
+        if (progressState !== "completed") {
+          experiment = {
+            ...experiment,
+            status: "failed",
+            error: progressState === "stopped"
+              ? "Planning was stopped."
+              : "Planning failed.",
+          };
+          this.orchestratorExperiments[planIndex] = experiment;
+          await this.saveOrchestratorExperiments();
+          return;
+        }
+        const resolution = resolveOrchestratorPlan(experiment, assistantText);
+        experiment = resolution.experiment;
+        if (resolution.kind === "retry") {
+          this.orchestratorExperiments[planIndex] = experiment;
+          await this.saveOrchestratorExperiments();
+          await this.enqueueMessage(
+            resolution.prompt,
+            false,
+            [],
+            "plan",
+            [],
+            false,
+            undefined,
+            false,
+            conversationId,
+          );
+          return;
+        }
+        if (resolution.usedFallback) {
+          void vscode.window.showWarningMessage(localize(
+            "The planner omitted the subtask JSON twice. Continuing with the original request as one execution task.",
+            "プランナーが2回続けてサブタスクJSONを返さなかったため、元の依頼を1件の実行タスクとして続行します。",
+          ));
+        }
+        if (experiment.status === "failed") {
+          this.orchestratorExperiments[planIndex] = experiment;
+          await this.saveOrchestratorExperiments();
+          void vscode.window.showWarningMessage(
+            localize(
+              experiment.error ?? "Orchestrator planning produced no subtasks.",
+              experiment.error ?? "オーケストレーターの計画でサブタスクが生成されませんでした。",
+            ),
+          );
+          return;
+        }
         const workspaceFolderUri = this.resolveChatWorkspace()?.uri.toString();
-        const synthesisConversation: Conversation = {
-          id: randomUUID(),
-          title: makeConversationTitle(`[Synthesis] ${experiment.prompt}`),
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          workspaceFolderUri,
-          orchestratorExperimentId: experiment.id,
-          orchestratorRole: "synthesis",
-          transcript: [],
-        };
-        this.conversations.unshift(synthesisConversation);
-        experiment = {
-          ...experiment,
-          synthesisConversationId: synthesisConversation.id,
-        };
-        await this.enqueueMessage(
-          buildSynthesisPrompt(experiment),
-          false,
-          [],
-          "agent",
-          [],
-          false,
-          undefined,
-          false,
-          synthesisConversation.id,
+        const launches: Array<{ conversationId: string; prompt: string }> = [];
+        for (const subtask of experiment.subtasks) {
+          const conversation: Conversation = {
+            id: randomUUID(),
+            title: makeConversationTitle(`[${subtask.title}] ${experiment.prompt}`),
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            workspaceFolderUri,
+            orchestratorExperimentId: experiment.id,
+            orchestratorRole: "subtask",
+            transcript: [],
+          };
+          this.conversations.unshift(conversation);
+          experiment = markSubtaskConversation(experiment, subtask.id, conversation.id);
+          launches.push({ conversationId: conversation.id, prompt: subtask.prompt });
+        }
+        const maximumParallelAgents = this.alertConfiguration()
+          .get<number>("maxParallelChatAgents", 3);
+        const availableParallelAgents = Math.max(
+          0,
+          Math.max(1, maximumParallelAgents) - this.activeRunCount(),
         );
-        await this.saveConversations();
+        if (availableParallelAgents === 0) {
+          for (const launch of launches) {
+            experiment = markSubtaskLaunch(
+              experiment,
+              launch.conversationId,
+              "failed",
+              "No parallel agent slots available.",
+            );
+          }
+          this.orchestratorExperiments[planIndex] = experiment;
+          await this.saveOrchestratorExperiments();
+          await this.saveConversations();
+          void vscode.window.showWarningMessage(
+            localize(
+              experiment.error ?? "Orchestrator subtasks could not launch because no parallel agent slots were available.",
+              experiment.error ?? "並列Agentスロットがないため、オーケストレーターのサブタスクを起動できませんでした。",
+            ),
+          );
+          return;
+        }
+        await launchOrchestratorSubtasks(
+          launches,
+          async () => {
+            this.orchestratorExperiments[planIndex] = experiment;
+            await this.saveOrchestratorExperiments();
+            await this.saveConversations();
+          },
+          async (launch) => {
+            const slots = Math.max(
+              0,
+              Math.max(1, maximumParallelAgents) - this.activeRunCount(),
+            );
+            if (slots === 0) {
+              experiment = markSubtaskLaunch(
+                experiment,
+                launch.conversationId,
+                "failed",
+                "No parallel agent slots available.",
+              );
+              this.orchestratorExperiments[planIndex] = experiment;
+              await this.saveOrchestratorExperiments();
+              return;
+            }
+            await this.enqueueMessage(
+              launch.prompt,
+              false,
+              [],
+              "agent",
+              [],
+              false,
+              undefined,
+              false,
+              launch.conversationId,
+            );
+            experiment = markSubtaskLaunch(experiment, launch.conversationId, "running");
+            this.orchestratorExperiments[planIndex] = experiment;
+            await this.saveOrchestratorExperiments();
+          },
+          availableParallelAgents,
+        );
+        return;
       }
-      this.orchestratorExperiments[subtaskIndex] = experiment;
-      await this.saveOrchestratorExperiments();
-      return;
-    }
 
-    const synthesisIndex = this.orchestratorExperiments.findIndex(
-      (experiment) =>
-        experiment.synthesisConversationId === conversationId
-        && experiment.status === "synthesizing",
-    );
-    if (synthesisIndex >= 0) {
-      this.orchestratorExperiments[synthesisIndex] = {
-        ...this.orchestratorExperiments[synthesisIndex],
-        status: progressState === "completed" ? "completed" : "failed",
-        error: progressState === "completed"
-          ? undefined
-          : progressState === "stopped"
-            ? "Synthesis was stopped."
-            : "Synthesis failed.",
-      };
-      await this.saveOrchestratorExperiments();
-    }
+      const subtaskIndex = this.orchestratorExperiments.findIndex(
+        (experiment) =>
+          experiment.status === "running"
+          && experiment.subtasks.some((subtask) => subtask.conversationId === conversationId),
+      );
+      if (subtaskIndex >= 0) {
+        let experiment = markSubtaskStatus(
+          this.orchestratorExperiments[subtaskIndex],
+          conversationId,
+          progressState === "completed" ? "completed" : "failed",
+        );
+        if (experiment.status === "failed") {
+          this.orchestratorExperiments[subtaskIndex] = experiment;
+          await this.saveOrchestratorExperiments();
+          void vscode.window.showWarningMessage(
+            localize(
+              experiment.error ?? "All subtasks failed.",
+              experiment.error ?? "すべてのサブタスクが失敗しました。",
+            ),
+          );
+          return;
+        }
+        if (experiment.status === "synthesizing") {
+          if (experiment.synthesisConversationId) {
+            this.orchestratorExperiments[subtaskIndex] = experiment;
+            await this.saveOrchestratorExperiments();
+            return;
+          }
+          const workspaceFolderUri = this.resolveChatWorkspace()?.uri.toString();
+          const synthesisConversation: Conversation = {
+            id: randomUUID(),
+            title: makeConversationTitle(`[Synthesis] ${experiment.prompt}`),
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            workspaceFolderUri,
+            orchestratorExperimentId: experiment.id,
+            orchestratorRole: "synthesis",
+            transcript: [],
+          };
+          this.conversations.unshift(synthesisConversation);
+          experiment = {
+            ...experiment,
+            synthesisConversationId: synthesisConversation.id,
+          };
+          this.orchestratorExperiments[subtaskIndex] = experiment;
+          await this.saveOrchestratorExperiments();
+          await this.saveConversations();
+          await this.enqueueMessage(
+            buildSynthesisPrompt(experiment),
+            false,
+            [],
+            "agent",
+            [],
+            false,
+            undefined,
+            false,
+            synthesisConversation.id,
+          );
+          return;
+        }
+        this.orchestratorExperiments[subtaskIndex] = experiment;
+        await this.saveOrchestratorExperiments();
+        return;
+      }
+
+      const synthesisIndex = this.orchestratorExperiments.findIndex(
+        (experiment) =>
+          experiment.synthesisConversationId === conversationId
+          && experiment.status === "synthesizing",
+      );
+      if (synthesisIndex >= 0) {
+        this.orchestratorExperiments[synthesisIndex] = {
+          ...this.orchestratorExperiments[synthesisIndex],
+          status: progressState === "completed" ? "completed" : "failed",
+          error: progressState === "completed"
+            ? undefined
+            : progressState === "stopped"
+              ? "Synthesis was stopped."
+              : "Synthesis failed.",
+        };
+        await this.saveOrchestratorExperiments();
+      }
+    });
   }
 
   public async fixDiagnostics(
@@ -3171,7 +3375,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             `The best-of-N baseline for ${relative} is unavailable.`,
             `${relative} のbest-of-Nベースラインを利用できません。`,
           ),
-          autoMerge: true,
+          autoMerge: false,
             },
           );
         } finally {
@@ -4536,10 +4740,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           pathEscapeLabel: runtime.isolationKind === "windows-safe"
             ? "safe chat"
             : "parallel chat",
+          isExcluded: createExcludedPathMatcher(workspace.uri),
           onLog: (message) => this.output.appendLine(message),
-          beforeCaptureBaseline: shouldStartChangeSession
-            ? (worktreePath) => runConfiguredHooks("preEdit", worktreePath, this.output)
-            : undefined,
+          beforeCaptureBaseline: (worktreePath) =>
+            runConfiguredHooks("preEdit", worktreePath, this.output),
         });
       }
       const attachedFiles = await this.attachmentService.resolveAttachedFiles(requestedFiles, workspace);
@@ -4556,6 +4760,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         requestedSkills,
         editorContext,
         includeProjectMemory,
+        workspace,
       ));
       images = await this.attachmentService.loadAttachedImages(attachedFiles, workspace);
       if (shouldStartChangeSession) {
@@ -4666,7 +4871,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       const agentRoots = [cwd, conversation.attachmentRoot].filter(
         (root): root is string => typeof root === "string",
       );
-      const rootsKey = agentRoots.map((root) => path.resolve(root).toLowerCase()).join("\n");
+      const rootsKey = [
+        ...agentRoots.map((root) => path.resolve(root).toLowerCase()),
+        this.integrationStateKey(conversation),
+      ].join("\n");
       if (
         !runtime.agent
         || runtime.rootsKey !== rootsKey
@@ -4796,24 +5004,43 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         const safeModeIsolation = runtime.isolationKind === "windows-safe";
         const isolationPathLabel = safeModeIsolation ? "safe chat" : "parallel chat";
         const baselineLabel = safeModeIsolation ? "safe-chat" : "parallel-chat";
+        const isExcluded = createExcludedPathMatcher(workspace.uri);
         const changes = await collectIsolatedChanges(session, storageRoot, {
           pathEscapeLabel: isolationPathLabel,
+          isExcluded,
           missingBaselineMessage: (relative) => localize(
             `The ${baselineLabel} baseline for ${relative} is unavailable.`,
             `${relative} の隔離チャットベースラインを利用できません。`,
           ),
         });
+        const excludedChanges = changes.filter((change) => change.excluded);
+        if (excludedChanges.length > 0) {
+          const excludedSummary = localize(
+            `${excludedChanges.length} sensitive path(s) were not applied:\n${
+              excludedChanges.map((change) => `- ${change.relative}`).join("\n")
+            }`,
+            `${excludedChanges.length}件の機微パスは適用しませんでした:\n${
+              excludedChanges.map((change) => `- ${change.relative}`).join("\n")
+            }`,
+          );
+          assistantText = `${assistantText}\n\n${excludedSummary}`.trim();
+          if (runtime.live) {
+            runtime.live.assistantText = assistantText;
+          }
+          this.postIfActive(conversationId, { type: "chunk", text: `\n\n${excludedSummary}` });
+        }
+        const applyableChanges = changes.filter((change) => !change.excluded);
         if (bestOfNCandidate) {
           await this.cleanupBestOfNArtifact(conversationId);
           this.bestOfNArtifacts.set(conversationId, {
             session,
-            changes,
+            changes: applyableChanges,
             root: workspaceRoot,
           });
           preserveIsolatedWorktree = true;
           const comparisonSummary = localize(
-            `Prepared ${changes.length} isolated candidate change(s). Pick this run as the best-of-N winner to apply them or create a pull request.`,
-            `${changes.length}件の候補変更を隔離して準備しました。best-of-Nの勝者に選ぶと適用またはPR作成できます。`,
+            `Prepared ${applyableChanges.length} isolated candidate change(s). Pick this run as the best-of-N winner to apply them or create a pull request.`,
+            `${applyableChanges.length}件の候補変更を隔離して準備しました。best-of-Nの勝者に選ぶと適用またはPR作成できます。`,
           );
           assistantText = `${assistantText}\n\n${comparisonSummary}`.trim();
           if (runtime.live) {
@@ -4828,14 +5055,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               conversationId,
               [
                 path.join(workspaceRoot, ".cursor-parallel-workspace-owner"),
-                ...changes.map((change) => path.join(workspaceRoot, change.relative)),
+                ...applyableChanges.map((change) => path.join(workspaceRoot, change.relative)),
               ],
             );
             try {
               return await applyIsolatedChanges(
                 session,
                 storageRoot,
-                changes,
+                applyableChanges,
                 {
             pathEscapeLabel: isolationPathLabel,
             unavailableMessage: localize(
@@ -4926,6 +5153,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               path: absolute,
               label: vscode.workspace.asRelativePath(absolute),
             });
+          }
+          if (changeSessionId && editedFiles.size > 0) {
+            await this.changeSessions.markPending([...editedFiles], changeSessionId);
           }
         }
           if (remainingConflicts.length > 0) {
@@ -5572,6 +5802,56 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.post({ type: "contextInfo", label: this.currentContextLabel() ?? null });
   }
 
+  private projectGuidanceInstruction(
+    workspace: vscode.WorkspaceFolder | undefined,
+    includeProjectMemory: boolean,
+  ): string | undefined {
+    if (!workspace) {
+      return undefined;
+    }
+    const disabled = this.disabledIntegrationIds();
+    const rulesId = `rules:${workspace.name}:.cursor/rules.md`;
+    const memoryId = `memory:${workspace.name}:.cursor/project-memory.md`;
+    const allowMemory = includeProjectMemory
+      && this.featureEnabled("enableProjectMemory")
+      && this.alertConfiguration().get<boolean>("includeProjectMemory", true);
+    const allowed: string[] = [];
+    const blocked: string[] = [];
+    if (disabled.has(rulesId)) {
+      blocked.push(".cursor/rules.md");
+    } else {
+      allowed.push(".cursor/rules.md");
+    }
+    if (disabled.has(memoryId)) {
+      blocked.push(".cursor/project-memory.md");
+    } else if (allowMemory) {
+      allowed.push(".cursor/project-memory.md");
+    }
+    const skillPrefix = `skill:${workspace.name}:`;
+    const disabledSkills = [...this.skillIntegrationIdsByName.entries()]
+      .filter(([, ids]) => {
+        const workspaceSkillIds = ids.filter((id) => id.startsWith(skillPrefix));
+        return workspaceSkillIds.length > 0
+          && workspaceSkillIds.every((id) => disabled.has(id));
+      })
+      .map(([name]) => name)
+      .sort();
+    if (disabledSkills.length > 0) {
+      blocked.push(`skills: ${disabledSkills.join(", ")}`);
+    }
+    if (allowed.length === 0 && blocked.length === 0) {
+      return undefined;
+    }
+    return [
+      allowed.length > 0
+        ? `If present, read and follow only these enabled project guidance files before acting: ${allowed.join(", ")}. Never write secrets to project memory.`
+        : undefined,
+      blocked.length > 0
+        ? `Do not read or use these disabled project integrations: ${blocked.join(", ")}.`
+        : undefined,
+    ].filter((line): line is string => Boolean(line)).join("\n");
+  }
+
   private composePrompt(
     prompt: string,
     attachContext: boolean,
@@ -5580,6 +5860,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     requestedSkills: string[],
     editorContext?: EditorContextSnapshot,
     includeProjectMemory = true,
+    workspace?: vscode.WorkspaceFolder,
   ): { composed: string; contextLabel?: string } {
     const profileInstruction: Partial<Record<RunProfile, string>> = {
       plan: [
@@ -5594,12 +5875,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     };
     const skills = [...new Set(requestedSkills)]
       .filter((skill) => skill.length > 0 && skill.length <= 80)
+      .filter((skill) => this.isRequestedSkillEnabled(skill, workspace))
       .slice(0, 10);
-    const memoryInstruction = includeProjectMemory
-      && this.featureEnabled("enableProjectMemory")
-      && this.alertConfiguration().get<boolean>("includeProjectMemory", true)
-      ? "If .cursor/rules.md or .cursor/project-memory.md exists, read and follow the relevant project guidance before acting. Never write secrets to project memory."
-      : undefined;
+    const memoryInstruction = this.projectGuidanceInstruction(workspace, includeProjectMemory);
     const intentReference = [
       profileInstruction[profile],
       memoryInstruction,
@@ -5835,7 +6113,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
       const isAbsolute = path.isAbsolute(candidatePath);
       const hasDirectory = candidatePath.includes("/") || candidatePath.includes("\\");
-      const absolute = resolveAbsoluteInWorkspace(candidatePath, preferred);
+      const absolute = await resolveAbsoluteInWorkspaceResolved(candidatePath, preferred);
       let item: WorkspaceFileItem | undefined;
 
       if (absolute) {
@@ -5894,13 +6172,74 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
   }
 
-  private createOrResumeAgent(
+  private integrationStateKey(conversation: Conversation): string {
+    const workspace = this.resolveChatWorkspace(conversation);
+    if (!workspace) {
+      return "integrations:none";
+    }
+    const folderMarker = `:${workspace.name}:`;
+    const disabled = [...this.disabledIntegrationIds()]
+      .filter((id) => id.includes(folderMarker))
+      .sort();
+    return `integrations:${disabled.join(",")}`;
+  }
+
+  private async agentIntegrationOptions(
+    conversation: Conversation,
+  ): Promise<{
+    settingSources: SettingSource[];
+    mcpServers?: Record<string, McpServerConfig>;
+  }> {
+    const workspace = this.resolveChatWorkspace(conversation);
+    if (!workspace) {
+      return { settingSources: ["all"] };
+    }
+    const disabled = this.disabledIntegrationIds();
+    const folderMarker = `:${workspace.name}:`;
+    if (![...disabled].some((id) => id.includes(folderMarker))) {
+      return { settingSources: ["all"] };
+    }
+    const mcpIntegrationId = `mcp:${workspace.name}:mcp.json`;
+    let mcpServers: Record<string, McpServerConfig> | undefined;
+    if (!disabled.has(mcpIntegrationId)) {
+      try {
+        const mcpUri = vscode.Uri.joinPath(workspace.uri, ".cursor", "mcp.json");
+        const parsed = JSON.parse(
+          Buffer.from(await vscode.workspace.fs.readFile(mcpUri)).toString("utf8"),
+        ) as { mcpServers?: unknown };
+        if (
+          parsed.mcpServers
+          && typeof parsed.mcpServers === "object"
+          && !Array.isArray(parsed.mcpServers)
+        ) {
+          mcpServers = parsed.mcpServers as Record<string, McpServerConfig>;
+        }
+      } catch {
+        // Invalid or missing MCP configuration remains visible in the editor.
+      }
+    }
+    return {
+      // Project settings are supplied selectively below so disabled project
+      // rules, skills, and MCP files are not auto-loaded by the SDK.
+      settingSources: ["user", "team", "mdm", "plugins"],
+      mcpServers,
+    };
+  }
+
+  private async createOrResumeAgent(
     apiKey: string,
     roots: string[],
     workspaceName: string,
     conversation: Conversation,
   ): Promise<CursorAgent> {
-    return this.agentFactory.createOrResume({ apiKey, roots, workspaceName, conversation });
+    const integrations = await this.agentIntegrationOptions(conversation);
+    return this.agentFactory.createOrResume({
+      apiKey,
+      roots,
+      workspaceName,
+      conversation,
+      ...integrations,
+    });
   }
 
   private async showSandboxLimitationDetails(): Promise<void> {
@@ -6279,7 +6618,16 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private async openDiff(filePath: string): Promise<void> {
-    const uri = vscode.Uri.file(filePath);
+    const workspace = this.resolveChatWorkspace() ?? resolveWorkspaceFolder();
+    const absolute = await resolveAbsoluteInWorkspaceResolved(filePath, workspace);
+    if (!absolute || !vscode.workspace.getWorkspaceFolder(vscode.Uri.file(absolute))) {
+      void vscode.window.showWarningMessage(localize(
+        "The diff target is outside the open workspace and was not opened.",
+        "差分対象がワークスペース外のため開きませんでした。",
+      ));
+      return;
+    }
+    const uri = vscode.Uri.file(absolute);
     try {
       await vscode.commands.executeCommand("git.openChange", uri);
     } catch {
@@ -6288,7 +6636,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private async openFile(filePath: string): Promise<void> {
-    const absolute = resolveAbsoluteInWorkspace(
+    const absolute = await resolveAbsoluteInWorkspaceResolved(
       filePath,
       resolveWorkspaceFolder(),
     );
@@ -6335,7 +6683,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const line = match?.[2] ? Math.max(0, Number(match[2]) - 1) : undefined;
     let candidates: vscode.Uri[] = [];
 
-    const exactAbsolute = resolveAbsoluteInWorkspace(
+    const exactAbsolute = await resolveAbsoluteInWorkspaceResolved(
       requestedPath,
       resolveWorkspaceFolder(),
     );
@@ -6355,7 +6703,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       const fileName = path.posix.basename(requestedPath).toLowerCase();
       const files = await this.getWorkspaceFiles();
       for (const file of files.filter((item) => item.label.toLowerCase() === fileName)) {
-        const absolute = resolveAbsoluteInWorkspace(file.path);
+        const absolute = await resolveAbsoluteInWorkspaceResolved(file.path);
         if (absolute) {
           candidates.push(vscode.Uri.file(absolute));
         }
@@ -6505,6 +6853,33 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     runtime.rootsKey = rootsKey;
   }
 
+  public async refreshIntegrationIndex(): Promise<void> {
+    const generation = ++this.workspaceIndexGeneration;
+    await this.publishIntegrationIndex(generation);
+  }
+
+  private disabledIntegrationIds(): Set<string> {
+    const state = this.context.workspaceState.get<IntegrationToggleState>(
+      INTEGRATION_TOGGLE_KEY,
+    );
+    return new Set(state?.disabledIds ?? []);
+  }
+
+  private isRequestedSkillEnabled(
+    skill: string,
+    workspace?: vscode.WorkspaceFolder,
+  ): boolean {
+    const ids = this.skillIntegrationIdsByName.get(skill);
+    if (!ids) {
+      return true;
+    }
+    const scopedIds = workspace
+      ? ids.filter((id) => id.startsWith(`skill:${workspace.name}:`))
+      : ids;
+    return scopedIds.length === 0
+      || scopedIds.some((id) => !this.disabledIntegrationIds().has(id));
+  }
+
   private async publishIntegrationIndex(
     generation = this.workspaceIndexGeneration,
   ): Promise<void> {
@@ -6512,12 +6887,17 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return;
     }
     const folders = vscode.workspace.workspaceFolders ?? [];
+    const disabledIntegrationIds = this.disabledIntegrationIds();
     if (folders.length === 0) {
       const projectCommands = await loadProjectCommands();
       if (generation !== this.workspaceIndexGeneration) {
         return;
       }
-      this.projectCommands = projectCommands;
+      this.skillIntegrationIdsByName.clear();
+      this.projectCommands = filterEnabledProjectCommands(
+        projectCommands,
+        disabledIntegrationIds,
+      );
       this.post({
         type: "integrations",
         skills: [],
@@ -6533,6 +6913,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
 
     const skillsByName = new Map<string, { name: string; description?: string }>();
+    const skillIdsByName = new Map<string, string[]>();
     for (const workspace of folders) {
       try {
         const skillUris = await vscode.workspace.findFiles(
@@ -6554,7 +6935,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             ?? fallbackName;
           const description = /^description:\s*["']?([^"'\r\n]+)["']?\s*$/m
             .exec(source)?.[1]?.trim();
-          if (!skillsByName.has(name)) {
+          const integrationId = `skill:${workspace.name}:${fallbackName}`;
+          const ids = skillIdsByName.get(name) ?? [];
+          ids.push(integrationId);
+          skillIdsByName.set(name, ids);
+          if (!disabledIntegrationIds.has(integrationId) && !skillsByName.has(name)) {
             skillsByName.set(name, { name, description });
           }
         }
@@ -6565,6 +6950,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
     const mcpServers = new Set<string>();
     for (const workspace of folders) {
+      if (disabledIntegrationIds.has(`mcp:${workspace.name}:mcp.json`)) {
+        continue;
+      }
       const mcpUri = vscode.Uri.joinPath(workspace.uri, ".cursor", "mcp.json");
       try {
         const bytes = await vscode.workspace.fs.readFile(mcpUri);
@@ -6589,7 +6977,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (generation !== this.workspaceIndexGeneration) {
       return;
     }
-    this.projectCommands = projectCommands;
+    this.skillIntegrationIdsByName.clear();
+    for (const [name, ids] of skillIdsByName) {
+      this.skillIntegrationIdsByName.set(name, ids);
+    }
+    this.projectCommands = filterEnabledProjectCommands(
+      projectCommands,
+      disabledIntegrationIds,
+    );
     this.post({
       type: "integrations",
       skills: [...skillsByName.values()].sort((a, b) => a.name.localeCompare(b.name)),
