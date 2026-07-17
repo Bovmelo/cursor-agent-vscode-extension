@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.10
+
+- Add in-chat toggles for running, completion, and error sounds
+- Keep sound preferences synchronized with VS Code settings across platforms
+
 ## 0.1.9
 
 - Keep chat from auto-scrolling away while reading older messages

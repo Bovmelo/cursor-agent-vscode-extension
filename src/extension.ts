@@ -273,6 +273,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         profile?: string;
         skills?: string[];
         approvalMode?: string;
+        sound?: string;
+        enabled?: boolean;
         path?: string;
         id?: string;
         uploads?: { name?: unknown; data?: unknown }[];
@@ -422,6 +424,25 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               await this.cancel();
               await this.disposeAgent();
               this.post({ type: "approvalModeSelected", mode: message.approvalMode });
+            }
+            break;
+          case "setSoundSetting":
+            if (
+              typeof message.enabled === "boolean"
+              && (
+                message.sound === "playSoundWhileRunning"
+                || message.sound === "playSoundOnComplete"
+                || message.sound === "playSoundOnError"
+              )
+            ) {
+              await vscode.workspace
+                .getConfiguration("cursorSubscription")
+                .update(
+                  message.sound,
+                  message.enabled,
+                  vscode.ConfigurationTarget.Global,
+                );
+              this.postRunningSoundSetting();
             }
             break;
           case "openFile":
@@ -988,18 +1009,19 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private postRunningSoundSetting(): void {
-    const enabled = vscode.workspace
-      .getConfiguration("cursorSubscription")
-      .get<boolean>("playSoundWhileRunning", true)
-      && process.platform !== "win32";
-    const completionEnabled = vscode.workspace
-      .getConfiguration("cursorSubscription")
-      .get<boolean>("playSoundOnComplete", true)
-      && process.platform !== "win32";
-    const errorEnabled = vscode.workspace
-      .getConfiguration("cursorSubscription")
-      .get<boolean>("playSoundOnError", true)
-      && process.platform !== "win32";
+    const configuration = vscode.workspace.getConfiguration("cursorSubscription");
+    const runningConfigured = configuration.get<boolean>("playSoundWhileRunning", true);
+    const completionConfigured = configuration.get<boolean>("playSoundOnComplete", true);
+    const errorConfigured = configuration.get<boolean>("playSoundOnError", true);
+    const enabled = runningConfigured && process.platform !== "win32";
+    const completionEnabled = completionConfigured && process.platform !== "win32";
+    const errorEnabled = errorConfigured && process.platform !== "win32";
+    this.post({
+      type: "soundSettings",
+      running: runningConfigured,
+      completion: completionConfigured,
+      error: errorConfigured,
+    });
     this.post({ type: "runningSoundSetting", enabled });
     this.post({ type: "completionSoundSetting", enabled: completionEnabled });
     this.post({ type: "errorSoundSetting", enabled: errorEnabled });
@@ -2664,6 +2686,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           copyCode: "コードをコピー",
           copyMessage: "メッセージをコピー",
           copied: "コピーしました",
+          soundSettings: "音の設定",
+          soundWhileRunning: "処理中の音",
+          soundOnComplete: "完了時の音",
+          soundOnError: "エラー時の音",
         }
       : {
           history: "Conversation history",
@@ -2750,6 +2776,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           copyCode: "Copy code",
           copyMessage: "Copy message",
           copied: "Copied",
+          soundSettings: "Sound settings",
+          soundWhileRunning: "While running",
+          soundOnComplete: "On completion",
+          soundOnError: "On error",
         };
 
     return /* html */ `<!doctype html>
@@ -2809,6 +2839,40 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
     .icon-btn:hover { background: var(--vscode-toolbar-hoverBackground); }
     .icon-btn svg { width: 15px; height: 15px; }
+    .sound-control { position: relative; }
+    #soundButton.active { background: var(--vscode-toolbar-hoverBackground); }
+    #soundMenu {
+      position: absolute;
+      top: calc(100% + 4px);
+      right: 0;
+      z-index: 30;
+      width: 190px;
+      padding: 6px;
+      color: var(--vscode-menu-foreground, var(--vscode-foreground));
+      background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
+      border: 1px solid var(--vscode-menu-border, var(--vscode-widget-border, transparent));
+      border-radius: 8px;
+      box-shadow: 0 4px 14px var(--vscode-widget-shadow, rgba(0, 0, 0, .3));
+    }
+    #soundMenu[hidden] { display: none; }
+    .sound-menu-title {
+      padding: 3px 7px 6px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .sound-option {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 30px;
+      padding: 5px 7px;
+      border-radius: 5px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .sound-option:hover { background: var(--vscode-menu-selectionBackground); }
+    .sound-option input { margin: 0; accent-color: var(--vscode-focusBorder); }
 
     /* ---- Messages ---- */
     #scroller {
@@ -3815,6 +3879,20 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   <div class="header">
     <span class="brand">Cursor</span>
     <span class="spacer"></span>
+    <div class="sound-control">
+      <button id="soundButton" class="icon-btn" type="button" title="${ui.soundSettings}" aria-label="${ui.soundSettings}" aria-expanded="false">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2.5 6.2h2.3L8 3.5v9L4.8 9.8H2.5z"/>
+          <path d="M10.5 5.5a3.2 3.2 0 0 1 0 5M12.3 3.7a5.7 5.7 0 0 1 0 8.6"/>
+        </svg>
+      </button>
+      <div id="soundMenu" role="group" aria-label="${ui.soundSettings}" hidden>
+        <div class="sound-menu-title">${ui.soundSettings}</div>
+        <label class="sound-option"><input id="runningSoundToggle" type="checkbox"><span>${ui.soundWhileRunning}</span></label>
+        <label class="sound-option"><input id="completionSoundToggle" type="checkbox"><span>${ui.soundOnComplete}</span></label>
+        <label class="sound-option"><input id="errorSoundToggle" type="checkbox"><span>${ui.soundOnError}</span></label>
+      </div>
+    </div>
     <button id="historyButton" class="icon-btn" type="button" title="${ui.history}">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="8" cy="8" r="6.2"/>
@@ -3956,6 +4034,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const taskList = document.getElementById("taskList");
     const viewAll = document.getElementById("viewAll");
     const historyButton = document.getElementById("historyButton");
+    const soundButton = document.getElementById("soundButton");
+    const soundMenu = document.getElementById("soundMenu");
+    const runningSoundToggle = document.getElementById("runningSoundToggle");
+    const completionSoundToggle = document.getElementById("completionSoundToggle");
+    const errorSoundToggle = document.getElementById("errorSoundToggle");
     const scroller = document.getElementById("scroller");
     const prompt = document.getElementById("prompt");
     const composerCard = document.querySelector(".composer-wrap .card");
@@ -4022,6 +4105,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     let availableMcpServers = [];
     let queuedMessages = [];
     let followOutput = true;
+
+    function setSoundMenuOpen(open) {
+      soundMenu.hidden = !open;
+      soundButton.classList.toggle("active", open);
+      soundButton.setAttribute("aria-expanded", String(open));
+    }
 
     function profileLabel(profile) {
       return {
@@ -5525,6 +5614,28 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     interruptButton.addEventListener("click", () => submitMessage("interrupt"));
     newChatButton.addEventListener("click", () => vscode.postMessage({ type: "newChat" }));
     historyButton.addEventListener("click", () => vscode.postMessage({ type: "showHome" }));
+    soundButton.addEventListener("click", () => setSoundMenuOpen(soundMenu.hidden));
+    runningSoundToggle.addEventListener("change", () => {
+      vscode.postMessage({
+        type: "setSoundSetting",
+        sound: "playSoundWhileRunning",
+        enabled: runningSoundToggle.checked,
+      });
+    });
+    completionSoundToggle.addEventListener("change", () => {
+      vscode.postMessage({
+        type: "setSoundSetting",
+        sound: "playSoundOnComplete",
+        enabled: completionSoundToggle.checked,
+      });
+    });
+    errorSoundToggle.addEventListener("change", () => {
+      vscode.postMessage({
+        type: "setSoundSetting",
+        sound: "playSoundOnError",
+        enabled: errorSoundToggle.checked,
+      });
+    });
     viewAll.addEventListener("click", () => {
       tasksExpanded = true;
       renderTasks();
@@ -5554,11 +5665,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     window.addEventListener("blur", () => {
       closeModelPicker();
       closeAddMenu();
+      setSoundMenuOpen(false);
     });
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {
         closeModelPicker();
         closeAddMenu();
+        setSoundMenuOpen(false);
       }
     });
     document.addEventListener("pointerdown", (event) => {
@@ -5567,6 +5680,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }
       if (!addMenu.hidden && !document.querySelector(".add-control").contains(event.target)) {
         closeAddMenu();
+      }
+      if (!soundMenu.hidden && !document.querySelector(".sound-control").contains(event.target)) {
+        setSoundMenuOpen(false);
       }
     });
     document.addEventListener("keydown", (event) => {
@@ -5578,6 +5694,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         event.preventDefault();
         closeAddMenu();
         attachButton.focus();
+      } else if (event.key === "Escape" && !soundMenu.hidden) {
+        event.preventDefault();
+        setSoundMenuOpen(false);
+        soundButton.focus();
       }
     });
     document.getElementById("keyButton").addEventListener("click", () => vscode.postMessage({ type: "setApiKey" }));
@@ -5710,6 +5830,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         case "authRequired":
           auth.style.display = "block";
           authChip.style.display = "inline-flex";
+          break;
+        case "soundSettings":
+          runningSoundToggle.checked = data.running === true;
+          completionSoundToggle.checked = data.completion === true;
+          errorSoundToggle.checked = data.error === true;
           break;
         case "runningSoundSetting":
           runningSoundEnabled = data.enabled === true;
