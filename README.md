@@ -89,6 +89,14 @@ Cursor's local SDK sandbox is unavailable on Windows. The extension therefore de
 
 Safe worktree mode requires the workspace to be a Git repository. Plan mode is read-only and does not create a worktree.
 
+## Data and privacy
+
+- Prompts and the context you explicitly include—such as selected code, referenced files, images, diagnostics, debug metadata, project memory, Skills, and MCP results—are sent to Cursor through the public Cursor SDK under your account and plan. Agent tools may read additional workspace files when needed for the task.
+- The Cursor API key is stored in VS Code SecretStorage. This extension does not read the Cursor desktop login session and does not add its own telemetry or analytics.
+- Conversation transcripts and aggregate token usage are stored in VS Code workspace state. Copies of external attachments, dirty-file checkpoints, isolated-run baselines, and Supervisor task data are stored in VS Code extension-private storage. Deleting a conversation removes its transcript and managed external-attachment copies; change-session history and checkpoint data are limited to the latest 20 sessions, while Supervisor data remains until its task is dismissed or extension storage is removed.
+- Project MCP servers and configured pre-edit, post-edit, and verification commands run locally with the permissions of the VS Code extension host or spawned process. Review workspace configuration before enabling tools or opening an untrusted repository.
+- Uninstalling the extension does not guarantee immediate deletion of VS Code extension storage. Use VS Code's profile/application-data controls when you need to remove all retained local data.
+
 ## Requirements
 
 - VS Code 1.100 or later
@@ -171,6 +179,14 @@ Anysphere / Cursor 非提携の**非公式**拡張機能です。公式 TypeScri
 WindowsではCursorローカルSDKのサンドボックスを利用できません。そのため、この拡張機能はWindowsで**安全worktree**を既定にし、以前保存された実行権限もアップデート後の初回起動時に一度だけ安全worktreeへ移行します。自動レビューを維持したまま通常のAgent編集を分離Git worktreeで実行し、完了した変更は競合確認後に適用します。初回警告への確認が必要です。安全worktree中は小さな状態表示だけを残し、ワークスペース直接実行またはフルアクセス中は閉じられない警告バナーを表示します。
 
 安全worktreeはワークスペースへの意図しない編集を抑えますが、OSのセキュリティ境界ではありません。ツールはホストのファイルシステムとネットワークへアクセスできます。ワークスペース直接実行の**自動レビュー**または**フルアクセス**へ切り替える際は、明示確認が必要です。安全worktreeにはGitリポジトリが必要です。読み取り専用のPlanモードではworktreeを作成しません。
+
+### データとプライバシー
+
+- プロンプト、および選択コード、参照ファイル、画像、診断、デバッグ情報、プロジェクトメモリ、Skills、MCP結果など明示的に含めたコンテキストは、ご自身のアカウントとプランで公開Cursor SDKを通じてCursorへ送信されます。タスクの実行に必要な場合、Agentツールが追加のワークスペースファイルを読み取ることがあります。
+- Cursor APIキーはVS Code SecretStorageへ保存します。この拡張機能はCursorデスクトップのログイン情報を読み取らず、独自のテレメトリやアクセス解析も追加しません。
+- 会話本文と集計トークン使用量はVS Codeのworkspace stateへ保存します。外部添付ファイルのコピー、未コミットファイルのチェックポイント、隔離実行のbaseline、Supervisorタスク情報はVS Codeの拡張機能専用ストレージへ保存します。会話を削除すると本文と管理対象の外部添付コピーを削除します。変更セッションとチェックポイントは最新20件に制限され、Supervisorデータはタスクを破棄するか拡張機能ストレージを削除するまで残ります。
+- プロジェクトMCPサーバーと、設定した編集前・編集後・検証コマンドは、VS Code拡張ホストまたは起動したプロセスの権限でローカル実行されます。信頼できないリポジトリを開く場合は、ツールを有効にする前にワークスペース設定を確認してください。
+- 拡張機能をアンインストールしても、VS Codeの拡張機能ストレージが即時削除されるとは限りません。ローカル保存データをすべて削除する必要がある場合は、VS Codeのプロファイルまたはアプリケーションデータ管理を使用してください。
 
 ### 必要なもの
 

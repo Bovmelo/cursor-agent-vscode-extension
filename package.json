@@ -2,7 +2,7 @@
   "name": "cursor-subscription-for-vscode",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "publisher": "ark4ez",
   "license": "MIT",
   "type": "module",
@@ -583,7 +583,7 @@
     "marked": "^18.0.6"
   },
   "devDependencies": {
-    "@types/node": "^26.1.1",
+    "@types/node": "~22.13.17",
     "@types/vscode": "~1.100.0",
     "@vscode/vsce": "^3.9.2",
     "typescript": "^7.0.2"

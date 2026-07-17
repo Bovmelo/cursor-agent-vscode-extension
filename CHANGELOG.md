@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.1.15
+
+- Recover orphaned Safe/parallel chat worktrees after crashes and clean up partially prepared worktrees
+- Run pre-edit hooks before capturing isolated-worktree baselines so hook output is not attributed to the agent
+- Validate real Git worktree creation, junction/symlink linking, failure cleanup, and orphan recovery on Windows and Ubuntu CI
+- Document local retention, Cursor transmission, MCP/command execution, and telemetry behavior in English and Japanese
+- Align Node.js type definitions with the supported Node 22.13 runtime and tighten the Marketplace parallel-agent screenshot
+
 ## 0.1.14
 
 - Persist each chat's workspace folder in multi-root workspaces, and let the footer label pick a different root

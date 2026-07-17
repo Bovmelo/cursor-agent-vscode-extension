@@ -83,6 +83,7 @@ import {
 } from "./usageStats.js";
 import { pickWorkspaceFolder, resolveWorkspaceFolder, configurationFor, workspaceDisplayName, resolveAbsoluteInWorkspace, workspaceFolderFromUri, defaultWorkspaceFolder } from "./workspaceFolder.js";
 import { WebviewController } from "./webviewController.js";
+import { cleanupOrphanedManagedWorktrees } from "./worktreeLifecycle.js";
 import {
   canStartAnotherParallelAgent,
   computeOverlappedMutationFlags,
@@ -164,6 +165,33 @@ export function activate(context: vscode.ExtensionContext): void {
     changeSessions,
     reviewDiagnostics,
   );
+  const cleanupChatWorktrees = (folder: vscode.WorkspaceFolder): void => {
+    void cleanupOrphanedManagedWorktrees(
+      folder.uri.fsPath,
+      [".cursor-safe-chat/worktrees", ".cursor-parallel-chat/worktrees"],
+      (message) => output.appendLine(message),
+    ).then((removed) => {
+      if (removed.length > 0) {
+        output.appendLine(
+          `[${new Date().toISOString()}] Removed ${removed.length} orphaned chat worktree(s).`,
+        );
+      }
+    }).catch((error) => {
+      output.appendLine(
+        `[${new Date().toISOString()}] Could not inspect orphaned chat worktrees: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
+  };
+  for (const folder of vscode.workspace.workspaceFolders ?? []) {
+    cleanupChatWorktrees(folder);
+  }
+  const orphanCleanupSubscription = vscode.workspace.onDidChangeWorkspaceFolders((event) => {
+    for (const folder of event.added) {
+      cleanupChatWorktrees(folder);
+    }
+  });
   supervisor.setExecutor(
     async (task, worktreePath, prompt) => {
       const outcome = await supervisorRunner.execute(task, worktreePath, prompt);
@@ -190,6 +218,7 @@ export function activate(context: vscode.ExtensionContext): void {
     reviewDiagnostics,
     provider,
     supervisorTree,
+    orphanCleanupSubscription,
     vscode.window.registerTreeDataProvider(
       "cursorSubscription.changeSessions",
       changeSessions,
@@ -2867,6 +2896,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     let images: SDKImage[] = [];
     let changeSessionId = continueSession ? runtime.changeSessionId : undefined;
     const storageRoot = this.context.storageUri ?? this.context.globalStorageUri;
+    const shouldStartChangeSession = profile !== "plan"
+      && !continueSession
+      && this.featureEnabled("enableChangeSessions");
     try {
       if (useIsolatedWorktree) {
         if (runtime.isolatedWorktree) {
@@ -2891,6 +2923,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             ? "safe chat"
             : "parallel chat",
           onLog: (message) => this.output.appendLine(message),
+          beforeCaptureBaseline: shouldStartChangeSession
+            ? (worktreePath) => runConfiguredHooks("preEdit", worktreePath, this.output)
+            : undefined,
         });
       }
       const attachedFiles = await this.attachmentService.resolveAttachedFiles(requestedFiles, workspace);
@@ -2909,16 +2944,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         includeProjectMemory,
       ));
       images = await this.attachmentService.loadAttachedImages(attachedFiles, workspace);
-      if (
-        profile !== "plan"
-        && !continueSession
-        && this.featureEnabled("enableChangeSessions")
-      ) {
-        await runConfiguredHooks(
-          "preEdit",
-          runtime.isolatedWorktree?.worktreePath ?? workspace.uri.fsPath,
-          this.output,
-        );
+      if (shouldStartChangeSession) {
+        if (!runtime.isolatedWorktree) {
+          await runConfiguredHooks("preEdit", workspace.uri.fsPath, this.output);
+        }
         changeSessionId = (await this.changeSessions.begin(effectivePrompt, workspace.uri.fsPath)).id;
         runtime.changeSessionId = changeSessionId;
         this.repairAttempts.set(conversationId, 0);

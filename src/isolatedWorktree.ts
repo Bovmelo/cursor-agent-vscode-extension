@@ -1,8 +1,6 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
-import { homedir } from "node:os";
 import * as path from "node:path";
-import { promisify } from "node:util";
 import * as vscode from "vscode";
 import {
   canApplyAgainstBaseline,
@@ -11,8 +9,13 @@ import {
   safeResolvePath,
 } from "./safety.js";
 import { hasConflictMarkers, threeWayMergeBytes } from "./threeWayMerge.js";
+import {
+  linkManagedNodeModules,
+  removeManagedWorktree,
+  runGit,
+  withManagedWorktree,
+} from "./worktreeLifecycle.js";
 
-const execFileAsync = promisify(execFileCallback);
 const MAX_GIT_OUTPUT = 32 * 1024 * 1024;
 
 export interface IsolatedBaselineFile {
@@ -49,6 +52,7 @@ export interface PrepareIsolatedWorktreeOptions {
   isExcluded?: (relative: string) => boolean;
   onLog?: (message: string) => void;
   pathEscapeLabel?: string;
+  beforeCaptureBaseline?: (worktreePath: string) => Promise<void>;
 }
 
 export { hashBytes };
@@ -107,16 +111,6 @@ export function lineDiffCounts(
     added: afterLines.length - common,
     deleted: beforeLines.length - common,
   };
-}
-
-export async function runGit(root: string, args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync("git", args, {
-    cwd: root,
-    windowsHide: true,
-    maxBuffer: MAX_GIT_OUTPUT,
-    encoding: "utf8",
-  });
-  return stdout;
 }
 
 async function git(root: string, args: string[]): Promise<string> {
@@ -239,33 +233,6 @@ async function captureBaseline(
   }
 }
 
-async function linkNodeModules(
-  root: string,
-  worktree: string,
-  onLog?: (message: string) => void,
-): Promise<void> {
-  const source = path.join(root, "node_modules");
-  const target = path.join(worktree, "node_modules");
-  try {
-    const stat = await vscode.workspace.fs.stat(vscode.Uri.file(source));
-    if ((stat.type & vscode.FileType.Directory) === 0) {
-      return;
-    }
-  } catch {
-    return;
-  }
-  try {
-    const { symlink } = await import("node:fs/promises");
-    await symlink(source, target, process.platform === "win32" ? "junction" : "dir");
-  } catch (error) {
-    onLog?.(
-      `[${new Date().toISOString()}] Could not link node_modules: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
-  }
-}
-
 /**
  * Create a detached git worktree, overlay dirty main-tree files, capture baselines,
  * and symlink node_modules. Cursor SDK state paths stay short via a home-dir checkout.
@@ -275,29 +242,41 @@ export async function prepareIsolatedWorktree(
 ): Promise<IsolatedWorktreeSession> {
   const pathEscapeLabel = options.pathEscapeLabel ?? "isolated worktree";
   await vscode.workspace.fs.createDirectory(options.storageRoot);
-  const worktreesRoot = path.join(homedir(), ...options.worktreesHomeSegment.split(/[/\\]+/));
-  await vscode.workspace.fs.createDirectory(vscode.Uri.file(worktreesRoot));
-  const worktree = path.join(worktreesRoot, options.id);
-  await git(options.root, ["worktree", "add", "--detach", worktree, "HEAD"]);
-  await overlayCurrentWorkspace(
-    options.root,
-    worktree,
-    options.isExcluded,
-    pathEscapeLabel,
-  );
-  const baselineCommit = (await git(worktree, ["rev-parse", "HEAD"])).trim();
-  const session: IsolatedWorktreeSession = {
-    id: options.id,
-    root: options.root,
-    worktreePath: worktree,
-    baselineCommit,
-    baselineFiles: {},
-    initialChangedFiles: [],
-    baselinesFolder: options.baselinesFolder,
-  };
-  await captureBaseline(session, options.storageRoot);
-  await linkNodeModules(options.root, worktree, options.onLog);
-  return session;
+  try {
+    return await withManagedWorktree(options, async (worktree) => {
+      await overlayCurrentWorkspace(
+        options.root,
+        worktree,
+        options.isExcluded,
+        pathEscapeLabel,
+      );
+      await options.beforeCaptureBaseline?.(worktree);
+      const baselineCommit = (await git(worktree, ["rev-parse", "HEAD"])).trim();
+      const session: IsolatedWorktreeSession = {
+        id: options.id,
+        root: options.root,
+        worktreePath: worktree,
+        baselineCommit,
+        baselineFiles: {},
+        initialChangedFiles: [],
+        baselinesFolder: options.baselinesFolder,
+      };
+      await captureBaseline(session, options.storageRoot);
+      await linkManagedNodeModules(options.root, worktree, options.onLog);
+      return session;
+    });
+  } catch (error) {
+    try {
+      await vscode.workspace.fs.delete(vscode.Uri.joinPath(
+        options.storageRoot,
+        options.baselinesFolder,
+        options.id,
+      ), { recursive: true });
+    } catch {
+      // Baseline capture may have failed before creating its storage folder.
+    }
+    throw error;
+  }
 }
 
 export async function readIsolatedBaseline(
@@ -626,15 +605,7 @@ export async function cleanupIsolatedWorktree(
     return;
   }
   const worktree = session.worktreePath;
-  try {
-    try {
-      const { unlink } = await import("node:fs/promises");
-      await unlink(path.join(worktree, "node_modules"));
-    } catch {
-      // node_modules may not have been linked.
-    }
-    await git(session.root, ["worktree", "remove", "--force", worktree]);
-    await git(session.root, ["worktree", "prune"]);
+  if (await removeManagedWorktree(session.root, worktree, onLog)) {
     try {
       await vscode.workspace.fs.delete(vscode.Uri.joinPath(
         storageRoot,
@@ -644,12 +615,6 @@ export async function cleanupIsolatedWorktree(
     } catch {
       // The baseline directory may already have been cleaned up.
     }
-  } catch (error) {
-    onLog?.(
-      `[${new Date().toISOString()}] Could not remove worktree ${worktree}: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
   }
 }
 

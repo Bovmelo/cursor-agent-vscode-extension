@@ -10,11 +10,11 @@ import {
   normalizedRelative,
   prepareIsolatedWorktree,
   readIsolatedBaseline,
-  runGit,
   safePath,
   type IsolatedBaselineFile,
   type IsolatedWorktreeSession,
 } from "./isolatedWorktree.js";
+import { runGit } from "./worktreeLifecycle.js";
 import { configurationFor, resolveWorkspaceFolder } from "./workspaceFolder.js";
 
 const TASKS_KEY = "cursorSubscription.supervisorTasks";
