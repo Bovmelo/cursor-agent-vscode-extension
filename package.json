@@ -38,10 +38,14 @@
   ],
   "activationEvents": [
     "onView:cursorSubscription.chatView",
+    "onView:cursorSubscription.changeSessions",
     "onCommand:cursorSubscription.generateCommitMessage",
     "onCommand:cursorSubscription.generateCode",
     "onCommand:cursorSubscription.explainSelection",
-    "onCommand:cursorSubscription.addFileToChat"
+    "onCommand:cursorSubscription.addFileToChat",
+    "onCommand:cursorSubscription.runAutopilot",
+    "onCommand:cursorSubscription.reviewChanges",
+    "onCommand:cursorSubscription.debugContext"
   ],
   "main": "./out/extension.js",
   "scripts": {
@@ -87,6 +91,34 @@
       {
         "command": "cursorSubscription.addFileToChat",
         "title": "%command.addFileToChat%"
+      },
+      {
+        "command": "cursorSubscription.runAutopilot",
+        "title": "%command.runAutopilot%"
+      },
+      {
+        "command": "cursorSubscription.reviewChanges",
+        "title": "%command.reviewChanges%"
+      },
+      {
+        "command": "cursorSubscription.clearReview",
+        "title": "%command.clearReview%"
+      },
+      {
+        "command": "cursorSubscription.debugContext",
+        "title": "%command.debugContext%"
+      },
+      {
+        "command": "cursorSubscription.refreshProjectMemory",
+        "title": "%command.refreshProjectMemory%"
+      },
+      {
+        "command": "cursorSubscription.verifyChanges",
+        "title": "%command.verifyChanges%"
+      },
+      {
+        "command": "cursorSubscription.revertLastSession",
+        "title": "%command.revertLastSession%"
       }
     ],
     "menus": {
@@ -126,6 +158,11 @@
           "command": "cursorSubscription.addFileToChat",
           "when": "resourceScheme == file",
           "group": "cursor@3"
+        },
+        {
+          "command": "cursorSubscription.debugContext",
+          "when": "resourceScheme == file",
+          "group": "cursor@4"
         }
       ]
     },
@@ -144,6 +181,10 @@
           "type": "webview",
           "id": "cursorSubscription.chatView",
           "name": "%view.agent%"
+        },
+        {
+          "id": "cursorSubscription.changeSessions",
+          "name": "%view.changeSessions%"
         }
       ]
     },
@@ -169,6 +210,41 @@
           "type": "boolean",
           "default": true,
           "description": "%config.playSoundOnError.description%"
+        },
+        "cursorSubscription.autoVerify": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.autoVerify.description%"
+        },
+        "cursorSubscription.autoRepair": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.autoRepair.description%"
+        },
+        "cursorSubscription.maxAutoRepairAttempts": {
+          "type": "integer",
+          "default": 1,
+          "minimum": 0,
+          "maximum": 3,
+          "description": "%config.maxAutoRepairAttempts.description%"
+        },
+        "cursorSubscription.verificationCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "%config.verificationCommands.description%"
+        },
+        "cursorSubscription.enableInlineCompletions": {
+          "type": "boolean",
+          "default": false,
+          "description": "%config.enableInlineCompletions.description%"
+        },
+        "cursorSubscription.includeProjectMemory": {
+          "type": "boolean",
+          "default": true,
+          "description": "%config.includeProjectMemory.description%"
         }
       }
     }

@@ -19,7 +19,28 @@ Run [Cursor](https://cursor.com) agents from the VS Code sidebar with your Curso
 - Active editor and selection context
 - Conversation history across restarts
 - Commit message generation from Source Control
+- Autopilot change sessions with an investigation/edit/verification/review lifecycle
+- Preview-and-accept inline code generation instead of immediate edits
+- AI Quick Fix actions for editor diagnostics
+- Automatic validation with optional bounded self-repair
+- AI review findings published into the Problems panel
+- Revertible AI checkpoints when a session starts from a clean Git tree
+- Project memory, debug-context analysis, and experimental inline completions
 - Japanese / English UI (follows VS Code display language)
+
+## AI-native workflow
+
+Run **Cursor: Run Autopilot Change** to give Cursor an outcome instead of an individual edit. The **AI Change Session** view tracks investigation, edited files, verification, and review readiness. When the working tree was clean at the beginning, the entire session can be reverted from that view.
+
+After an agent edits files, the extension detects `validate`, `compile`, `lint`, or `test` npm scripts and runs the best available verification automatically. Configure `cursorSubscription.verificationCommands` to override detection. Automatic repair is available through `cursorSubscription.autoRepair` and is disabled by default because it can consume additional plan quota.
+
+Additional commands:
+
+- **Cursor: Review Workspace Changes** publishes line-level findings to VS Code Problems.
+- **Cursor: Analyze Debug Context** sends the active editor, diagnostics, breakpoints, and debug-session metadata to the agent.
+- **Cursor: Refresh Project Memory** creates or updates `.cursor/project-memory.md`.
+- AI Quick Fix actions appear alongside diagnostics in the editor.
+- Experimental inline completions can be enabled with `cursorSubscription.enableInlineCompletions`.
 
 ## Requirements
 
@@ -64,7 +85,19 @@ Anysphere / Cursor 非提携の**非公式**拡張機能です。公式 TypeScri
 - 画像コンテキスト、Skills、`.cursor/mcp.json` の MCP
 - `@` ファイル参照、D&D / 貼り付け、選択範囲の添付
 - 会話履歴の復元、コミットメッセージ生成
+- 調査・編集・検証・レビューを通して実行する Autopilot 変更セッション
+- 適用前に確認できるインライン生成コードの差分プレビュー
+- Problems の診断に対する AI Quick Fix と、行単位の AI コードレビュー
+- 編集後の自動検証と、回数制限付きの自動修正
+- クリーンな Git 状態から開始した AI セッションの一括取り消し
+- プロジェクト記憶、デバッグ状況の解析、実験的なインライン補完
 - VS Code の表示言語に連動した日英 UI
+
+### AIネイティブ機能
+
+**Cursor: Autopilot変更を実行**では、個別の編集内容ではなく達成したい結果を指示できます。**AI変更セッション**ビューに調査状況、編集ファイル、検証結果、レビュー待ち状態が表示されます。
+
+検証コマンドは npm の `validate`、`compile`、`lint`、`test` から自動検出します。`cursorSubscription.verificationCommands` で上書きできます。検証失敗時の自動修正は追加の利用枠を消費する場合があるため、初期状態では無効です。
 
 ### 必要なもの
 

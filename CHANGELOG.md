@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add Autopilot change sessions with a task-oriented progress view and safe session revert from clean Git baselines
+- Preview generated inline edits in a diff before applying them
+- Add AI Quick Fix actions for editor diagnostics and line-level AI review findings in Problems
+- Automatically detect and run project verification commands after agent edits, with optional bounded self-repair
+- Add project-memory refresh, debug-context analysis, and experimental quota-aware inline completions
+
 ## 0.1.11
 
 - Restore the prompt caret after Typeless or another dictation tool temporarily takes focus

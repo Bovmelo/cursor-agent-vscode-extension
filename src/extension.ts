@@ -15,6 +15,15 @@ import {
   type TokenUsage,
 } from "@cursor/sdk";
 import * as vscode from "vscode";
+import {
+  ChangeSessionController,
+  CursorAiCodeActionProvider,
+  listWorkspaceChanges,
+  parseReviewFindings,
+  runVerification,
+  type ReviewFinding,
+  type VerificationResult,
+} from "./aiNative.js";
 import { generateCommitMessage, resolveRootUri } from "./generateCommitMessage.js";
 import {
   detectBlockedProxyEnvironment,
@@ -133,6 +142,7 @@ interface QueuedMessage {
   model: ModelSelection;
   kind: "queued" | "interrupt";
   editorContext?: EditorContextSnapshot;
+  internalRepair?: boolean;
 }
 
 function addTokenUsage(current: TokenUsage | undefined, usage: TokenUsage): TokenUsage {
@@ -157,12 +167,46 @@ function makeTitle(prompt: string): string {
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Cursor Agent");
   const runningSound = new RunningSoundController(context, output);
-  const provider = new CursorChatProvider(context, output, runningSound);
+  const reviewDiagnostics = vscode.languages.createDiagnosticCollection("cursor-ai-review");
+  const changeSessions = new ChangeSessionController(
+    context.workspaceState,
+    output,
+    IS_JAPANESE,
+  );
+  const provider = new CursorChatProvider(
+    context,
+    output,
+    runningSound,
+    changeSessions,
+    reviewDiagnostics,
+  );
 
   context.subscriptions.push(
     output,
     runningSound,
+    changeSessions,
+    reviewDiagnostics,
     provider,
+    vscode.window.registerTreeDataProvider(
+      "cursorSubscription.changeSessions",
+      changeSessions,
+    ),
+    vscode.languages.registerCodeActionsProvider(
+      { scheme: "file" },
+      new CursorAiCodeActionProvider(IS_JAPANESE),
+      { providedCodeActionKinds: CursorAiCodeActionProvider.providedCodeActionKinds },
+    ),
+    vscode.languages.registerInlineCompletionItemProvider(
+      { scheme: "file" },
+      {
+        provideInlineCompletionItems: (document, position, inlineContext, token) =>
+          provider.provideInlineCompletionItems(document, position, inlineContext, token),
+      },
+    ),
+    vscode.workspace.registerTextDocumentContentProvider(
+      "cursor-ai-preview",
+      provider.previewContentProvider(),
+    ),
     vscode.window.registerWebviewViewProvider(VIEW_ID, provider, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
@@ -209,6 +253,27 @@ export function activate(context: vscode.ExtensionContext): void {
           () => runningSound.playCompletion(),
         ),
     ),
+    vscode.commands.registerCommand("cursorSubscription.runAutopilot", () =>
+      provider.runAutopilot()),
+    vscode.commands.registerCommand(
+      "cursorSubscription.fixDiagnostics",
+      (uri: vscode.Uri, range: vscode.Range, diagnostics: vscode.Diagnostic[]) =>
+        provider.fixDiagnostics(uri, range, diagnostics),
+    ),
+    vscode.commands.registerCommand("cursorSubscription.reviewChanges", () =>
+      provider.reviewWorkspaceChanges()),
+    vscode.commands.registerCommand("cursorSubscription.clearReview", () =>
+      reviewDiagnostics.clear()),
+    vscode.commands.registerCommand("cursorSubscription.debugContext", () =>
+      provider.analyzeDebugContext()),
+    vscode.commands.registerCommand("cursorSubscription.refreshProjectMemory", () =>
+      provider.refreshProjectMemory()),
+    vscode.commands.registerCommand("cursorSubscription.verifyChanges", () =>
+      provider.verifyCurrentChanges()),
+    vscode.commands.registerCommand("cursorSubscription.revertLastSession", () =>
+      provider.revertLastSession()),
+    vscode.commands.registerCommand("cursorSubscription.openSessionFile", (file: string) =>
+      provider.openSessionFile(file)),
   );
 }
 
@@ -236,11 +301,19 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private readonly pendingChatFiles: string[] = [];
   private pendingAttachmentRoot: Promise<vscode.Uri> | undefined;
   private readonly pendingAttachmentLabels = new Map<string, string>();
+  private readonly repairAttempts = new Map<string, number>();
+  private inlineCompletionBusy = false;
+  private inlineCompletionCache:
+    | { key: string; value: vscode.InlineCompletionItem[] }
+    | undefined;
+  private readonly previewContents = new Map<string, string>();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly output: vscode.OutputChannel,
     private readonly runningSound: RunningSoundController,
+    private readonly changeSessions: ChangeSessionController,
+    private readonly reviewDiagnostics: vscode.DiagnosticCollection,
   ) {
     this.conversations = context.workspaceState.get<Conversation[]>(CONVERSATIONS_KEY, []);
   }
@@ -543,6 +616,311 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     await this.publishAuthState();
   }
 
+  public previewContentProvider(): vscode.TextDocumentContentProvider {
+    return {
+      provideTextDocumentContent: (uri) => this.previewContents.get(uri.toString()) ?? "",
+    };
+  }
+
+  public async runAutopilot(): Promise<void> {
+    const goal = await vscode.window.showInputBox({
+      title: localize("Cursor: Autopilot Change", "Cursor: Autopilot変更"),
+      prompt: localize(
+        "Describe the outcome. Cursor will investigate, edit, verify, and prepare the change for review.",
+        "実現したい結果を指示してください。調査・編集・検証・レビュー準備まで実行します。",
+      ),
+      ignoreFocusOut: true,
+    });
+    if (!goal?.trim()) {
+      return;
+    }
+    await vscode.commands.executeCommand(`${VIEW_ID}.focus`);
+    await this.send(
+      [
+        goal.trim(),
+        "",
+        "Run this as an autonomous change session.",
+        "Investigate the repository, make the smallest coherent implementation, run relevant validation, and review the resulting diff.",
+        "Do not stop after describing code: complete the change and report remaining risks.",
+      ].join("\n"),
+      true,
+      [],
+      "multitask",
+      [],
+    );
+    await this.drainMessageQueue();
+  }
+
+  public async fixDiagnostics(
+    uri: vscode.Uri,
+    range: vscode.Range,
+    diagnostics: readonly vscode.Diagnostic[],
+  ): Promise<void> {
+    const document = await vscode.workspace.openTextDocument(uri);
+    const safeRange = document.validateRange(range);
+    const editorContext: EditorContextSnapshot = {
+      filePath: vscode.workspace.asRelativePath(uri),
+      languageId: document.languageId,
+      startLine: safeRange.start.line + 1,
+      endLine: safeRange.end.line + 1,
+      selectedText: document.getText(safeRange),
+    };
+    const details = diagnostics.slice(0, 20).map((diagnostic) => {
+      const source = diagnostic.source ? ` [${diagnostic.source}]` : "";
+      return `- L${diagnostic.range.start.line + 1}${source}: ${diagnostic.message}`;
+    });
+    await vscode.commands.executeCommand(`${VIEW_ID}.focus`);
+    await this.enqueueMessage(
+      [
+        "Fix the following editor diagnostics. Inspect related code before editing, preserve intended behavior, and add or update tests when appropriate.",
+        ...details,
+      ].join("\n"),
+      true,
+      [],
+      "agent",
+      [],
+      false,
+      editorContext,
+    );
+  }
+
+  public async reviewWorkspaceChanges(): Promise<void> {
+    const workspace = vscode.workspace.workspaceFolders?.[0];
+    if (!workspace || this.busy) {
+      return;
+    }
+    const apiKey = await this.context.secrets.get(API_KEY_SECRET);
+    if (!apiKey) {
+      await this.promptForApiKey();
+      return;
+    }
+
+    try {
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: localize("Reviewing workspace changes…", "作業ツリーの変更をレビュー中…"),
+        },
+        async () => {
+        const result = await Agent.prompt(
+          [
+            "Review the current git working-tree diff for correctness, regressions, security, performance, and missing tests.",
+            "Read the relevant surrounding code. Do not edit files.",
+            "Return ONLY a JSON array. Each item must be:",
+            '{"file":"relative/path","line":1,"endLine":1,"severity":"error|warning|info|hint","message":"concise finding","code":"optional stable id","suggestion":"specific fix"}',
+            "Use exact 1-based line numbers from the current working tree. Return [] when there are no actionable findings.",
+          ].join("\n"),
+          {
+            apiKey,
+            model: this.selectedModelSelection(),
+            name: "VS Code: AI Review",
+            mode: "plan",
+            local: { cwd: workspace.uri.fsPath, settingSources: [] },
+          },
+        );
+        if (result.status !== "finished") {
+          throw new Error(this.formatRunFailure(result));
+        }
+        const findings = parseReviewFindings(result.result ?? "[]");
+        await this.publishReviewFindings(workspace, findings);
+        this.changeSessions.setPhase(findings.length > 0 ? "review" : "complete");
+        void vscode.window.showInformationMessage(localize(
+          findings.length === 0
+            ? "AI review found no actionable issues."
+            : `AI review published ${findings.length} finding(s) in Problems.`,
+          findings.length === 0
+            ? "AIレビューで指摘は見つかりませんでした。"
+            : `AIレビューの指摘${findings.length}件をProblemsに表示しました。`,
+        ));
+        },
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[${new Date().toISOString()}] AI review failed: ${message}`);
+      void vscode.window.showErrorMessage(localize(
+        `AI review failed: ${message}`,
+        `AIレビューに失敗しました: ${message}`,
+      ));
+    }
+  }
+
+  public async analyzeDebugContext(): Promise<void> {
+    const editor = vscode.window.activeTextEditor;
+    const session = vscode.debug.activeDebugSession;
+    const diagnostics = editor
+      ? vscode.languages.getDiagnostics(editor.document.uri)
+      : [];
+    const breakpoints = vscode.debug.breakpoints.map((breakpoint) => {
+      if (breakpoint instanceof vscode.SourceBreakpoint) {
+        return `${vscode.workspace.asRelativePath(breakpoint.location.uri)}:${breakpoint.location.range.start.line + 1}`;
+      }
+      return breakpoint instanceof vscode.FunctionBreakpoint
+        ? breakpoint.functionName
+        : "data breakpoint";
+    });
+    const prompt = [
+      "Investigate the current debugging context. Identify the likely root cause, inspect relevant code, and propose or implement a focused fix when the evidence is sufficient.",
+      session ? `Debug session: ${session.name} (${session.type})` : "Debug session: not currently running",
+      breakpoints.length > 0 ? `Breakpoints: ${breakpoints.join(", ")}` : undefined,
+      diagnostics.length > 0
+        ? `Editor diagnostics:\n${diagnostics.map((item) => `- ${item.message}`).join("\n")}`
+        : undefined,
+    ].filter((line): line is string => Boolean(line)).join("\n");
+    await vscode.commands.executeCommand(`${VIEW_ID}.focus`);
+    await this.enqueueMessage(
+      prompt,
+      Boolean(editor),
+      [],
+      "agent",
+      [],
+      false,
+      editor ? this.captureEditorContext(editor) : undefined,
+    );
+  }
+
+  public async refreshProjectMemory(): Promise<void> {
+    await vscode.commands.executeCommand(`${VIEW_ID}.focus`);
+    await this.send(
+      [
+        "Inspect this repository and create or update .cursor/project-memory.md.",
+        "Keep it concise and evidence-based. Record architecture, important entry points, validation commands, conventions, generated files, and areas that require caution.",
+        "Preserve user-authored rules in .cursor/rules.md and do not copy secrets or transient details.",
+      ].join("\n"),
+      false,
+      [],
+      "agent",
+      [],
+    );
+  }
+
+  public async verifyCurrentChanges(): Promise<VerificationResult | undefined> {
+    const workspace = vscode.workspace.workspaceFolders?.[0];
+    if (!workspace) {
+      return undefined;
+    }
+    const configuration = this.alertConfiguration();
+    this.changeSessions.setPhase("verify");
+    const result = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: localize("Verifying changes…", "変更を検証中…"),
+      },
+      () => runVerification(
+        workspace.uri.fsPath,
+        configuration.get<string[]>("verificationCommands", []),
+        this.output,
+      ),
+    );
+    this.changeSessions.setVerification(result);
+    const summary = this.formatVerificationSummary(result);
+    this.output.appendLine(summary);
+    void vscode.window.showInformationMessage(summary);
+    return result;
+  }
+
+  public async revertLastSession(): Promise<void> {
+    if (!this.changeSessions.canRevert()) {
+      void vscode.window.showWarningMessage(localize(
+        "The last session cannot be safely reverted.",
+        "直前のセッションは安全に元に戻せません。",
+      ));
+      return;
+    }
+    const revertLabel = localize("Revert session", "セッションを元に戻す");
+    const answer = await vscode.window.showWarningMessage(
+      localize(
+        "Restore tracked files and move files created by the last AI session to the Trash?",
+        "追跡済みファイルを復元し、直前のAIセッションが作成したファイルをゴミ箱へ移動しますか？",
+      ),
+      { modal: true },
+      revertLabel,
+    );
+    if (answer !== revertLabel) {
+      return;
+    }
+    const result = await this.changeSessions.revert();
+    void vscode.window.showInformationMessage(localize(
+      `Reverted ${result.restored.length + result.removed.length} file(s).`,
+      `${result.restored.length + result.removed.length}ファイルを元に戻しました。`,
+    ));
+  }
+
+  public async openSessionFile(file: string): Promise<void> {
+    await this.openDiff(file);
+  }
+
+  public async provideInlineCompletionItems(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    _inlineContext: vscode.InlineCompletionContext,
+    token: vscode.CancellationToken,
+  ): Promise<vscode.InlineCompletionItem[]> {
+    const enabled = this.alertConfiguration().get<boolean>("enableInlineCompletions", false);
+    if (!enabled || this.inlineCompletionBusy || this.busy || document.uri.scheme !== "file") {
+      return [];
+    }
+    const linePrefix = document.lineAt(position.line).text.slice(0, position.character);
+    if (linePrefix.trim().length < 3) {
+      return [];
+    }
+    const key = `${document.uri.toString()}:${document.version}:${position.line}:${position.character}`;
+    if (this.inlineCompletionCache?.key === key) {
+      return this.inlineCompletionCache.value;
+    }
+    const apiKey = await this.context.secrets.get(API_KEY_SECRET);
+    const workspace = vscode.workspace.getWorkspaceFolder(document.uri);
+    if (!apiKey || !workspace || token.isCancellationRequested) {
+      return [];
+    }
+
+    this.inlineCompletionBusy = true;
+    try {
+      await new Promise<void>((resolve) => setTimeout(resolve, 350));
+      if (token.isCancellationRequested) {
+        return [];
+      }
+      const offset = document.offsetAt(position);
+      const source = document.getText();
+      const before = source.slice(Math.max(0, offset - 6_000), offset);
+      const after = source.slice(offset, Math.min(source.length, offset + 2_000));
+      const result = await Agent.prompt(
+        [
+          "Complete code at the cursor. Return only the text to insert, without Markdown or explanation.",
+          "Prefer a short, high-confidence continuation. Return an empty string if intent is unclear.",
+          `File: ${vscode.workspace.asRelativePath(document.uri)}`,
+          `Language: ${document.languageId}`,
+          "<before>",
+          before,
+          "</before>",
+          "<after>",
+          after,
+          "</after>",
+        ].join("\n"),
+        {
+          apiKey,
+          model: this.selectedModelSelection(),
+          name: "VS Code: Inline Completion",
+          mode: "plan",
+          local: { cwd: workspace.uri.fsPath, settingSources: [] },
+        },
+      );
+      if (result.status !== "finished" || token.isCancellationRequested) {
+        return [];
+      }
+      const completion = this.cleanGeneratedCode(result.result ?? "");
+      const value = completion ? [new vscode.InlineCompletionItem(completion)] : [];
+      this.inlineCompletionCache = { key, value };
+      return value;
+    } catch (error) {
+      this.output.appendLine(
+        `[${new Date().toISOString()}] Inline completion failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return [];
+    } finally {
+      this.inlineCompletionBusy = false;
+    }
+  }
+
   public async generateCode(editor: vscode.TextEditor): Promise<void> {
     if (editor.document.uri.scheme !== "file") {
       void vscode.window.showInformationMessage(localize(
@@ -693,6 +1071,43 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             throw new Error(localize(
               "The file changed while code was being generated. Run the command again.",
               "コードの生成中にファイルが変更されました。もう一度実行してください。",
+            ));
+          }
+
+          const fullText = currentDocument.getText();
+          const previewText = `${fullText.slice(0, currentDocument.offsetAt(selection.start))}${generatedCode}${fullText.slice(currentDocument.offsetAt(selection.end))}`;
+          const previewUri = vscode.Uri.from({
+            scheme: "cursor-ai-preview",
+            path: `/${randomUUID()}/${path.basename(document.uri.fsPath)}`,
+          });
+          this.previewContents.set(previewUri.toString(), previewText);
+          await vscode.commands.executeCommand(
+            "vscode.diff",
+            document.uri,
+            previewUri,
+            localize(
+              `${path.basename(document.uri.fsPath)} ↔ Cursor preview`,
+              `${path.basename(document.uri.fsPath)} ↔ Cursorプレビュー`,
+            ),
+            { preview: true },
+          );
+          const applyLabel = localize("Apply", "適用");
+          const decision = await vscode.window.showInformationMessage(
+            localize(
+              "Review the generated diff, then apply or discard it.",
+              "生成された差分を確認し、適用するか破棄してください。",
+            ),
+            { modal: true },
+            applyLabel,
+            localize("Discard", "破棄"),
+          );
+          if (decision !== applyLabel) {
+            return;
+          }
+          if (currentDocument.version !== documentVersion) {
+            throw new Error(localize(
+              "The file changed while the preview was open. Generate the change again.",
+              "プレビュー中にファイルが変更されました。再度生成してください。",
             ));
           }
 
@@ -884,6 +1299,75 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       : new vscode.Position(start.line + lines.length - 1, lines.at(-1)?.length ?? 0);
   }
 
+  private async publishReviewFindings(
+    workspace: vscode.WorkspaceFolder,
+    findings: readonly ReviewFinding[],
+  ): Promise<void> {
+    this.reviewDiagnostics.clear();
+    const grouped = new Map<string, vscode.Diagnostic[]>();
+    const severityMap: Record<ReviewFinding["severity"], vscode.DiagnosticSeverity> = {
+      error: vscode.DiagnosticSeverity.Error,
+      warning: vscode.DiagnosticSeverity.Warning,
+      info: vscode.DiagnosticSeverity.Information,
+      hint: vscode.DiagnosticSeverity.Hint,
+    };
+    const root = path.resolve(workspace.uri.fsPath);
+    for (const finding of findings) {
+      const absolute = path.resolve(root, finding.file);
+      const relative = path.relative(root, absolute);
+      if (relative.startsWith("..") || path.isAbsolute(relative)) {
+        continue;
+      }
+      let document: vscode.TextDocument;
+      try {
+        document = await vscode.workspace.openTextDocument(vscode.Uri.file(absolute));
+      } catch {
+        continue;
+      }
+      const startLine = Math.max(0, Math.min(document.lineCount - 1, finding.line - 1));
+      const endLine = Math.max(
+        startLine,
+        Math.min(document.lineCount - 1, (finding.endLine ?? finding.line) - 1),
+      );
+      const range = new vscode.Range(
+        new vscode.Position(startLine, 0),
+        document.lineAt(endLine).range.end,
+      );
+      const message = finding.suggestion
+        ? `${finding.message}\nSuggestion: ${finding.suggestion}`
+        : finding.message;
+      const diagnostic = new vscode.Diagnostic(range, message, severityMap[finding.severity]);
+      diagnostic.source = "Cursor AI Review";
+      diagnostic.code = finding.code;
+      const key = document.uri.toString();
+      const entries = grouped.get(key) ?? [];
+      entries.push(diagnostic);
+      grouped.set(key, entries);
+    }
+    for (const [uri, diagnostics] of grouped) {
+      this.reviewDiagnostics.set(vscode.Uri.parse(uri), diagnostics);
+    }
+  }
+
+  private formatVerificationSummary(result: VerificationResult): string {
+    if (result.skipped) {
+      return localize(
+        "Verification skipped: no configured or detected commands.",
+        "検証をスキップしました: 実行できるコマンドが見つかりません。",
+      );
+    }
+    const passed = result.steps.filter((step) => step.success).length;
+    return result.success
+      ? localize(
+          `Verification passed (${passed}/${result.steps.length}).`,
+          `検証に成功しました (${passed}/${result.steps.length})。`,
+        )
+      : localize(
+          `Verification failed (${passed}/${result.steps.length}). See Cursor Agent output for details.`,
+          `検証に失敗しました (${passed}/${result.steps.length})。詳細はCursor Agent出力を確認してください。`,
+        );
+  }
+
   private captureEditorContext(editor: vscode.TextEditor): EditorContextSnapshot | undefined {
     if (editor.document.uri.scheme !== "file") {
       return undefined;
@@ -1053,6 +1537,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     skills: string[],
     interrupt: boolean,
     editorContext?: EditorContextSnapshot,
+    internalRepair = false,
   ): Promise<void> {
     if (!prompt) {
       return;
@@ -1069,6 +1554,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         undefined,
         undefined,
         editorContext,
+        internalRepair,
       );
       await this.drainMessageQueue();
       return;
@@ -1085,6 +1571,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       model: this.selectedModelSelection(),
       kind: interrupt ? "interrupt" : "queued",
       editorContext,
+      internalRepair: internalRepair || undefined,
     };
     if (interrupt) {
       this.messageQueue.unshift(item);
@@ -1145,6 +1632,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           item.conversationId,
           item.model,
           item.editorContext,
+          item.internalRepair === true,
         );
       }
     } finally {
@@ -1161,6 +1649,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     targetConversationId?: string,
     modelSelection?: ModelSelection,
     editorContext?: EditorContextSnapshot,
+    continueSession = false,
   ): Promise<void> {
     if (!prompt || this.busy) {
       return;
@@ -1208,6 +1697,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const images = await this.loadAttachedImages(attachedFiles, workspace);
     const conversationId = conversation.id;
 
+    if (profile !== "plan" && !continueSession) {
+      await this.changeSessions.begin(prompt, workspace.uri.fsPath);
+      this.repairAttempts.set(conversationId, 0);
+    }
+
     this.busy = true;
     this.runningConversationId = conversationId;
     const runningSound = this.runningSound.start();
@@ -1233,6 +1727,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const progressSteps = new Map<string, ToolProgressEntry>();
     let failed = false;
     let progressState: "completed" | "stopped" | "error" = "completed";
+    let verificationResult: VerificationResult | undefined;
 
     try {
       const blockedProxy = detectBlockedProxyEnvironment();
@@ -1343,6 +1838,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }
 
       result ??= await resultPromise;
+      if (this.changeSessions.snapshot()?.baselineClean) {
+        for (const changedFile of await listWorkspaceChanges(workspace.uri.fsPath)) {
+          editedFiles.add(changedFile);
+          this.changeSessions.noteFile(changedFile);
+        }
+      }
       if (result.usage) {
         conversation.tokenUsage = addTokenUsage(conversation.tokenUsage, result.usage);
       }
@@ -1368,6 +1869,68 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         }
       } else {
         this.postIfActive(conversationId, { type: "finished" });
+      }
+
+      if (
+        result.status === "finished"
+        && editedFiles.size > 0
+        && this.alertConfiguration().get<boolean>("autoVerify", true)
+      ) {
+        this.changeSessions.setPhase("verify");
+        const verificationStep: ToolProgressEntry = {
+          id: `verification-${run.id}`,
+          text: localize("Running automatic verification", "自動検証を実行"),
+          status: "running",
+        };
+        progressSteps.set(verificationStep.id, verificationStep);
+        this.postIfActive(conversationId, {
+          type: "toolStatus",
+          callId: verificationStep.id,
+          text: verificationStep.text,
+          status: "running",
+        });
+        verificationResult = await runVerification(
+          workspace.uri.fsPath,
+          this.alertConfiguration().get<string[]>("verificationCommands", []),
+          this.output,
+        );
+        this.changeSessions.setVerification(verificationResult);
+        verificationStep.status = verificationResult.success ? "completed" : "error";
+        this.postIfActive(conversationId, {
+          type: "toolStatus",
+          callId: verificationStep.id,
+          text: this.formatVerificationSummary(verificationResult),
+          status: verificationStep.status,
+        });
+        assistantText = `${assistantText}\n\n${this.formatVerificationSummary(verificationResult)}`.trim();
+
+        const autoRepair = this.alertConfiguration().get<boolean>("autoRepair", false);
+        const maxAttempts = this.alertConfiguration().get<number>("maxAutoRepairAttempts", 1);
+        const attempts = this.repairAttempts.get(conversationId) ?? 0;
+        if (!verificationResult.success && autoRepair && attempts < maxAttempts) {
+          this.repairAttempts.set(conversationId, attempts + 1);
+          const failures = verificationResult.steps
+            .filter((step) => !step.success)
+            .map((step) => `$ ${step.command}\n${step.output}`)
+            .join("\n\n");
+          await this.enqueueMessage(
+            [
+              `Automatic verification failed (repair attempt ${attempts + 1}/${maxAttempts}).`,
+              "Diagnose the failure, make the smallest correction, and leave the workspace in a verified state.",
+              "",
+              failures,
+            ].join("\n"),
+            false,
+            [],
+            "agent",
+            [],
+            false,
+            undefined,
+            true,
+          );
+        }
+      } else if (result.status === "finished" && profile !== "plan") {
+        this.changeSessions.setPhase("review");
       }
     } catch (error) {
       failed = true;
@@ -1403,6 +1966,16 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       this.pendingCancelConversationId = undefined;
       this.post({ type: "idle" });
 
+      if (profile !== "plan") {
+        if (progressState === "error") {
+          this.changeSessions.setPhase("failed");
+        } else if (progressState === "stopped") {
+          this.changeSessions.setPhase("stopped");
+        } else if (!verificationResult) {
+          this.changeSessions.setPhase("review");
+        }
+      }
+
       const storedProgress = [...progressSteps.values()].map((step): ToolProgressEntry =>
         step.status === "running"
           ? {
@@ -1426,6 +1999,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         this.postView();
       }
       this.notifyRunComplete(conversation, progressState);
+      setTimeout(() => void this.drainMessageQueue(), 0);
     }
   }
 
@@ -1582,8 +2156,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const skills = [...new Set(requestedSkills)]
       .filter((skill) => skill.length > 0 && skill.length <= 80)
       .slice(0, 10);
+    const memoryInstruction = this.alertConfiguration().get<boolean>(
+      "includeProjectMemory",
+      true,
+    )
+      ? "If .cursor/rules.md or .cursor/project-memory.md exists, read and follow the relevant project guidance before acting. Never write secrets to project memory."
+      : undefined;
     const intentReference = [
       profileInstruction[profile],
+      memoryInstruction,
       skills.length > 0
         ? "Use these Cursor skills for this request when applicable: " + skills.join(", ") + "."
         : undefined,
@@ -2177,6 +2758,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (typeof tool.name !== "string") {
       return;
     }
+    this.changeSessions.noteTool(tool.name);
 
     const id = typeof tool.call_id === "string"
       ? tool.call_id
@@ -2200,6 +2782,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       const absolute = path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath);
       if (!editedFiles.has(absolute)) {
         editedFiles.add(absolute);
+        this.changeSessions.noteFile(absolute);
         this.postIfActive(conversationId, {
           type: "fileEdited",
           path: absolute,
