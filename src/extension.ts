@@ -85,11 +85,15 @@ import {
 import { IntegrationCatalogController } from "./integrationCatalogView.js";
 import {
   attachSubtasks,
+  buildOrchestratorDetail,
   buildSynthesisPrompt,
   createOrchestratorExperiment,
+  extractSubagentName,
   markSubtaskConversation,
   markSubtaskStatus,
+  orchestratorSummaries,
   parseOrchestratorSubtasks,
+  type OrchestratorActivity,
   type OrchestratorExperiment,
 } from "./orchestrator.js";
 import { scanTodoAiComments } from "./todoScanner.js";
@@ -396,6 +400,7 @@ export function activate(context: vscode.ExtensionContext): void {
       provider.clearApiKey(),
     ),
     vscode.commands.registerCommand("cursorSubscription.newChat", () => provider.newChat()),
+    vscode.commands.registerCommand("cursorSubscription.findInChat", () => provider.findInChat()),
     vscode.commands.registerTextEditorCommand(
       "cursorSubscription.generateCode",
       (editor) => provider.generateCode(editor),
@@ -596,6 +601,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     { session: IsolatedWorktreeSession; changes: IsolatedChange[]; root: string }
   >();
   private orchestratorExperiments: OrchestratorExperiment[];
+  /** Live tool activity for orchestrator-linked conversations (conversationId → activity). */
+  private readonly orchestratorActivityByConversationId = new Map<string, OrchestratorActivity>();
   private executionPlans: ExecutionPlan[];
   private pendingPipelinePr:
     | { title: string; body: string; root: string; files: string[] }
@@ -875,6 +882,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               this.showingHome = true;
               this.activeId = undefined;
               this.postBestOfNCompare(message.id);
+            }
+            break;
+          case "openOrchestrator":
+            if (typeof message.id === "string") {
+              this.showingHome = true;
+              this.activeId = undefined;
+              this.postOrchestratorDetail(message.id);
             }
             break;
           case "estimateContext":
@@ -1641,6 +1655,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       createdAt: Date.now(),
       updatedAt: Date.now(),
       workspaceFolderUri,
+      orchestratorExperimentId: experiment.id,
+      orchestratorRole: "plan",
       transcript: [],
     };
     experiment.planConversationId = planConversation.id;
@@ -1687,6 +1703,106 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
   private async saveOrchestratorExperiments(): Promise<void> {
     await this.context.workspaceState.update(ORCHESTRATOR_KEY, this.orchestratorExperiments);
+    this.postOrchestratorState();
+  }
+
+  private busyConversationIds(): Set<string> {
+    return new Set(
+      this.conversations
+        .filter((conversation) => this.isConversationBusy(conversation.id))
+        .map((conversation) => conversation.id),
+    );
+  }
+
+  private postOrchestratorState(): void {
+    const experiments = orchestratorSummaries(this.orchestratorExperiments)
+      .filter((summary) => {
+        const experiment = this.orchestratorExperiments.find((item) => item.id === summary.id);
+        if (!experiment) {
+          return false;
+        }
+        const conversationIds = [
+          experiment.planConversationId,
+          experiment.synthesisConversationId,
+          ...experiment.subtasks.map((subtask) => subtask.conversationId),
+        ].filter((id): id is string => typeof id === "string");
+        return conversationIds.some((id) =>
+          this.conversations.some((conversation) => conversation.id === id)
+        ) || summary.status === "planning" || summary.status === "running"
+          || summary.status === "synthesizing";
+      })
+      .slice(0, 10);
+    this.post({ type: "orchestratorExperiments", experiments });
+  }
+
+  private postOrchestratorDetail(experimentId: string): void {
+    const experiment = this.orchestratorExperiments.find((item) => item.id === experimentId);
+    if (!experiment) {
+      return;
+    }
+    this.post({
+      type: "orchestratorDetail",
+      experiment: buildOrchestratorDetail(
+        experiment,
+        this.busyConversationIds(),
+        this.orchestratorActivityByConversationId,
+      ),
+    });
+  }
+
+  private resolveOrchestratorActivityTarget(conversationId: string): {
+    experimentId: string;
+    role: "plan" | "subtask" | "synthesis";
+    subtaskId?: string;
+  } | undefined {
+    const conversation = this.conversations.find((item) => item.id === conversationId);
+    if (!conversation?.orchestratorExperimentId || !conversation.orchestratorRole) {
+      return undefined;
+    }
+    const experiment = this.orchestratorExperiments.find(
+      (item) => item.id === conversation.orchestratorExperimentId,
+    );
+    const subtaskId = conversation.orchestratorRole === "subtask"
+      ? experiment?.subtasks.find((subtask) => subtask.conversationId === conversationId)?.id
+      : undefined;
+    return {
+      experimentId: conversation.orchestratorExperimentId,
+      role: conversation.orchestratorRole,
+      subtaskId,
+    };
+  }
+
+  private postOrchestratorActivity(
+    conversationId: string,
+    activity: OrchestratorActivity | null,
+  ): void {
+    if (activity) {
+      this.orchestratorActivityByConversationId.set(conversationId, activity);
+    } else {
+      this.orchestratorActivityByConversationId.delete(conversationId);
+    }
+    const target = this.resolveOrchestratorActivityTarget(conversationId);
+    if (!target) {
+      return;
+    }
+    this.post({
+      type: "orchestratorActivity",
+      experimentId: target.experimentId,
+      conversationId,
+      role: target.role,
+      subtaskId: target.subtaskId,
+      activity,
+    });
+  }
+
+  private clearOrchestratorActivity(conversationId: string): void {
+    if (
+      !this.orchestratorActivityByConversationId.has(conversationId)
+      && !this.resolveOrchestratorActivityTarget(conversationId)
+    ) {
+      return;
+    }
+    this.postOrchestratorActivity(conversationId, null);
   }
 
   private async listGhIssues(
@@ -1867,6 +1983,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           createdAt: Date.now(),
           updatedAt: Date.now(),
           workspaceFolderUri,
+          orchestratorExperimentId: experiment.id,
+          orchestratorRole: "subtask",
           transcript: [],
         };
         this.conversations.unshift(conversation);
@@ -1908,6 +2026,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           createdAt: Date.now(),
           updatedAt: Date.now(),
           workspaceFolderUri,
+          orchestratorExperimentId: experiment.id,
+          orchestratorRole: "synthesis",
           transcript: [],
         };
         this.conversations.unshift(synthesisConversation);
@@ -2861,6 +2981,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.postQueueState();
   }
 
+  public async findInChat(): Promise<void> {
+    await vscode.commands.executeCommand(`${VIEW_ID}.focus`);
+    this.post({ type: "openFind" });
+  }
+
   public async startBestOfN(
     prompt: string,
     attachContext: boolean,
@@ -3719,6 +3844,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       });
       this.postUsageStats();
       this.postExperimentSummaries();
+      this.postOrchestratorState();
     } else {
       this.post({ type: "newChat" });
     }
@@ -3975,14 +4101,26 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             : queueCount > 0
               ? "queued"
               : retainedStatus;
+        const orchestratorRole = conversation.orchestratorRole;
+        const shortTitle = orchestratorRole === "plan"
+          ? "Plan"
+          : orchestratorRole === "synthesis"
+            ? "Synthesis"
+            : orchestratorRole === "subtask"
+              ? (conversation.title.match(/^\[([^\]]+)\]/)?.[1] || conversation.title)
+              : conversation.title;
+        const activity = this.orchestratorActivityByConversationId.get(conversation.id);
         return {
           id: conversation.id,
-          title: conversation.title,
+          title: shortTitle,
           status,
           queueCount,
           active: this.activeId === conversation.id,
           updatedAt: conversation.updatedAt,
           visible: status !== undefined,
+          orchestratorExperimentId: conversation.orchestratorExperimentId,
+          orchestratorRole,
+          activity: status === "running" ? activity : undefined,
         };
       })
       .filter((task) => task.visible)
@@ -5107,6 +5245,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       runtime.ownershipLease = undefined;
       this.fileOwnership.releaseOwner(conversationId);
       this.retainFinishedParallelTask(conversationId, progressState);
+      this.clearOrchestratorActivity(conversationId);
       this.postParallelState();
       this.postIfActive(conversationId, {
         type: "idle",
@@ -6051,6 +6190,22 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       status,
     });
 
+    if (status === "running" && this.resolveOrchestratorActivityTarget(conversationId)) {
+      const filePath = extractFilePaths(tool.args)[0];
+      let relativePath: string | undefined;
+      if (filePath) {
+        const absolute = path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath);
+        const displayPath = isolatedWorktree
+          ? mapWorktreePathToRoot(absolute, isolatedWorktree)
+          : absolute;
+        relativePath = vscode.workspace.asRelativePath(displayPath);
+      }
+      this.postOrchestratorActivity(conversationId, {
+        text,
+        path: relativePath,
+      });
+    }
+
     if (!reportEdits || !/edit|write|apply.?patch/i.test(tool.name)) {
       return;
     }
@@ -6091,7 +6246,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     } else if (/shell|terminal|command|exec|run/.test(lower)) {
       action = localize("Running command", "コマンドを実行");
     } else if (/subagent|agent/.test(lower)) {
-      action = localize("Running subagent", "サブエージェントを実行");
+      const subagentName = extractSubagentName(args);
+      action = subagentName
+        ? localize("Running subagent", "サブエージェントを実行") + `: ${subagentName}`
+        : localize("Running subagent", "サブエージェントを実行");
     } else if (/web|browser|fetch/.test(lower)) {
       action = localize("Accessing the web", "Webへアクセス");
     } else {

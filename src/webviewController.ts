@@ -181,6 +181,13 @@ export class WebviewController {
           usageConversations: "会話合計",
           usageInlineAcceptance: "インライン補完採用率",
           searchConversations: "会話を検索",
+          findInChat: "会話内を検索",
+          findPlaceholder: "会話内を検索…",
+          findPrev: "前へ",
+          findNext: "次へ",
+          findClose: "閉じる",
+          findNoMatches: "一致なし",
+          findMatchCount: "{current} / {total}",
           pinConversation: "ピン留め",
           unpinConversation: "ピン解除",
           exportConversation: "書き出し",
@@ -197,6 +204,17 @@ export class WebviewController {
           compareRuns: "比較",
           compareTitle: "best-of-N 比較",
           orchestrateDescription: "計画してサブタスクを並列実行し、結果を統合",
+          orchestratorTitle: "オーケストレーション",
+          orchestratorDetailTitle: "オーケストレーション詳細",
+          orchestratorPhasePlanning: "計画中",
+          orchestratorPhaseRunning: "実行中",
+          orchestratorPhaseSynthesizing: "統合中",
+          orchestratorPhaseCompleted: "完了",
+          orchestratorPhaseFailed: "失敗",
+          orchestratorPlanAgent: "計画",
+          orchestratorSynthesisAgent: "統合",
+          orchestratorOpenAgent: "開く",
+          orchestratorGroup: "Orchestrate",
           budgetLabel: "予算",
           monthlyBudgetLabel: "月間予算",
           estimatedCostLabel: "推定コスト",
@@ -325,6 +343,13 @@ export class WebviewController {
           usageConversations: "All conversations",
           usageInlineAcceptance: "Inline completion acceptance",
           searchConversations: "Search conversations",
+          findInChat: "Find in chat",
+          findPlaceholder: "Find in chat…",
+          findPrev: "Previous",
+          findNext: "Next",
+          findClose: "Close",
+          findNoMatches: "No matches",
+          findMatchCount: "{current} / {total}",
           pinConversation: "Pin",
           unpinConversation: "Unpin",
           exportConversation: "Export",
@@ -341,6 +366,17 @@ export class WebviewController {
           compareRuns: "Compare",
           compareTitle: "best-of-N compare",
           orchestrateDescription: "Plan, run subtasks in parallel, then synthesize",
+          orchestratorTitle: "Orchestration",
+          orchestratorDetailTitle: "Orchestration detail",
+          orchestratorPhasePlanning: "Planning",
+          orchestratorPhaseRunning: "Running",
+          orchestratorPhaseSynthesizing: "Synthesizing",
+          orchestratorPhaseCompleted: "Completed",
+          orchestratorPhaseFailed: "Failed",
+          orchestratorPlanAgent: "Plan",
+          orchestratorSynthesisAgent: "Synthesis",
+          orchestratorOpenAgent: "Open",
+          orchestratorGroup: "Orchestrate",
           budgetLabel: "Budget",
           monthlyBudgetLabel: "Monthly budget",
           estimatedCostLabel: "Estimated cost",
@@ -408,7 +444,69 @@ export class WebviewController {
     .icon-btn:hover { background: var(--vscode-toolbar-hoverBackground); }
     .icon-btn svg { width: 15px; height: 15px; }
     .sound-control { position: relative; }
-    #soundButton.active { background: var(--vscode-toolbar-hoverBackground); }
+    #soundButton.active,
+    #findInChatButton.active { background: var(--vscode-toolbar-hoverBackground); }
+    #chatFindBar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px 8px;
+      border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,.35));
+      background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+      color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+    }
+    #chatFindBar[hidden] { display: none !important; }
+    #chatFindInput {
+      flex: 1;
+      min-width: 0;
+      padding: 4px 8px;
+      border: 1px solid var(--vscode-input-border, transparent);
+      border-radius: 6px;
+      color: var(--vscode-input-foreground);
+      background: var(--vscode-input-background);
+      font: inherit;
+      font-size: 12px;
+      outline: none;
+    }
+    #chatFindInput:focus {
+      border-color: var(--vscode-focusBorder);
+    }
+    #chatFindCount {
+      flex: 0 0 auto;
+      min-width: 4.5em;
+      font-size: 11px;
+      color: var(--muted);
+      text-align: right;
+      white-space: nowrap;
+    }
+    #chatFindBar .find-nav {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      border: 0;
+      border-radius: 6px;
+      color: var(--vscode-icon-foreground);
+      background: transparent;
+      cursor: pointer;
+      font-size: 12px;
+      line-height: 1;
+    }
+    #chatFindBar .find-nav:hover {
+      background: var(--vscode-toolbar-hoverBackground);
+    }
+    mark.chat-find-hit {
+      color: inherit;
+      background: var(--vscode-editor-findMatchHighlightBackground, rgba(234, 92, 0, 0.33));
+      border-radius: 2px;
+      padding: 0 1px;
+    }
+    mark.chat-find-hit.chat-find-current {
+      background: var(--vscode-editor-findMatchBackground, rgba(255, 150, 50, 0.8));
+      outline: 1px solid var(--vscode-editor-findMatchBorder, transparent);
+    }
     #soundMenu {
       position: absolute;
       top: calc(100% + 4px);
@@ -557,6 +655,31 @@ export class WebviewController {
       border: 1px solid var(--vscode-widget-border, var(--vscode-contrastBorder, transparent));
       border-radius: 999px;
     }
+    .parallel-task.has-activity {
+      border-radius: 12px;
+    }
+    .parallel-task-activity {
+      display: block;
+      min-width: 0;
+      max-width: 100%;
+      color: var(--muted);
+      font-size: 9px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .parallel-task.active .parallel-task-activity {
+      color: inherit;
+      opacity: .75;
+    }
+    .parallel-task-copy {
+      min-width: 0;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+      overflow: hidden;
+    }
     .parallel-task.active {
       color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
       background: var(--vscode-list-activeSelectionBackground, var(--vscode-editorWidget-background));
@@ -668,7 +791,9 @@ export class WebviewController {
       background: color-mix(in srgb, var(--vscode-sideBar-background) 88%, var(--vscode-foreground) 12%);
     }
     #experimentsPanel,
-    #comparePanel {
+    #comparePanel,
+    #orchestratorPanel,
+    #orchestratorDetailPanel {
       margin: 0 0 10px;
       padding: 8px 10px;
       border: 1px solid var(--vscode-widget-border, transparent);
@@ -719,6 +844,101 @@ export class WebviewController {
       display: flex;
       gap: 6px;
       margin-top: 8px;
+    }
+    .orchestrator-phase-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin: 0 0 8px;
+    }
+    .orchestrator-phase {
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--vscode-sideBar-background) 80%, var(--vscode-foreground) 20%);
+      color: var(--muted);
+      font-size: 10px;
+    }
+    .orchestrator-phase.active {
+      background: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
+    }
+    .orchestrator-phase.done {
+      color: var(--vscode-foreground);
+    }
+    .orchestrator-agent-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 6px 8px;
+      border: 1px solid var(--vscode-widget-border, transparent);
+      border-radius: 8px;
+      background: var(--vscode-editor-background);
+    }
+    .orchestrator-agent-status {
+      flex: none;
+      width: 14px;
+      text-align: center;
+      font-size: 11px;
+      margin-top: 2px;
+    }
+    .orchestrator-agent-body {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .orchestrator-agent-title {
+      min-width: 0;
+      font-size: 12px;
+      font-weight: 600;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .orchestrator-agent-activity {
+      min-width: 0;
+      color: var(--muted);
+      font-size: 10px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .orchestrator-agent-activity[hidden] {
+      display: none;
+    }
+    .orchestrator-agent-meta {
+      flex: none;
+      color: var(--muted);
+      font-size: 10px;
+      margin-top: 2px;
+    }
+    .orchestrator-error {
+      margin: 0 0 8px;
+      color: var(--vscode-errorForeground, #f44);
+      font-size: 11px;
+    }
+    .parallel-group {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      flex: none;
+      min-width: min-content;
+      padding: 4px 6px;
+      border: 1px solid var(--vscode-widget-border, transparent);
+      border-radius: 8px;
+      background: color-mix(in srgb, var(--vscode-sideBar-background) 92%, var(--vscode-foreground) 8%);
+    }
+    .parallel-group-header {
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: .03em;
+      white-space: nowrap;
+    }
+    .parallel-group-tasks {
+      display: flex;
+      gap: 6px;
     }
     #contextPreviewRow {
       display: flex;
@@ -1841,6 +2061,12 @@ export class WebviewController {
         <label class="sound-option"><input id="errorSoundToggle" type="checkbox"><span>${ui.soundOnError}</span></label>
       </div>
     </div>
+    <button id="findInChatButton" class="icon-btn" type="button" title="${ui.findInChat}" aria-label="${ui.findInChat}" hidden>
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="7" cy="7" r="4.2"/>
+        <path d="M10.2 10.2 13.5 13.5"/>
+      </svg>
+    </button>
     <button id="historyButton" class="icon-btn" type="button" title="${ui.history}">
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="8" cy="8" r="6.2"/>
@@ -1890,6 +2116,14 @@ export class WebviewController {
     </div>
   </div>
 
+  <div id="chatFindBar" hidden>
+    <input id="chatFindInput" type="search" placeholder="${ui.findPlaceholder}" aria-label="${ui.findInChat}">
+    <span id="chatFindCount" aria-live="polite"></span>
+    <button id="chatFindPrev" class="find-nav" type="button" title="${ui.findPrev}" aria-label="${ui.findPrev}">↑</button>
+    <button id="chatFindNext" class="find-nav" type="button" title="${ui.findNext}" aria-label="${ui.findNext}">↓</button>
+    <button id="chatFindClose" class="find-nav" type="button" title="${ui.findClose}" aria-label="${ui.findClose}">×</button>
+  </div>
+
   <div id="scroller">
     <div id="messages" aria-live="polite" style="display: none;"></div>
     <div id="home">
@@ -1919,6 +2153,20 @@ export class WebviewController {
         </div>
         <div id="comparePrompt" class="compare-prompt"></div>
         <div id="compareGrid" class="compare-grid"></div>
+      </div>
+      <div id="orchestratorPanel" hidden>
+        <div class="tasks-title">${ui.orchestratorTitle}</div>
+        <div id="orchestratorList"></div>
+      </div>
+      <div id="orchestratorDetailPanel" hidden>
+        <div class="compare-header">
+          <div class="tasks-title">${ui.orchestratorDetailTitle}</div>
+          <button id="orchestratorClose" class="task-action" type="button" title="${ui.back}">×</button>
+        </div>
+        <div id="orchestratorPrompt" class="compare-prompt"></div>
+        <div id="orchestratorPhaseStrip" class="orchestrator-phase-strip"></div>
+        <div id="orchestratorError" class="orchestrator-error" hidden></div>
+        <div id="orchestratorAgents" class="compare-grid"></div>
       </div>
       <div id="tasks" hidden>
         <div class="tasks-title">${ui.tasks}</div>
@@ -2055,6 +2303,14 @@ export class WebviewController {
     const comparePrompt = document.getElementById("comparePrompt");
     const compareGrid = document.getElementById("compareGrid");
     const compareClose = document.getElementById("compareClose");
+    const orchestratorPanel = document.getElementById("orchestratorPanel");
+    const orchestratorList = document.getElementById("orchestratorList");
+    const orchestratorDetailPanel = document.getElementById("orchestratorDetailPanel");
+    const orchestratorPrompt = document.getElementById("orchestratorPrompt");
+    const orchestratorPhaseStrip = document.getElementById("orchestratorPhaseStrip");
+    const orchestratorError = document.getElementById("orchestratorError");
+    const orchestratorAgents = document.getElementById("orchestratorAgents");
+    const orchestratorClose = document.getElementById("orchestratorClose");
     const contextPreviewRow = document.getElementById("contextPreviewRow");
     const viewAll = document.getElementById("viewAll");
     const parallelBar = document.getElementById("parallelBar");
@@ -2062,6 +2318,13 @@ export class WebviewController {
     const parallelBarCount = document.getElementById("parallelBarCount");
     const startParallelAgentButton = document.getElementById("startParallelAgentButton");
     const parallelTaskList = document.getElementById("parallelTaskList");
+    const findInChatButton = document.getElementById("findInChatButton");
+    const chatFindBar = document.getElementById("chatFindBar");
+    const chatFindInput = document.getElementById("chatFindInput");
+    const chatFindCount = document.getElementById("chatFindCount");
+    const chatFindPrev = document.getElementById("chatFindPrev");
+    const chatFindNext = document.getElementById("chatFindNext");
+    const chatFindClose = document.getElementById("chatFindClose");
     const historyButton = document.getElementById("historyButton");
     const soundButton = document.getElementById("soundButton");
     const featureSettingsButton = document.getElementById("featureSettingsButton");
@@ -2111,6 +2374,11 @@ export class WebviewController {
     let assistantNode;
     let assistantRaw = "";
     let activeProgress;
+    let findQuery = "";
+    let findMatches = [];
+    let findIndex = -1;
+    let findBarOpen = false;
+    let findDebounceTimer;
     let running = false;
     let activeChatRuns = 0;
     let maximumChatRuns = 3;
@@ -2138,6 +2406,8 @@ export class WebviewController {
     let usageEstimatedCost = null;
     let usageInlineCompletion = null;
     let bestOfNExperiments = [];
+    let orchestratorExperiments = [];
+    let openOrchestratorId = null;
     let contextEstimateTimer;
     let selectedFiles = [];
     let fileResults = [];
@@ -2724,6 +2994,14 @@ export class WebviewController {
       }
     }
 
+    function orchestratorPhaseLabel(status) {
+      if (status === "planning") return i18n.orchestratorPhasePlanning;
+      if (status === "running") return i18n.orchestratorPhaseRunning;
+      if (status === "synthesizing") return i18n.orchestratorPhaseSynthesizing;
+      if (status === "failed") return i18n.orchestratorPhaseFailed;
+      return i18n.orchestratorPhaseCompleted;
+    }
+
     function renderExperiments() {
       experimentList.innerHTML = "";
       experimentsPanel.hidden = bestOfNExperiments.length === 0 || !comparePanel.hidden;
@@ -2762,6 +3040,7 @@ export class WebviewController {
         renderExperiments();
         return;
       }
+      renderOrchestratorDetail(null);
       comparePanel.hidden = false;
       experimentsPanel.hidden = true;
       comparePrompt.textContent = experiment.prompt;
@@ -2797,6 +3076,263 @@ export class WebviewController {
         }
         card.append(heading, body, actions);
         compareGrid.appendChild(card);
+      }
+    }
+
+    function renderOrchestratorExperiments() {
+      orchestratorList.innerHTML = "";
+      orchestratorPanel.hidden = orchestratorExperiments.length === 0
+        || !orchestratorDetailPanel.hidden;
+      for (const experiment of orchestratorExperiments) {
+        const row = document.createElement("div");
+        row.className = "task-row";
+        const title = document.createElement("span");
+        title.className = "task-title";
+        title.textContent = experiment.prompt.split("\\n")[0] || experiment.id;
+        const meta = document.createElement("span");
+        meta.className = "task-meta";
+        const progress = experiment.subtaskCount > 0
+          ? experiment.completedCount + "/" + experiment.subtaskCount + " · "
+          : "";
+        meta.textContent = progress + orchestratorPhaseLabel(experiment.status)
+          + (experiment.createdAt ? " · " + relTime(experiment.createdAt) : "");
+        row.append(title, meta);
+        row.addEventListener("click", () => {
+          vscode.postMessage({ type: "openOrchestrator", id: experiment.id });
+        });
+        orchestratorList.appendChild(row);
+      }
+    }
+
+    function fillOrchestratorActivity(el, activity) {
+      el.replaceChildren();
+      if (!activity || !activity.text) {
+        el.hidden = true;
+        el.removeAttribute("title");
+        return;
+      }
+      el.hidden = false;
+      el.title = activity.text;
+      if (activity.path && activity.text.endsWith(activity.path)) {
+        const prefix = activity.text.slice(0, -activity.path.length);
+        if (prefix) {
+          el.appendChild(document.createTextNode(prefix));
+        }
+        const link = document.createElement("a");
+        link.href = "#";
+        link.className = "workspace-file-link";
+        link.dataset.workspaceFile = activity.path;
+        link.textContent = activity.path;
+        link.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          vscode.postMessage({ type: "openReferencedFile", path: activity.path });
+        });
+        el.appendChild(link);
+      } else {
+        el.textContent = activity.text;
+      }
+    }
+
+    function appendOrchestratorAgentRow(label, status, conversationId, running, activity, subtaskId) {
+      const row = document.createElement("div");
+      row.className = "orchestrator-agent-row";
+      if (conversationId) {
+        row.dataset.conversationId = conversationId;
+      }
+      if (subtaskId) {
+        row.dataset.subtaskId = subtaskId;
+      }
+      const statusEl = document.createElement("span");
+      statusEl.className = "orchestrator-agent-status";
+      if (running || status === "running" || status === "planning" || status === "synthesizing") {
+        const spinner = document.createElement("span");
+        spinner.className = "running-spinner";
+        statusEl.appendChild(spinner);
+      } else if (status === "completed") {
+        statusEl.textContent = "✓";
+      } else if (status === "failed") {
+        statusEl.textContent = "!";
+      } else if (status === "pending") {
+        statusEl.textContent = "…";
+      } else {
+        statusEl.textContent = "·";
+      }
+      const body = document.createElement("div");
+      body.className = "orchestrator-agent-body";
+      const title = document.createElement("span");
+      title.className = "orchestrator-agent-title";
+      title.textContent = label;
+      const activityEl = document.createElement("div");
+      activityEl.className = "orchestrator-agent-activity";
+      fillOrchestratorActivity(activityEl, running ? activity : null);
+      body.append(title, activityEl);
+      const meta = document.createElement("span");
+      meta.className = "orchestrator-agent-meta";
+      meta.textContent = running
+        ? i18n.running
+        : status === "completed"
+          ? i18n.completedTask
+          : status === "failed"
+            ? i18n.failedTask
+            : status === "pending"
+              ? i18n.queuedTask
+              : orchestratorPhaseLabel(status);
+      row.append(statusEl, body, meta);
+      if (conversationId) {
+        const open = document.createElement("button");
+        open.className = "task-action";
+        open.type = "button";
+        open.textContent = i18n.orchestratorOpenAgent;
+        open.addEventListener("click", () => {
+          vscode.postMessage({ type: "openConversation", id: conversationId });
+        });
+        row.appendChild(open);
+      }
+      orchestratorAgents.appendChild(row);
+    }
+
+    function patchOrchestratorActivity(message) {
+      if (!message || !openOrchestratorId || message.experimentId !== openOrchestratorId) {
+        return;
+      }
+      const rows = orchestratorAgents.querySelectorAll(".orchestrator-agent-row");
+      for (const row of rows) {
+        if (message.conversationId && row.dataset.conversationId === message.conversationId) {
+          const activityEl = row.querySelector(".orchestrator-agent-activity");
+          if (activityEl) {
+            fillOrchestratorActivity(activityEl, message.activity);
+          }
+          return;
+        }
+        if (message.subtaskId && row.dataset.subtaskId === message.subtaskId) {
+          const activityEl = row.querySelector(".orchestrator-agent-activity");
+          if (activityEl) {
+            fillOrchestratorActivity(activityEl, message.activity);
+          }
+          return;
+        }
+      }
+    }
+
+    function patchParallelTaskActivity(message) {
+      if (!message || !message.conversationId) {
+        return;
+      }
+      const chip = parallelTaskList.querySelector(
+        '.parallel-task[data-conversation-id="' + message.conversationId + '"]',
+      );
+      if (!chip) {
+        return;
+      }
+      let activityEl = chip.querySelector(".parallel-task-activity");
+      const text = message.activity && message.activity.text ? message.activity.text : "";
+      if (!text) {
+        if (activityEl) {
+          activityEl.remove();
+        }
+        chip.classList.remove("has-activity");
+        return;
+      }
+      if (!activityEl) {
+        const copy = chip.querySelector(".parallel-task-copy");
+        activityEl = document.createElement("span");
+        activityEl.className = "parallel-task-activity";
+        if (copy) {
+          copy.appendChild(activityEl);
+        }
+      }
+      activityEl.textContent = text;
+      activityEl.title = text;
+      chip.classList.add("has-activity");
+    }
+
+    function renderOrchestratorDetail(experiment) {
+      if (!experiment) {
+        openOrchestratorId = null;
+        orchestratorDetailPanel.hidden = true;
+        renderOrchestratorExperiments();
+        return;
+      }
+      if (!comparePanel.hidden) {
+        comparePanel.hidden = true;
+        renderExperiments();
+      }
+      openOrchestratorId = experiment.id;
+      orchestratorDetailPanel.hidden = false;
+      orchestratorPanel.hidden = true;
+      orchestratorPrompt.textContent = experiment.prompt;
+      if (experiment.error) {
+        orchestratorError.hidden = false;
+        orchestratorError.textContent = experiment.error;
+      } else {
+        orchestratorError.hidden = true;
+        orchestratorError.textContent = "";
+      }
+      const phases = [
+        { id: "planning", label: i18n.orchestratorPhasePlanning },
+        { id: "running", label: i18n.orchestratorPhaseRunning },
+        { id: "synthesizing", label: i18n.orchestratorPhaseSynthesizing },
+        { id: "completed", label: i18n.orchestratorPhaseCompleted },
+      ];
+      const order = { planning: 0, running: 1, synthesizing: 2, completed: 3, failed: 3 };
+      const current = order[experiment.status] ?? 0;
+      orchestratorPhaseStrip.innerHTML = "";
+      for (const phase of phases) {
+        const chip = document.createElement("span");
+        const phaseOrder = order[phase.id] ?? 0;
+        chip.className = "orchestrator-phase"
+          + (experiment.status === "failed" && phase.id === "completed"
+            ? " active"
+            : phase.id === experiment.status
+              ? " active"
+              : phaseOrder < current
+                ? " done"
+                : "");
+        chip.textContent = experiment.status === "failed" && phase.id === "completed"
+          ? i18n.orchestratorPhaseFailed
+          : phase.label;
+        orchestratorPhaseStrip.appendChild(chip);
+      }
+      orchestratorAgents.innerHTML = "";
+      const planStatus = experiment.status === "planning"
+        ? "planning"
+        : experiment.plan?.running
+          ? "running"
+          : "completed";
+      appendOrchestratorAgentRow(
+        i18n.orchestratorPlanAgent,
+        planStatus,
+        experiment.plan?.conversationId,
+        experiment.plan?.running === true,
+        experiment.plan?.activity,
+      );
+      for (const subtask of experiment.subtasks || []) {
+        appendOrchestratorAgentRow(
+          subtask.title,
+          subtask.status,
+          subtask.conversationId,
+          subtask.running === true,
+          subtask.activity,
+          subtask.id,
+        );
+      }
+      if (experiment.synthesis?.conversationId || experiment.status === "synthesizing"
+        || experiment.status === "completed" || experiment.status === "failed") {
+        const synthesisStatus = experiment.status === "synthesizing"
+          ? "synthesizing"
+          : experiment.status === "completed"
+            ? "completed"
+            : experiment.status === "failed" && experiment.synthesis?.conversationId
+              ? "failed"
+              : "pending";
+        appendOrchestratorAgentRow(
+          i18n.orchestratorSynthesisAgent,
+          synthesisStatus,
+          experiment.synthesis?.conversationId,
+          experiment.synthesis?.running === true,
+          experiment.synthesis?.activity,
+        );
       }
     }
 
@@ -2921,6 +3457,92 @@ export class WebviewController {
       viewAll.textContent = i18n.showAll + " (" + allConversations.length + ")";
     }
 
+    function createParallelTaskChip(task) {
+      const chip = document.createElement("div");
+      const activityText = task.status === "running" && task.activity && task.activity.text
+        ? task.activity.text
+        : "";
+      chip.className = "parallel-task " + task.status + (task.active ? " active" : "")
+        + (activityText ? " has-activity" : "");
+      chip.dataset.conversationId = task.id;
+
+      const main = document.createElement("button");
+      main.className = "parallel-task-main";
+      main.type = "button";
+      main.title = activityText
+        ? i18n.switchTask + ": " + task.title + " · " + activityText
+        : i18n.switchTask + ": " + task.title;
+      main.setAttribute("aria-label", main.title);
+
+      const taskStatus = document.createElement("span");
+      taskStatus.className = "parallel-task-status";
+      const taskStatusLabel = task.status === "running"
+        ? i18n.running
+        : task.status === "queued"
+          ? i18n.queuedTask
+          : task.status === "error"
+            ? i18n.failedTask
+            : task.status === "stopped"
+              ? i18n.stoppedTask
+              : i18n.completedTask;
+      taskStatus.title = taskStatusLabel;
+      if (task.status === "running") {
+        const spinner = document.createElement("span");
+        spinner.className = "running-spinner";
+        taskStatus.appendChild(spinner);
+      } else if (task.status === "queued") {
+        taskStatus.textContent = "◷";
+      } else if (task.status === "error") {
+        taskStatus.textContent = "!";
+      } else if (task.status === "stopped") {
+        taskStatus.textContent = "■";
+      } else {
+        taskStatus.textContent = "✓";
+      }
+
+      const copy = document.createElement("span");
+      copy.className = "parallel-task-copy";
+      const title = document.createElement("span");
+      title.className = "parallel-task-title";
+      title.textContent = task.title;
+      copy.appendChild(title);
+      if (activityText) {
+        const activityEl = document.createElement("span");
+        activityEl.className = "parallel-task-activity";
+        activityEl.textContent = activityText;
+        activityEl.title = activityText;
+        copy.appendChild(activityEl);
+      }
+
+      main.append(taskStatus, copy);
+      if (Number(task.queueCount) > 0) {
+        const queued = document.createElement("span");
+        queued.className = "parallel-task-queue-count";
+        queued.textContent = "+" + task.queueCount;
+        queued.title = task.queueCount + " " + i18n.queuedTask;
+        main.appendChild(queued);
+      }
+      main.addEventListener("click", () => {
+        vscode.postMessage({ type: "openConversation", id: task.id });
+      });
+
+      chip.appendChild(main);
+      if (task.status === "running" || task.status === "queued") {
+        const stop = document.createElement("button");
+        stop.className = "parallel-task-stop";
+        stop.type = "button";
+        stop.textContent = "×";
+        stop.title = task.status === "running" ? i18n.stopTask : i18n.removeQueuedTask;
+        stop.setAttribute("aria-label", stop.title + ": " + task.title);
+        stop.addEventListener("click", (event) => {
+          event.stopPropagation();
+          vscode.postMessage({ type: "cancelConversation", id: task.id });
+        });
+        chip.appendChild(stop);
+      }
+      return chip;
+    }
+
     function renderParallelBar() {
       parallelBar.hidden = parallelTasks.length === 0;
       parallelBarTitle.textContent = i18n.parallelAgents;
@@ -2932,73 +3554,157 @@ export class WebviewController {
         : i18n.launchParallelAgent;
       parallelTaskList.innerHTML = "";
 
+      const groups = new Map();
+      const ungrouped = [];
       for (const task of parallelTasks) {
-        const chip = document.createElement("div");
-        chip.className = "parallel-task " + task.status + (task.active ? " active" : "");
-
-        const main = document.createElement("button");
-        main.className = "parallel-task-main";
-        main.type = "button";
-        main.title = i18n.switchTask + ": " + task.title;
-        main.setAttribute("aria-label", main.title);
-
-        const taskStatus = document.createElement("span");
-        taskStatus.className = "parallel-task-status";
-        const taskStatusLabel = task.status === "running"
-          ? i18n.running
-          : task.status === "queued"
-            ? i18n.queuedTask
-            : task.status === "error"
-              ? i18n.failedTask
-              : task.status === "stopped"
-                ? i18n.stoppedTask
-                : i18n.completedTask;
-        taskStatus.title = taskStatusLabel;
-        if (task.status === "running") {
-          const spinner = document.createElement("span");
-          spinner.className = "running-spinner";
-          taskStatus.appendChild(spinner);
-        } else if (task.status === "queued") {
-          taskStatus.textContent = "◷";
-        } else if (task.status === "error") {
-          taskStatus.textContent = "!";
-        } else if (task.status === "stopped") {
-          taskStatus.textContent = "■";
+        if (task.orchestratorExperimentId) {
+          const list = groups.get(task.orchestratorExperimentId) || [];
+          list.push(task);
+          groups.set(task.orchestratorExperimentId, list);
         } else {
-          taskStatus.textContent = "✓";
+          ungrouped.push(task);
         }
-
-        const title = document.createElement("span");
-        title.className = "parallel-task-title";
-        title.textContent = task.title;
-
-        main.append(taskStatus, title);
-        if (Number(task.queueCount) > 0) {
-          const queued = document.createElement("span");
-          queued.className = "parallel-task-queue-count";
-          queued.textContent = "+" + task.queueCount;
-          queued.title = task.queueCount + " " + i18n.queuedTask;
-          main.appendChild(queued);
+      }
+      for (const [, tasks] of groups) {
+        const group = document.createElement("div");
+        group.className = "parallel-group";
+        const header = document.createElement("div");
+        header.className = "parallel-group-header";
+        const runningCount = tasks.filter((task) => task.status === "running").length;
+        header.textContent = i18n.orchestratorGroup + " · " + runningCount + "/" + tasks.length;
+        const chips = document.createElement("div");
+        chips.className = "parallel-group-tasks";
+        for (const task of tasks) {
+          chips.appendChild(createParallelTaskChip(task));
         }
-        main.addEventListener("click", () => {
-          vscode.postMessage({ type: "openConversation", id: task.id });
-        });
+        group.append(header, chips);
+        parallelTaskList.appendChild(group);
+      }
+      for (const task of ungrouped) {
+        parallelTaskList.appendChild(createParallelTaskChip(task));
+      }
+    }
 
-        chip.appendChild(main);
-        if (task.status === "running" || task.status === "queued") {
-          const stop = document.createElement("button");
-          stop.className = "parallel-task-stop";
-          stop.type = "button";
-          stop.textContent = "×";
-          stop.title = task.status === "running" ? i18n.stopTask : i18n.removeQueuedTask;
-          stop.setAttribute("aria-label", stop.title + ": " + task.title);
-          stop.addEventListener("click", (event) => {
-            event.stopPropagation();
-            vscode.postMessage({ type: "cancelConversation", id: task.id });
-          });
-          chip.appendChild(stop);
+    function clearFindHighlights() {
+      for (const mark of messages.querySelectorAll("mark.chat-find-hit")) {
+        const parent = mark.parentNode;
+        if (!parent) continue;
+        while (mark.firstChild) parent.insertBefore(mark.firstChild, mark);
+        parent.removeChild(mark);
+        parent.normalize();
+      }
+      findMatches = [];
+      findIndex = -1;
+    }
+
+    function selectFindMatch(index) {
+      if (findIndex >= 0 && findMatches[findIndex]) {
+        findMatches[findIndex].classList.remove("chat-find-current");
+      }
+      findIndex = index;
+      const mark = findMatches[findIndex];
+      if (!mark) return;
+      mark.classList.add("chat-find-current");
+      mark.scrollIntoView({ block: "center", behavior: "smooth" });
+      chatFindCount.textContent = String(i18n.findMatchCount || "{current} / {total}")
+        .replace("{current}", String(findIndex + 1))
+        .replace("{total}", String(findMatches.length));
+    }
+
+    function applyFindHighlights(query, preferredIndex) {
+      const previousIndex = typeof preferredIndex === "number" ? preferredIndex : findIndex;
+      clearFindHighlights();
+      findQuery = typeof query === "string" ? query : "";
+      if (!findQuery) {
+        chatFindCount.textContent = "";
+        return;
+      }
+      const needle = findQuery.toLowerCase();
+      const bodies = messages.querySelectorAll(":scope > .message > .message-body");
+      for (const body of bodies) {
+        const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+        const textNodes = [];
+        while (walker.nextNode()) textNodes.push(walker.currentNode);
+        for (const textNode of textNodes) {
+          const text = textNode.nodeValue || "";
+          if (!text) continue;
+          const lower = text.toLowerCase();
+          let start = 0;
+          let matchAt = lower.indexOf(needle, start);
+          if (matchAt < 0) continue;
+          const frag = document.createDocumentFragment();
+          while (matchAt >= 0) {
+            if (matchAt > start) {
+              frag.appendChild(document.createTextNode(text.slice(start, matchAt)));
+            }
+            const mark = document.createElement("mark");
+            mark.className = "chat-find-hit";
+            mark.textContent = text.slice(matchAt, matchAt + needle.length);
+            frag.appendChild(mark);
+            findMatches.push(mark);
+            start = matchAt + needle.length;
+            matchAt = lower.indexOf(needle, start);
+          }
+          if (start < text.length) {
+            frag.appendChild(document.createTextNode(text.slice(start)));
+          }
+          textNode.parentNode?.replaceChild(frag, textNode);
         }
-        parallelTaskList.appendChild(chip);
+      }
+      if (findMatches.length === 0) {
+        chatFindCount.textContent = i18n.findNoMatches;
+        findIndex = -1;
+        return;
+      }
+      const index = Math.max(0, Math.min(previousIndex >= 0 ? previousIndex : 0, findMatches.length - 1));
+      selectFindMatch(index);
+    }
+
+    function gotoFindMatch(delta) {
+      if (findMatches.length === 0) return;
+      const next = (findIndex + delta + findMatches.length) % findMatches.length;
+      selectFindMatch(next);
+    }
+
+    function openFindBar() {
+      if (view !== "chat") return;
+      findBarOpen = true;
+      chatFindBar.hidden = false;
+      findInChatButton.classList.add("active");
+      chatFindInput.focus();
+      chatFindInput.select();
+      if (chatFindInput.value) {
+        applyFindHighlights(chatFindInput.value);
+      }
+    }
+
+    function closeFindBar() {
+      findBarOpen = false;
+      chatFindBar.hidden = true;
+      findInChatButton.classList.remove("active");
+      clearFindHighlights();
+      findQuery = "";
+      chatFindCount.textContent = "";
+      clearTimeout(findDebounceTimer);
+    }
+
+    function reapplyFindIfActive() {
+      if (findBarOpen && findQuery) {
+        applyFindHighlights(findQuery, findIndex);
+      }
+    }
+
+    function scheduleFind() {
+      clearTimeout(findDebounceTimer);
+      findDebounceTimer = setTimeout(() => {
+        applyFindHighlights(chatFindInput.value);
+      }, 150);
+    }
+
+    function updateFindChrome() {
+      findInChatButton.hidden = view !== "chat";
+      if (view !== "chat") {
+        closeFindBar();
       }
     }
 
@@ -3009,6 +3715,11 @@ export class WebviewController {
       activeProgress = undefined;
       followOutput = true;
       scroller.scrollTop = 0;
+      findMatches = [];
+      findIndex = -1;
+      if (!findBarOpen) {
+        findQuery = "";
+      }
     }
 
     function showHome(convs, query) {
@@ -3025,8 +3736,10 @@ export class WebviewController {
       clearMessages();
       home.style.display = "flex";
       messages.style.display = "none";
+      updateFindChrome();
       renderUsagePanel();
       renderExperiments();
+      renderOrchestratorExperiments();
       renderTasks();
     }
 
@@ -3034,6 +3747,7 @@ export class WebviewController {
       view = "chat";
       home.style.display = "none";
       messages.style.display = "flex";
+      updateFindChrome();
     }
 
     function setRunningState(value) {
@@ -3687,6 +4401,7 @@ export class WebviewController {
       linkifyWorkspaceFiles(body);
       enhanceCodeBlocks(body);
       ensureMessageCopy(messageNode);
+      reapplyFindIfActive();
     }
 
     function addUserMessage(text, attachments = []) {
@@ -4243,6 +4958,9 @@ export class WebviewController {
     compareClose.addEventListener("click", () => {
       renderCompare(null);
     });
+    orchestratorClose.addEventListener("click", () => {
+      renderOrchestratorDetail(null);
+    });
     memoryChip.addEventListener("click", () => {
       setIncludeProjectMemory(!includeProjectMemory);
       requestContextPreview();
@@ -4289,8 +5007,32 @@ export class WebviewController {
         setSoundMenuOpen(false);
       }
     });
+    findInChatButton.addEventListener("click", () => openFindBar());
+    chatFindPrev.addEventListener("click", () => gotoFindMatch(-1));
+    chatFindNext.addEventListener("click", () => gotoFindMatch(1));
+    chatFindClose.addEventListener("click", () => closeFindBar());
+    chatFindInput.addEventListener("input", () => scheduleFind());
+    chatFindInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        gotoFindMatch(event.shiftKey ? -1 : 1);
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        closeFindBar();
+      }
+    });
     document.addEventListener("keydown", (event) => {
-      if (event.key === "Escape" && !modelPicker.hidden) {
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && String(event.key).toLowerCase() === "f") {
+        if (view === "chat") {
+          event.preventDefault();
+          openFindBar();
+        }
+        return;
+      }
+      if (event.key === "Escape" && findBarOpen) {
+        event.preventDefault();
+        closeFindBar();
+      } else if (event.key === "Escape" && !modelPicker.hidden) {
         event.preventDefault();
         closeModelPicker();
         modelButton.focus();
@@ -4627,10 +5369,37 @@ export class WebviewController {
           home.style.display = "flex";
           messages.style.display = "none";
           setRunningState(false);
+          updateFindChrome();
           renderCompare(data.experiment);
+          break;
+        case "orchestratorExperiments":
+          orchestratorExperiments = data.experiments || [];
+          if (view === "home") {
+            renderOrchestratorExperiments();
+            if (openOrchestratorId) {
+              vscode.postMessage({ type: "openOrchestrator", id: openOrchestratorId });
+            }
+          }
+          break;
+        case "orchestratorDetail":
+          view = "home";
+          home.style.display = "flex";
+          messages.style.display = "none";
+          setRunningState(false);
+          updateFindChrome();
+          renderOrchestratorDetail(data.experiment);
+          break;
+        case "orchestratorActivity":
+          patchOrchestratorActivity(data);
+          patchParallelTaskActivity(data);
           break;
         case "contextPreview":
           renderContextPreview(data.chips || []);
+          break;
+        case "openFind":
+          if (view === "chat") {
+            openFindBar();
+          }
           break;
         case "newChat":
           setRunningState(false);
@@ -4677,6 +5446,7 @@ export class WebviewController {
             }
           }
           setRunningState(data.running === true);
+          reapplyFindIfActive();
           break;
         }
         case "queueState":

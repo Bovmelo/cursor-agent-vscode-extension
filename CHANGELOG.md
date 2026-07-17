@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.1.17 - 2026-07-18
+
+- Show `/orchestrate` phase and agent board on the home view, group parallel-bar chips by experiment, and label SDK subagent names in tool progress
+- Surface live tool/file activity on each `/orchestrate` agent row and parallel-bar chip so stages show where they are working
+- Add in-conversation text search (find bar with highlight and prev/next, Ctrl/Cmd+F and Cursor: Find in Chat command)
+
 ## 0.1.16 - 2026-07-17
 
 - Add Supervisor TODO(ai) and failed-test triggers, task priority ordering, and an optional AI review gate before apply

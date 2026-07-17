@@ -357,6 +357,7 @@ export type WebviewIncomingType =
   | "startBestOfN"
   | "pickBestOfNWinner"
   | "compareBestOfN"
+  | "openOrchestrator"
   | "estimateContext"
   | "getContext"
   | "selectModel"
@@ -395,6 +396,7 @@ const WEBVIEW_TYPES = new Set<string>([
   "startBestOfN",
   "pickBestOfNWinner",
   "compareBestOfN",
+  "openOrchestrator",
   "estimateContext",
   "getContext",
   "selectModel",
@@ -471,7 +473,8 @@ export function parseWebviewMessage(raw: unknown): ParsedWebviewMessage | undefi
     || type === "pinConversation"
     || type === "exportConversation"
     || type === "pickBestOfNWinner"
-    || type === "compareBestOfN";
+    || type === "compareBestOfN"
+    || type === "openOrchestrator";
   if (requiresId && typeof message.id !== "string") {
     return undefined;
   }

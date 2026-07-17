@@ -6,6 +6,7 @@
   "command.setApiKey": "Cursor: Set API Key",
   "command.clearApiKey": "Cursor: Clear API Key",
   "command.newChat": "Cursor: New Chat",
+  "command.findInChat": "Cursor: Find in Chat",
   "command.generateCommitMessage": "Cursor: Generate Commit Message",
   "command.createPullRequest": "Cursor: Create Branch and Pull Request",
   "command.generateCode": "Cursor: Generate Code",

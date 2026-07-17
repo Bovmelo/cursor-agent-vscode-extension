@@ -59,6 +59,8 @@ export interface Conversation {
   attachmentRoot?: string;
   pinned?: boolean;
   experimentGroupId?: string;
+  orchestratorExperimentId?: string;
+  orchestratorRole?: "plan" | "subtask" | "synthesis";
   tokenUsage?: TokenUsage;
   transcript: TranscriptEntry[];
 }

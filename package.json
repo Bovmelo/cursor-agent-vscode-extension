@@ -2,7 +2,7 @@
   "name": "cursor-subscription-for-vscode",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "publisher": "ark4ez",
   "license": "MIT",
   "type": "module",
@@ -84,6 +84,10 @@
       {
         "command": "cursorSubscription.newChat",
         "title": "%command.newChat%"
+      },
+      {
+        "command": "cursorSubscription.findInChat",
+        "title": "%command.findInChat%"
       },
       {
         "command": "cursorSubscription.generateCommitMessage",

@@ -6,6 +6,7 @@
   "command.setApiKey": "Cursor: APIキーを設定",
   "command.clearApiKey": "Cursor: APIキーを削除",
   "command.newChat": "Cursor: 新規チャット",
+  "command.findInChat": "Cursor: 会話内を検索",
   "command.generateCommitMessage": "Cursor: コミットメッセージを生成",
   "command.createPullRequest": "Cursor: ブランチとプルリクエストを作成",
   "command.generateCode": "Cursor: コードを生成",

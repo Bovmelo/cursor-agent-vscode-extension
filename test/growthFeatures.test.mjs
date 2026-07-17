@@ -6,10 +6,13 @@ import {
 } from "../out/auditLog.js";
 import {
   attachSubtasks,
+  buildOrchestratorDetail,
   buildSynthesisPrompt,
   createOrchestratorExperiment,
+  extractSubagentName,
   markSubtaskConversation,
   markSubtaskStatus,
+  orchestratorSummaries,
   parseOrchestratorSubtasks,
 } from "../out/orchestrator.js";
 import {
@@ -88,6 +91,29 @@ test("orchestrator parses subtasks and advances through synthesis", () => {
   experiment = markSubtaskStatus(experiment, "c2", "completed");
   assert.equal(experiment.status, "synthesizing");
   assert.match(buildSynthesisPrompt(experiment), /Integrate the parallel subtask/);
+
+  const summaries = orchestratorSummaries([experiment]);
+  assert.equal(summaries[0].subtaskCount, 2);
+  assert.equal(summaries[0].completedCount, 2);
+  assert.equal(summaries[0].status, "synthesizing");
+
+  const detail = buildOrchestratorDetail(experiment, new Set(["c1"]));
+  assert.equal(detail.subtasks[0].running, true);
+  assert.equal(detail.subtasks[1].running, false);
+  assert.equal(detail.subtasks[0].activity, undefined);
+
+  const withActivity = buildOrchestratorDetail(
+    experiment,
+    new Set(["c1"]),
+    new Map([["c1", { text: "Reading file: src/a.ts", path: "src/a.ts" }]]),
+  );
+  assert.equal(withActivity.subtasks[0].activity?.path, "src/a.ts");
+  assert.match(withActivity.subtasks[0].activity?.text ?? "", /Reading file/);
+  assert.equal(withActivity.subtasks[1].activity, undefined);
+
+  assert.equal(extractSubagentName({ subagent_type: "researcher" }), "researcher");
+  assert.equal(extractSubagentName({ name: "implementer" }), "implementer");
+  assert.equal(extractSubagentName({}), undefined);
 });
 
 test("audit log appends and formats markdown", () => {

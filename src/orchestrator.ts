@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
 
+export interface OrchestratorActivity {
+  text: string;
+  path?: string;
+}
+
 export interface OrchestratorSubtask {
   id: string;
   title: string;
@@ -136,6 +141,7 @@ export function orchestratorSummaries(
   id: string;
   prompt: string;
   status: OrchestratorExperiment["status"];
+  createdAt: number;
   subtaskCount: number;
   completedCount: number;
 }> {
@@ -143,7 +149,93 @@ export function orchestratorSummaries(
     id: experiment.id,
     prompt: experiment.prompt,
     status: experiment.status,
+    createdAt: experiment.createdAt,
     subtaskCount: experiment.subtasks.length,
     completedCount: experiment.subtasks.filter((subtask) => subtask.status === "completed").length,
   }));
+}
+
+export function buildOrchestratorDetail(
+  experiment: OrchestratorExperiment,
+  busyIds: ReadonlySet<string>,
+  activities: ReadonlyMap<string, OrchestratorActivity> = new Map(),
+): {
+  id: string;
+  prompt: string;
+  status: OrchestratorExperiment["status"];
+  createdAt: number;
+  error?: string;
+  plan: {
+    conversationId?: string;
+    running: boolean;
+    activity?: OrchestratorActivity;
+  };
+  synthesis: {
+    conversationId?: string;
+    running: boolean;
+    activity?: OrchestratorActivity;
+  };
+  subtasks: Array<{
+    id: string;
+    title: string;
+    status: OrchestratorSubtask["status"];
+    conversationId?: string;
+    running: boolean;
+    activity?: OrchestratorActivity;
+  }>;
+} {
+  const activityFor = (conversationId?: string): OrchestratorActivity | undefined =>
+    conversationId ? activities.get(conversationId) : undefined;
+
+  return {
+    id: experiment.id,
+    prompt: experiment.prompt,
+    status: experiment.status,
+    createdAt: experiment.createdAt,
+    error: experiment.error,
+    plan: {
+      conversationId: experiment.planConversationId,
+      running: experiment.planConversationId
+        ? busyIds.has(experiment.planConversationId)
+        : false,
+      activity: activityFor(experiment.planConversationId),
+    },
+    synthesis: {
+      conversationId: experiment.synthesisConversationId,
+      running: experiment.synthesisConversationId
+        ? busyIds.has(experiment.synthesisConversationId)
+        : false,
+      activity: activityFor(experiment.synthesisConversationId),
+    },
+    subtasks: experiment.subtasks.map((subtask) => ({
+      id: subtask.id,
+      title: subtask.title,
+      status: subtask.status,
+      conversationId: subtask.conversationId,
+      running: subtask.conversationId ? busyIds.has(subtask.conversationId) : false,
+      activity: activityFor(subtask.conversationId),
+    })),
+  };
+}
+
+/** Extract a short SDK subagent label from tool args when present. */
+export function extractSubagentName(args: unknown): string | undefined {
+  if (!args || typeof args !== "object") {
+    return undefined;
+  }
+  const record = args as Record<string, unknown>;
+  for (const key of ["subagent_type", "subagentType", "name", "agent", "type"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim().slice(0, 40);
+    }
+  }
+  const description = record.description;
+  if (typeof description === "string" && description.trim()) {
+    const token = description.trim().split(/\s+/)[0];
+    if (token) {
+      return token.slice(0, 40);
+    }
+  }
+  return undefined;
 }
