@@ -158,7 +158,7 @@ vscode.CodeLensProvider, vscode.Disposable {
   private sharedApplyQueue: ApplyQueue | undefined;
   private fileOwnership: FileOwnershipCoordinator | undefined;
   private readonly statusBar: vscode.StatusBarItem;
-  private treeView: vscode.TreeView<SupervisorNode> | undefined;
+  private treeView: { description?: string } | undefined;
 
   public readonly onDidChangeTreeData = this.changedEmitter.event;
   public readonly onDidChange = this.contentChangedEmitter.event;
@@ -265,7 +265,7 @@ vscode.CodeLensProvider, vscode.Disposable {
     this.scheduleAutoRun();
   }
 
-  public attachTreeView(treeView: vscode.TreeView<SupervisorNode>): void {
+  public attachTreeView(treeView: { description?: string }): void {
     this.treeView = treeView;
     this.updateStatusBar();
   }
@@ -1073,7 +1073,7 @@ vscode.CodeLensProvider, vscode.Disposable {
           openLabel,
         );
         if (answer === openLabel) {
-          await vscode.commands.executeCommand("cursorSubscription.supervisorTasks.focus");
+          await vscode.commands.executeCommand("cursorSubscription.focusWorkspaceInbox");
         }
       } else {
         this.output.appendLine(

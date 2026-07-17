@@ -52,6 +52,7 @@
   "command.discardBackgroundJob": "Discard Background Changes",
   "command.refreshAuditTimeline": "Refresh AI Audit Timeline",
   "view.agent": "Agent",
+  "view.workspaceTree": "Workspace",
   "view.changeSessions": "AI Change Session",
   "view.supervisorTasks": "AI Supervisor Inbox",
   "view.integrations": "Rules / Skills / MCP",

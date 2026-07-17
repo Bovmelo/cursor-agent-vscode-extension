@@ -386,4 +386,17 @@ test("webview message schema validation accepts known shapes and rejects junk", 
     path: "https://example.com",
   });
   assert.equal(external?.path, "https://example.com");
+
+  assert.equal(parseWebviewMessage({ type: "launchQueuedParallel" }), undefined);
+  const launchOne = parseWebviewMessage({
+    type: "launchQueuedParallel",
+    id: "q1",
+  });
+  assert.equal(launchOne?.type, "launchQueuedParallel");
+  assert.deepEqual(launchOne?.ids, ["q1"]);
+  const launchMany = parseWebviewMessage({
+    type: "launchQueuedParallel",
+    ids: ["q1", 2, "q2", ""],
+  });
+  assert.deepEqual(launchMany?.ids, ["q1", "q2"]);
 });

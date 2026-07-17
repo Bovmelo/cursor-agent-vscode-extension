@@ -66,11 +66,7 @@ Change sessions distinguish your pre-existing uncommitted work from AI edits, so
 Activity Bar **Cursor** container:
 
 - **Agent** — chat, models, profiles, usage, and parallel agents
-- **AI Change Session** — Autopilot history, Keep/Restore, verification, and revert
-- **AI Supervisor Inbox** — queued tasks, mode control, and per-file apply/discard
-- **Rules / Skills / MCP** — discover and toggle project rules, Skills, MCP servers, and commands
-- **Background Agents** — detached workers that survive window restarts
-- **AI Audit Timeline** — inspect apply, restore, PR, and plan actions
+- **Workspace** — one tree with groups for Sessions, Inbox, Rules / Skills / MCP, Background, and Audit (Keep/Restore, Supervisor apply/discard, integration toggles, detached workers, and the audit timeline)
 
 ## Slash commands
 

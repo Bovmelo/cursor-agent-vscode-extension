@@ -52,10 +52,7 @@
   },
   "activationEvents": [
     "onView:cursorSubscription.chatView",
-    "onView:cursorSubscription.changeSessions",
-    "onView:cursorSubscription.supervisorTasks",
-    "onView:cursorSubscription.backgroundJobs",
-    "onView:cursorSubscription.auditTimeline",
+    "onView:cursorSubscription.workspaceTree",
     "onCommand:cursorSubscription.generateCommitMessage",
     "onCommand:cursorSubscription.generateCode",
     "onCommand:cursorSubscription.explainSelection",
@@ -346,125 +343,123 @@
       "view/item/context": [
         {
           "command": "cursorSubscription.keepSessionEdit",
-          "when": "view == cursorSubscription.changeSessions && (viewItem == cursorAiSession.file.pending || viewItem == cursorAiSession.file.pendingKeepOnly)",
+          "when": "view == cursorSubscription.workspaceTree && (viewItem == cursorAiSession.file.pending || viewItem == cursorAiSession.file.pendingKeepOnly)",
           "group": "inline@1"
         },
         {
           "command": "cursorSubscription.restoreSessionEdit",
-          "when": "view == cursorSubscription.changeSessions && viewItem == cursorAiSession.file.pending",
+          "when": "view == cursorSubscription.workspaceTree && viewItem == cursorAiSession.file.pending",
           "group": "inline@2"
         },
         {
           "command": "cursorSubscription.runSupervisorTask",
-          "when": "view == cursorSubscription.supervisorTasks && (viewItem == cursorSupervisor.task.detected || viewItem == cursorSupervisor.task.queued || viewItem == cursorSupervisor.task.failed)",
+          "when": "view == cursorSubscription.workspaceTree && (viewItem == cursorSupervisor.task.detected || viewItem == cursorSupervisor.task.queued || viewItem == cursorSupervisor.task.failed)",
           "group": "inline@1"
         },
         {
           "command": "cursorSubscription.applyAllSupervisorChanges",
-          "when": "view == cursorSubscription.supervisorTasks && (viewItem == cursorSupervisor.task.review || viewItem == cursorSupervisor.task.blocked)",
+          "when": "view == cursorSubscription.workspaceTree && (viewItem == cursorSupervisor.task.review || viewItem == cursorSupervisor.task.blocked)",
           "group": "inline@1"
         },
         {
           "command": "cursorSubscription.discardAllSupervisorChanges",
-          "when": "view == cursorSubscription.supervisorTasks && (viewItem == cursorSupervisor.task.review || viewItem == cursorSupervisor.task.blocked)",
+          "when": "view == cursorSubscription.workspaceTree && (viewItem == cursorSupervisor.task.review || viewItem == cursorSupervisor.task.blocked)",
           "group": "inline@2"
         },
         {
           "command": "cursorSubscription.dismissSupervisorTask",
-          "when": "view == cursorSubscription.supervisorTasks && (viewItem == cursorSupervisor.task.detected || viewItem == cursorSupervisor.task.queued || viewItem == cursorSupervisor.task.failed || viewItem == cursorSupervisor.task.completed)",
+          "when": "view == cursorSubscription.workspaceTree && (viewItem == cursorSupervisor.task.detected || viewItem == cursorSupervisor.task.queued || viewItem == cursorSupervisor.task.failed || viewItem == cursorSupervisor.task.completed)",
           "group": "inline@3"
         },
         {
           "command": "cursorSubscription.applySupervisorChange",
-          "when": "view == cursorSubscription.supervisorTasks && viewItem == cursorSupervisor.change.pending",
+          "when": "view == cursorSubscription.workspaceTree && viewItem == cursorSupervisor.change.pending",
           "group": "inline@1"
         },
         {
           "command": "cursorSubscription.discardSupervisorChange",
-          "when": "view == cursorSubscription.supervisorTasks && (viewItem == cursorSupervisor.change.pending || viewItem == cursorSupervisor.change.excluded)",
+          "when": "view == cursorSubscription.workspaceTree && (viewItem == cursorSupervisor.change.pending || viewItem == cursorSupervisor.change.excluded)",
           "group": "inline@2"
         },
         {
           "command": "cursorSubscription.enableIntegration",
-          "when": "view == cursorSubscription.integrations && viewItem == cursorIntegration.item.disabled",
+          "when": "view == cursorSubscription.workspaceTree && viewItem == cursorIntegration.item.disabled",
           "group": "inline@1"
         },
         {
           "command": "cursorSubscription.disableIntegration",
-          "when": "view == cursorSubscription.integrations && viewItem == cursorIntegration.item.enabled",
+          "when": "view == cursorSubscription.workspaceTree && viewItem == cursorIntegration.item.enabled",
           "group": "inline@1"
         },
         {
           "command": "cursorSubscription.openIntegration",
-          "when": "view == cursorSubscription.integrations && viewItem =~ /cursorIntegration\\.item\\./",
+          "when": "view == cursorSubscription.workspaceTree && viewItem =~ /cursorIntegration\\.item\\./",
           "group": "inline@2"
         },
         {
           "command": "cursorSubscription.applyBackgroundJob",
-          "when": "view == cursorSubscription.backgroundJobs && viewItem == cursorBackground.job.completed",
+          "when": "view == cursorSubscription.workspaceTree && viewItem == cursorBackground.job.completed",
           "group": "inline@1"
         },
         {
           "command": "cursorSubscription.cancelBackgroundJob",
-          "when": "view == cursorSubscription.backgroundJobs && (viewItem == cursorBackground.job.starting || viewItem == cursorBackground.job.running)",
+          "when": "view == cursorSubscription.workspaceTree && (viewItem == cursorBackground.job.starting || viewItem == cursorBackground.job.running)",
           "group": "inline@1"
         },
         {
           "command": "cursorSubscription.discardBackgroundJob",
-          "when": "view == cursorSubscription.backgroundJobs && (viewItem == cursorBackground.job.completed || viewItem == cursorBackground.job.error || viewItem == cursorBackground.job.cancelled)",
+          "when": "view == cursorSubscription.workspaceTree && (viewItem == cursorBackground.job.completed || viewItem == cursorBackground.job.error || viewItem == cursorBackground.job.cancelled)",
           "group": "inline@2"
-        }
-      ],
-      "view/title": [
+        },
         {
           "command": "cursorSubscription.createSupervisorTask",
-          "when": "view == cursorSubscription.supervisorTasks",
-          "group": "navigation@1"
+          "when": "view == cursorSubscription.workspaceTree && viewItem == cursorSidebar.group.inbox",
+          "group": "1_inbox@1"
         },
         {
           "command": "cursorSubscription.scanSupervisorDiagnostics",
-          "when": "view == cursorSubscription.supervisorTasks",
-          "group": "navigation@2"
+          "when": "view == cursorSubscription.workspaceTree && viewItem == cursorSidebar.group.inbox",
+          "group": "1_inbox@2"
         },
         {
           "command": "cursorSubscription.chooseSupervisorMode",
-          "when": "view == cursorSubscription.supervisorTasks",
-          "group": "navigation@3"
+          "when": "view == cursorSubscription.workspaceTree && viewItem == cursorSidebar.group.inbox",
+          "group": "1_inbox@3"
         },
         {
           "command": "cursorSubscription.scanSupervisorTodos",
-          "when": "view == cursorSubscription.supervisorTasks",
-          "group": "navigation@4"
+          "when": "view == cursorSubscription.workspaceTree && viewItem == cursorSidebar.group.inbox",
+          "group": "1_inbox@4"
         },
         {
           "command": "cursorSubscription.scanSupervisorGitHub",
-          "when": "view == cursorSubscription.supervisorTasks",
-          "group": "navigation@5"
+          "when": "view == cursorSubscription.workspaceTree && viewItem == cursorSidebar.group.inbox",
+          "group": "1_inbox@5"
         },
         {
           "command": "cursorSubscription.refreshIntegrations",
-          "when": "view == cursorSubscription.integrations",
-          "group": "navigation@1"
+          "when": "view == cursorSubscription.workspaceTree && viewItem == cursorSidebar.group.integrations",
+          "group": "1_integrations@1"
         },
         {
           "command": "cursorSubscription.startBackgroundJob",
-          "when": "view == cursorSubscription.backgroundJobs",
-          "group": "navigation@1"
+          "when": "view == cursorSubscription.workspaceTree && viewItem == cursorSidebar.group.background",
+          "group": "1_background@1"
         },
         {
           "command": "cursorSubscription.refreshBackgroundJobs",
-          "when": "view == cursorSubscription.backgroundJobs",
-          "group": "navigation@2"
+          "when": "view == cursorSubscription.workspaceTree && viewItem == cursorSidebar.group.background",
+          "group": "1_background@2"
         },
         {
           "command": "cursorSubscription.refreshAuditTimeline",
-          "when": "view == cursorSubscription.auditTimeline",
-          "group": "navigation@1"
+          "when": "view == cursorSubscription.workspaceTree && viewItem == cursorSidebar.group.audit",
+          "group": "1_audit@1"
         },
         {
           "command": "cursorSubscription.exportAuditLog",
-          "when": "view == cursorSubscription.auditTimeline",
-          "group": "navigation@2"
+          "when": "view == cursorSubscription.workspaceTree && viewItem == cursorSidebar.group.audit",
+          "group": "1_audit@2"
         }
       ]
     },
@@ -486,34 +481,9 @@
           "initialSize": 12
         },
         {
-          "id": "cursorSubscription.changeSessions",
-          "name": "%view.changeSessions%",
-          "visibility": "hidden",
-          "initialSize": 2
-        },
-        {
-          "id": "cursorSubscription.supervisorTasks",
-          "name": "%view.supervisorTasks%",
-          "visibility": "hidden",
-          "initialSize": 2
-        },
-        {
-          "id": "cursorSubscription.integrations",
-          "name": "%view.integrations%",
-          "visibility": "hidden",
-          "initialSize": 2
-        },
-        {
-          "id": "cursorSubscription.backgroundJobs",
-          "name": "%view.backgroundJobs%",
-          "visibility": "hidden",
-          "initialSize": 2
-        },
-        {
-          "id": "cursorSubscription.auditTimeline",
-          "name": "%view.auditTimeline%",
-          "visibility": "hidden",
-          "initialSize": 2
+          "id": "cursorSubscription.workspaceTree",
+          "name": "%view.workspaceTree%",
+          "initialSize": 4
         }
       ]
     },

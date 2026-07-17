@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseCommandLine, quoteForCmd, toExecFileInvocation } from "../out/shellCommand.js";
+import {
+  parseCommandLine,
+  quoteForCmd,
+  runConfiguredCommand,
+  toExecFileInvocation,
+} from "../out/shellCommand.js";
 import { minimalShellEnv } from "../out/shellEnv.js";
 import { isPathInside, resolveCanonicalPath, safeResolvePathResolved } from "../out/safety.js";
 import { mkdtemp, mkdir, symlink, writeFile, rm } from "node:fs/promises";
@@ -32,13 +37,22 @@ test("toExecFileInvocation routes Windows batch files through cmd.exe", () => {
   if (process.platform === "win32") {
     assert.equal(invocation.file.toLowerCase().endsWith("cmd.exe"), true);
     assert.deepEqual(invocation.args.slice(0, 3), ["/d", "/s", "/c"]);
-    assert.equal(invocation.args[3], "npm.cmd run validate");
+    assert.equal(invocation.args[3], "npm run validate");
   } else {
     assert.deepEqual(invocation, npm);
   }
 
   const node = parseCommandLine("node ./scripts/run.js");
   assert.deepEqual(toExecFileInvocation(node), node);
+});
+
+test("runConfiguredCommand can spawn npm without EINVAL", async () => {
+  const { stdout } = await runConfiguredCommand("npm -v", {
+    cwd: process.cwd(),
+    timeout: 60_000,
+    maxBuffer: 1024 * 1024,
+  });
+  assert.match(stdout.trim(), /^\d+\.\d+/);
 });
 
 test("minimalShellEnv forwards only an allowlisted subset", () => {

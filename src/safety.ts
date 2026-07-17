@@ -413,6 +413,7 @@ export type WebviewIncomingType =
   | "queueMessage"
   | "interruptMessage"
   | "removeQueuedMessage"
+  | "launchQueuedParallel"
   | "pickImages"
   | "openSkillsFolder"
   | "openMcpSettings"
@@ -454,6 +455,7 @@ const WEBVIEW_TYPES = new Set<string>([
   "queueMessage",
   "interruptMessage",
   "removeQueuedMessage",
+  "launchQueuedParallel",
   "pickImages",
   "openSkillsFolder",
   "openMcpSettings",
@@ -509,6 +511,7 @@ export interface ParsedWebviewMessage {
   enabled?: boolean;
   path?: string;
   id?: string;
+  ids?: string[];
   uploads?: { name?: unknown; data?: unknown }[];
   pinned?: boolean;
   format?: string;
@@ -561,6 +564,18 @@ export function parseWebviewMessage(raw: unknown): ParsedWebviewMessage | undefi
     return undefined;
   }
 
+  let launchIds: string[] | undefined;
+  if (type === "launchQueuedParallel") {
+    const fromIds = asStringArray(message.ids)?.filter((id) => id.length > 0);
+    if (fromIds && fromIds.length > 0) {
+      launchIds = fromIds;
+    } else if (typeof message.id === "string" && message.id.length > 0) {
+      launchIds = [message.id];
+    } else {
+      return undefined;
+    }
+  }
+
   if (type === "setAlertSetting") {
     if (typeof message.setting !== "string" || typeof message.enabled !== "boolean") {
       return undefined;
@@ -595,6 +610,7 @@ export function parseWebviewMessage(raw: unknown): ParsedWebviewMessage | undefi
     enabled: typeof message.enabled === "boolean" ? message.enabled : undefined,
     path: typeof message.path === "string" ? message.path : undefined,
     id: typeof message.id === "string" ? message.id : undefined,
+    ids: launchIds ?? asStringArray(message.ids),
     uploads: Array.isArray(message.uploads)
       ? message.uploads as { name?: unknown; data?: unknown }[]
       : undefined,

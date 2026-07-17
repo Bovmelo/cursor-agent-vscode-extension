@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Merge the five sidebar tree views into one **Workspace** tree (Sessions / Inbox / Rules / Background / Audit) so the Agent chat view can use more vertical space
 - Harden remaining safety gaps: run hooks/verification via `execFile` (no shell), symlink-aware path containment, transactional isolated apply with rollback, shared chat/Supervisor apply queue and file ownership, unified sensitive-path defaults, and skip baseline backups for excluded paths
 - Scrub secret-like files from isolated worktrees before agents run, run pre-edit hooks for Supervisor/background worktrees, and drop background-worker API key copies after agent creation
 

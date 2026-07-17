@@ -19,6 +19,7 @@ import {
 import * as vscode from "vscode";
 import { AgentFactory } from "./agentFactory.js";
 import { AttachmentService } from "./attachmentService.js";
+import { normalizeAttachedFilePath } from "./attachmentUtils.js";
 import { ChatRuntime, type CursorAgent, type CursorRun } from "./chatRuntime.js";
 import {
   type AttachedFileReference,
@@ -86,6 +87,11 @@ import {
   type AuditEntry,
 } from "./auditLog.js";
 import { IntegrationCatalogController } from "./integrationCatalogView.js";
+import {
+  unwrapWorkspaceNode,
+  WorkspaceSidebarController,
+  WORKSPACE_TREE_VIEW_ID,
+} from "./workspaceSidebar.js";
 import {
   INTEGRATION_TOGGLE_KEY,
   type IntegrationToggleState,
@@ -288,16 +294,19 @@ export function activate(context: vscode.ExtensionContext): void {
     () => supervisorRunner.isAtCapacity(),
     (taskId) => supervisorRunner.cancel(taskId),
   );
-  const supervisorTree = vscode.window.createTreeView(
-    "cursorSubscription.supervisorTasks",
-    { treeDataProvider: supervisor },
-  );
-  supervisor.attachTreeView(supervisorTree);
   const integrations = new IntegrationCatalogController(context.workspaceState, IS_JAPANESE);
-  const integrationsTree = vscode.window.createTreeView(
-    "cursorSubscription.integrations",
-    { treeDataProvider: integrations },
-  );
+  const workspaceSidebar = new WorkspaceSidebarController(IS_JAPANESE, {
+    sessions: changeSessions,
+    inbox: supervisor,
+    integrations,
+    background: backgroundJobs,
+    audit: auditTimeline,
+  });
+  const workspaceTree = vscode.window.createTreeView(WORKSPACE_TREE_VIEW_ID, {
+    treeDataProvider: workspaceSidebar,
+  });
+  workspaceSidebar.attachTreeView(workspaceTree);
+  supervisor.attachTreeView(workspaceTree);
   supervisor.setAuditSink((event) => {
     void provider.recordAudit(event);
   });
@@ -324,22 +333,10 @@ export function activate(context: vscode.ExtensionContext): void {
     provider,
     auditTimeline,
     backgroundJobs,
-    supervisorTree,
+    workspaceSidebar,
+    workspaceTree,
     integrations,
-    integrationsTree,
     orphanCleanupSubscription,
-    vscode.window.registerTreeDataProvider(
-      "cursorSubscription.changeSessions",
-      changeSessions,
-    ),
-    vscode.window.registerTreeDataProvider(
-      "cursorSubscription.auditTimeline",
-      auditTimeline,
-    ),
-    vscode.window.registerTreeDataProvider(
-      "cursorSubscription.backgroundJobs",
-      backgroundJobs,
-    ),
     vscode.workspace.registerTextDocumentContentProvider(
       "cursor-supervisor-preview",
       supervisor,
@@ -382,12 +379,16 @@ export function activate(context: vscode.ExtensionContext): void {
       backgroundJobs.create()),
     vscode.commands.registerCommand("cursorSubscription.refreshBackgroundJobs", () =>
       backgroundJobs.refresh()),
+    vscode.commands.registerCommand("cursorSubscription.focusWorkspaceSessions", () =>
+      workspaceSidebar.focusGroup("sessions")),
+    vscode.commands.registerCommand("cursorSubscription.focusWorkspaceInbox", () =>
+      workspaceSidebar.focusGroup("inbox")),
     vscode.commands.registerCommand("cursorSubscription.applyBackgroundJob", (target) =>
-      backgroundJobs.apply(target)),
+      backgroundJobs.apply(unwrapWorkspaceNode(target))),
     vscode.commands.registerCommand("cursorSubscription.cancelBackgroundJob", (target) =>
-      backgroundJobs.cancel(target)),
+      backgroundJobs.cancel(unwrapWorkspaceNode(target))),
     vscode.commands.registerCommand("cursorSubscription.discardBackgroundJob", (target) =>
-      backgroundJobs.discard(target)),
+      backgroundJobs.discard(unwrapWorkspaceNode(target))),
     vscode.commands.registerCommand("cursorSubscription.refreshAuditTimeline", () =>
       auditTimeline.refresh()),
     vscode.commands.registerCommand(
@@ -480,13 +481,17 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand(
       "cursorSubscription.keepSessionEdit",
-      (target: { sessionId?: string; file?: string }) =>
-        provider.keepSessionEdit(target?.sessionId, target?.file),
+      (target: unknown) => {
+        const node = unwrapWorkspaceNode<{ sessionId?: string; file?: string }>(target);
+        return provider.keepSessionEdit(node?.sessionId, node?.file);
+      },
     ),
     vscode.commands.registerCommand(
       "cursorSubscription.restoreSessionEdit",
-      (target: { sessionId?: string; file?: string }) =>
-        provider.restoreSessionEdit(target?.sessionId, target?.file),
+      (target: unknown) => {
+        const node = unwrapWorkspaceNode<{ sessionId?: string; file?: string }>(target);
+        return provider.restoreSessionEdit(node?.sessionId, node?.file);
+      },
     ),
     vscode.commands.registerCommand(
       "cursorSubscription.keepAllSessionEdits",
@@ -512,35 +517,43 @@ export function activate(context: vscode.ExtensionContext): void {
       supervisor.scanDiagnostics()),
     vscode.commands.registerCommand(
       "cursorSubscription.runSupervisorTask",
-      (target?: SupervisorTaskTarget | string) => supervisor.runTask(target),
+      (target?: SupervisorTaskTarget | string) =>
+        supervisor.runTask(unwrapWorkspaceNode(target)),
     ),
     vscode.commands.registerCommand(
       "cursorSubscription.openSupervisorChange",
-      (target?: SupervisorTaskTarget) => supervisor.openChange(target),
+      (target?: SupervisorTaskTarget) =>
+        supervisor.openChange(unwrapWorkspaceNode(target)),
     ),
     vscode.commands.registerCommand(
       "cursorSubscription.showSupervisorChangeReason",
-      (target?: SupervisorTaskTarget) => supervisor.showChangeReason(target),
+      (target?: SupervisorTaskTarget) =>
+        supervisor.showChangeReason(unwrapWorkspaceNode(target)),
     ),
     vscode.commands.registerCommand(
       "cursorSubscription.applySupervisorChange",
-      (target?: SupervisorTaskTarget) => supervisor.applyChange(target),
+      (target?: SupervisorTaskTarget) =>
+        supervisor.applyChange(unwrapWorkspaceNode(target)),
     ),
     vscode.commands.registerCommand(
       "cursorSubscription.discardSupervisorChange",
-      (target?: SupervisorTaskTarget) => supervisor.discardChange(target),
+      (target?: SupervisorTaskTarget) =>
+        supervisor.discardChange(unwrapWorkspaceNode(target)),
     ),
     vscode.commands.registerCommand(
       "cursorSubscription.applyAllSupervisorChanges",
-      (target?: SupervisorTaskTarget | string) => supervisor.applyAll(target),
+      (target?: SupervisorTaskTarget | string) =>
+        supervisor.applyAll(unwrapWorkspaceNode(target)),
     ),
     vscode.commands.registerCommand(
       "cursorSubscription.discardAllSupervisorChanges",
-      (target?: SupervisorTaskTarget | string) => supervisor.discardAll(target),
+      (target?: SupervisorTaskTarget | string) =>
+        supervisor.discardAll(unwrapWorkspaceNode(target)),
     ),
     vscode.commands.registerCommand(
       "cursorSubscription.dismissSupervisorTask",
-      (target?: SupervisorTaskTarget | string) => supervisor.dismissTask(target),
+      (target?: SupervisorTaskTarget | string) =>
+        supervisor.dismissTask(unwrapWorkspaceNode(target)),
     ),
     vscode.commands.registerCommand("cursorSubscription.runTaskPipeline", () =>
       provider.runTaskPipeline()),
@@ -554,25 +567,25 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand(
       "cursorSubscription.previewIntegration",
-      (target?: string) => integrations.preview(target),
+      (target?: unknown) => integrations.preview(unwrapWorkspaceNode(target)),
     ),
     vscode.commands.registerCommand(
       "cursorSubscription.enableIntegration",
-      async (target?: string) => {
-        await integrations.toggle(target, true);
+      async (target?: unknown) => {
+        await integrations.toggle(unwrapWorkspaceNode(target), true);
         await provider.refreshIntegrationIndex();
       },
     ),
     vscode.commands.registerCommand(
       "cursorSubscription.disableIntegration",
-      async (target?: string) => {
-        await integrations.toggle(target, false);
+      async (target?: unknown) => {
+        await integrations.toggle(unwrapWorkspaceNode(target), false);
         await provider.refreshIntegrationIndex();
       },
     ),
     vscode.commands.registerCommand(
       "cursorSubscription.openIntegration",
-      (target?: string) => integrations.open(target),
+      (target?: unknown) => integrations.open(unwrapWorkspaceNode(target)),
     ),
     vscode.commands.registerCommand("cursorSubscription.scanSupervisorTodos", () =>
       supervisor.scanTodos()),
@@ -762,12 +775,20 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               if (typeof message.modelId === "string") {
                 await this.storeModelSelection(message.modelId, message.modelParams);
               }
+              const sendFiles = Array.isArray(message.files)
+                ? message.files.filter((file): file is string => typeof file === "string")
+                : [];
+              const sendPrompt = message.prompt.trim()
+                || (sendFiles.length > 0
+                  ? localize(
+                      "Please look at the attached image(s).",
+                      "添付画像を確認してください。",
+                    )
+                  : "");
               await this.send(
-                message.prompt.trim(),
+                sendPrompt,
                 message.attachContext === true,
-                Array.isArray(message.files)
-                  ? message.files.filter((file): file is string => typeof file === "string")
-                  : [],
+                sendFiles,
                 this.isRunProfile(message.profile) ? message.profile : "agent",
                 Array.isArray(message.skills)
                   ? message.skills.filter((skill): skill is string => typeof skill === "string")
@@ -812,6 +833,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             if (typeof message.id === "string") {
               this.removeQueuedMessage(message.id);
             }
+            break;
+          case "launchQueuedParallel":
+            await this.launchQueuedMessagesParallel(
+              Array.isArray(message.ids) && message.ids.length > 0
+                ? message.ids
+                : typeof message.id === "string"
+                  ? [message.id]
+                  : [],
+            );
             break;
           case "pickImages":
             await this.pickImages(
@@ -4489,6 +4519,122 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.postQueueState();
   }
 
+  /**
+   * Move selected queued prompts into new conversations and start them as
+   * parallel agents without leaving the active chat.
+   */
+  private async launchQueuedMessagesParallel(ids: string[]): Promise<void> {
+    const wanted = new Set(ids.filter((id) => id.length > 0));
+    if (wanted.size === 0) {
+      return;
+    }
+
+    const items = this.messageQueue.filter(
+      (item) =>
+        wanted.has(item.id)
+        && item.kind !== "interrupt"
+        && (!this.activeId || item.conversationId === this.activeId),
+    );
+    if (items.length === 0) {
+      return;
+    }
+
+    const maximumParallelAgents = Math.max(
+      1,
+      this.alertConfiguration().get<number>("maxParallelChatAgents", 3),
+    );
+    if (!canStartAnotherParallelAgent(this.activeRunCount(), maximumParallelAgents)) {
+      this.post({
+        type: "error",
+        text: localize(
+          `The parallel chat-agent limit (${maximumParallelAgents}) has been reached. Wait for a run to finish or increase cursorSubscription.maxParallelChatAgents.`,
+          `並列チャットAgentの上限（${maximumParallelAgents}）に達しました。完了を待つか、cursorSubscription.maxParallelChatAgents を増やしてください。`,
+        ),
+      });
+      return;
+    }
+
+    const available = Math.max(0, maximumParallelAgents - this.activeRunCount());
+    const launchable = items.slice(0, available);
+    const skippedForLimit = items.length - launchable.length;
+    const launchIds = new Set(launchable.map((item) => item.id));
+    this.messageQueue.splice(
+      0,
+      this.messageQueue.length,
+      ...removeQueuedMessages(
+        this.messageQueue,
+        (item) => launchIds.has(item.id),
+      ) as QueuedMessage[],
+    );
+    this.postQueueState();
+
+    const workspaceFolderUri = this.resolveChatWorkspace()?.uri.toString();
+    const pending = [...launchable];
+    let launched = 0;
+    while (pending.length > 0) {
+      if (!canStartAnotherParallelAgent(this.activeRunCount(), maximumParallelAgents)) {
+        break;
+      }
+      const item = pending.shift()!;
+      const conversation: Conversation = {
+        id: randomUUID(),
+        title: makeConversationTitle(item.prompt),
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        workspaceFolderUri,
+        transcript: [],
+      };
+      this.conversations.unshift(conversation);
+
+      const started = await this.send(
+        item.prompt,
+        item.attachContext,
+        item.files,
+        item.profile,
+        item.skills,
+        conversation.id,
+        item.model,
+        item.editorContext,
+        item.internalRepair === true,
+        false,
+        item.commandId,
+        item.includeProjectMemory !== false,
+      );
+      if (!started) {
+        this.conversations.splice(
+          0,
+          this.conversations.length,
+          ...this.conversations.filter((candidate) => candidate.id !== conversation.id),
+        );
+        pending.unshift(item);
+        break;
+      }
+      launched += 1;
+    }
+
+    if (pending.length > 0) {
+      let queue: QueuedMessage[] = this.messageQueue;
+      for (const item of pending) {
+        queue = requeueUnstartedMessage(queue, item);
+      }
+      this.messageQueue.splice(0, this.messageQueue.length, ...queue);
+      this.postQueueState();
+    }
+
+    if (skippedForLimit > 0 || pending.length > 0) {
+      this.post({
+        type: "error",
+        text: localize(
+          `Started ${launched} parallel agent(s). ${skippedForLimit + pending.length} message(s) stayed queued (limit or start failure).`,
+          `${launched}件を並列Agentで起動しました。${skippedForLimit + pending.length}件は上限または起動失敗のためキューに残しました。`,
+        ),
+      });
+    }
+
+    await this.saveConversations();
+    this.postParallelState();
+  }
+
   private async drainMessageQueue(conversationId?: string): Promise<void> {
     if (!conversationId) {
       const conversationIds = [...new Set(this.messageQueue.map((item) => item.conversationId))];
@@ -4768,6 +4914,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         });
       }
       const attachedFiles = await this.attachmentService.resolveAttachedFiles(requestedFiles, workspace);
+      if (requestedFiles.length > 0 && attachedFiles.length === 0) {
+        void vscode.window.showWarningMessage(localize(
+          "Attached files could not be read and were omitted from this message.",
+          "添付ファイルを読み取れなかったため、このメッセージからは除外されました。",
+        ));
+      }
       attachmentReferences = await this.attachmentService.stageExternalAttachments(
         attachedFiles,
         workspace,
@@ -4784,6 +4936,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         workspace,
       ));
       images = await this.attachmentService.loadAttachedImages(attachedFiles, workspace);
+      const attachedVisionCount = attachedFiles.filter((file) =>
+        /\.(gif|jfif|jpe?g|png|webp)$/i.test(file)
+      ).length;
+      if (attachedVisionCount > 0 && images.length === 0) {
+        void vscode.window.showWarningMessage(localize(
+          "Attached images could not be loaded for the model (missing or over the size limit).",
+          "添付画像をモデル向けに読み込めませんでした（欠落またはサイズ上限超過）。",
+        ));
+      }
       if (shouldStartChangeSession) {
         if (!runtime.isolatedWorktree) {
           await runConfiguredHooks("preEdit", workspace.uri.fsPath, this.output);
@@ -5631,10 +5792,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
     const pending = this.changeSessions.pendingFiles(session.id).length;
     if (pending > 0) {
-      void vscode.commands.executeCommand("cursorSubscription.changeSessions.focus");
+      void vscode.commands.executeCommand("cursorSubscription.focusWorkspaceSessions");
       void vscode.window.showInformationMessage(localize(
-        `${pending} AI-edited file(s) remain pending. Resolve them in the AI Change Session view before verification.`,
-        `${pending}件のAI編集が確認待ちです。検証前にAI変更セッションビューで確定してください。`,
+        `${pending} AI-edited file(s) remain pending. Resolve them under Workspace → Sessions before verification.`,
+        `${pending}件のAI編集が確認待ちです。検証前にワークスペース → Sessions で確定してください。`,
       ));
     }
   }
@@ -6084,7 +6245,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const files = await this.attachmentService.pickImages();
     if (files.length > 0) {
       await this.resolveAttachmentReferences(files, requestId);
+      return;
     }
+    // Always reply so the webview can clear its pending-attachment gate on cancel.
+    this.post({ type: "resolvedAttachments", requestId, files: [] });
   }
 
   private async resolveAttachmentReferences(
@@ -6093,7 +6257,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     uploads: DroppedFileUpload[] = [],
   ): Promise<void> {
     const workspace = resolveWorkspaceFolder() ?? vscode.workspace.workspaceFolders?.[0];
-    if (!workspace && (vscode.workspace.workspaceFolders?.length ?? 0) === 0) {
+    const hasWorkspaceFolders = (vscode.workspace.workspaceFolders?.length ?? 0) > 0;
+    // Clipboard uploads stage under globalStorage and do not require a workspace.
+    // Path references still need an open folder when nothing was uploaded.
+    if (!workspace && !hasWorkspaceFolders && uploads.length === 0) {
       this.post({ type: "resolvedAttachments", requestId, files: [] });
       void vscode.window.showWarningMessage(localize(
         "Open a workspace folder to attach dropped files.",
@@ -6103,7 +6270,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
 
     const preferred = workspace;
-    const workspaceFiles = await this.getWorkspaceFiles();
+    const workspaceFiles = preferred ? await this.getWorkspaceFiles() : [];
     const resolved = new Map<string, WorkspaceFileItem>();
     let rejected = 0;
 
@@ -6138,7 +6305,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
       const isAbsolute = path.isAbsolute(candidatePath);
       const hasDirectory = candidatePath.includes("/") || candidatePath.includes("\\");
-      const absolute = await resolveAbsoluteInWorkspaceResolved(candidatePath, preferred);
+      const workspaceAbsolute = await resolveAbsoluteInWorkspaceResolved(candidatePath, preferred);
+      const absolute = workspaceAbsolute
+        ?? (isAbsolute ? path.resolve(candidatePath) : undefined);
       let item: WorkspaceFileItem | undefined;
 
       if (absolute) {
@@ -6661,11 +6830,17 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private async openFile(filePath: string): Promise<void> {
-    const absolute = await resolveAbsoluteInWorkspaceResolved(
+    const workspaceAbsolute = await resolveAbsoluteInWorkspaceResolved(
       filePath,
       resolveWorkspaceFolder(),
     );
+    // Clipboard/picker images are staged under globalStorage outside the workspace.
+    const absolute = normalizeAttachedFilePath(filePath, workspaceAbsolute);
     if (!absolute) {
+      void vscode.window.showWarningMessage(localize(
+        `Could not open file: ${filePath}`,
+        `ファイルを開けませんでした: ${filePath}`,
+      ));
       return;
     }
     let uri = vscode.Uri.file(absolute);

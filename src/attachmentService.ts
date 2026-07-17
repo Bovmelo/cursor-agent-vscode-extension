@@ -9,6 +9,7 @@ import type {
   DroppedFileUpload,
   WorkspaceFileItem,
 } from "./chatTypes.js";
+import { coerceUploadBytes, normalizeAttachedFilePath } from "./attachmentUtils.js";
 import { resolveAbsoluteInWorkspaceResolved } from "./workspaceFolder.js";
 
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
@@ -50,7 +51,8 @@ export class AttachmentService {
   ): Promise<string[]> {
     const resolved: string[] = [];
     for (const requested of [...new Set(requestedFiles)].slice(0, 20)) {
-      const absolute = await resolveAbsoluteInWorkspaceResolved(requested, workspace);
+      const workspaceAbsolute = await resolveAbsoluteInWorkspaceResolved(requested, workspace);
+      const absolute = normalizeAttachedFilePath(requested, workspaceAbsolute);
       if (!absolute) continue;
       try {
         const uri = vscode.Uri.file(absolute);
@@ -74,7 +76,8 @@ export class AttachmentService {
     for (const file of files) {
       const format = IMAGE_FORMATS[path.extname(file).toLowerCase()];
       if (!format?.vision || images.length >= 8) continue;
-      const absolute = await resolveAbsoluteInWorkspaceResolved(file, workspace);
+      const workspaceAbsolute = await resolveAbsoluteInWorkspaceResolved(file, workspace);
+      const absolute = normalizeAttachedFilePath(file, workspaceAbsolute);
       if (!absolute) continue;
       try {
         const uri = vscode.Uri.file(absolute);
@@ -117,18 +120,7 @@ export class AttachmentService {
     let totalBytes = 0;
     for (const upload of uploads.slice(0, MAX_DROPPED_FILES)) {
       if (typeof upload?.name !== "string") continue;
-      let data: Uint8Array | undefined;
-      if (upload.data instanceof Uint8Array) data = upload.data;
-      else if (upload.data instanceof ArrayBuffer) data = new Uint8Array(upload.data);
-      else if (
-        Array.isArray(upload.data)
-        && upload.data.length <= MAX_DROPPED_FILE_BYTES
-        && upload.data.every(
-          (value) => Number.isInteger(value) && value >= 0 && value <= 255,
-        )
-      ) {
-        data = Uint8Array.from(upload.data);
-      }
+      const data = coerceUploadBytes(upload.data);
       if (!data || data.byteLength > MAX_DROPPED_FILE_BYTES) continue;
       if (totalBytes + data.byteLength > MAX_TOTAL_DROPPED_BYTES) break;
       totalBytes += data.byteLength;

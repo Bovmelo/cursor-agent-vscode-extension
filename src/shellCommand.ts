@@ -101,13 +101,31 @@ export function quoteForCmd(argument: string): string {
  * unless a shell is used. Route those through `cmd.exe /d /s /c` instead of
  * `shell: true`, so argv stays explicit after parseCommandLine validation.
  */
+function windowsCmdExe(): string {
+  if (process.env.ComSpec) {
+    return process.env.ComSpec;
+  }
+  if (process.env.SystemRoot) {
+    return path.join(process.env.SystemRoot, "System32", "cmd.exe");
+  }
+  return "cmd.exe";
+}
+
 export function toExecFileInvocation(parsed: ParsedCommand): ParsedCommand {
-  if (process.platform !== "win32" || !/\.(cmd|bat)$/i.test(parsed.file)) {
+  if (process.platform !== "win32") {
     return parsed;
   }
-  const commandLine = [parsed.file, ...parsed.args].map(quoteForCmd).join(" ");
+  const base = path.basename(parsed.file);
+  const isBatch = /\.(cmd|bat)$/i.test(parsed.file);
+  const isPkgManager = /^(npm|npx|pnpm|yarn|corepack)(\.cmd)?$/i.test(base);
+  if (!isBatch && !isPkgManager) {
+    return parsed;
+  }
+  // Prefer the bare name inside cmd.exe so PATHEXT resolves the shim.
+  const file = parsed.file.replace(/\.cmd$/i, "");
+  const commandLine = [file, ...parsed.args].map(quoteForCmd).join(" ");
   return {
-    file: process.env.ComSpec || "cmd.exe",
+    file: windowsCmdExe(),
     args: ["/d", "/s", "/c", commandLine],
   };
 }

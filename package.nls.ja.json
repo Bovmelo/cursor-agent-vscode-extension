@@ -52,6 +52,7 @@
   "command.discardBackgroundJob": "バックグラウンド変更を破棄",
   "command.refreshAuditTimeline": "AI監査タイムラインを更新",
   "view.agent": "エージェント",
+  "view.workspaceTree": "ワークスペース",
   "view.changeSessions": "AI変更セッション",
   "view.supervisorTasks": "AI Supervisor受信箱",
   "view.integrations": "Rules / Skills / MCP",

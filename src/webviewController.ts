@@ -106,6 +106,10 @@ export class WebviewController {
           queued: "キュー",
           interruptQueued: "割り込み",
           removeQueued: "キューから削除",
+          selectQueued: "並列実行の対象に選択",
+          runQueuedParallel: "別Agentで並列実行",
+          runSelectedParallel: "選択を並列実行",
+          runSelectedParallelTitle: "選択したメッセージを別Agentで並列実行",
           localRun: "ローカルで実行",
           checkingConnection: "接続を確認中…",
           justNow: "たった今",
@@ -148,6 +152,7 @@ export class WebviewController {
           dropHelp: "ファイルはShiftを押しながらドラッグ＆ドロップできます",
           dropFailed: "ドロップしたファイルを読み取れませんでした。Shiftを押しながらドロップしてください。",
           pasteFailed: "クリップボードの画像を読み取れませんでした。",
+          attachedImagePrompt: "添付画像を確認してください。",
           approvalMode: "実行権限",
           safeWorktree: "安全worktree（推奨）",
           safeWorktreeDescription: "自動レビューを使用し、編集を分離worktreeで実行します",
@@ -274,6 +279,10 @@ export class WebviewController {
           queued: "Queued",
           interruptQueued: "Interrupt",
           removeQueued: "Remove from queue",
+          selectQueued: "Select for parallel run",
+          runQueuedParallel: "Run as parallel agent",
+          runSelectedParallel: "Run selected in parallel",
+          runSelectedParallelTitle: "Run selected messages as parallel agents",
           localRun: "Run locally",
           checkingConnection: "Checking connection…",
           justNow: "Just now",
@@ -316,6 +325,7 @@ export class WebviewController {
           dropHelp: "Hold Shift while dragging and dropping to attach files",
           dropFailed: "Could not read the dropped files. Hold Shift while dropping.",
           pasteFailed: "Could not read the image from the clipboard.",
+          attachedImagePrompt: "Please look at the attached image(s).",
           approvalMode: "Execution permissions",
           safeWorktree: "Safe worktree (recommended)",
           safeWorktreeDescription: "Use Auto-review and run edits in a detached worktree",
@@ -592,12 +602,12 @@ export class WebviewController {
     .sound-option:hover { background: var(--vscode-menu-selectionBackground); }
     .sound-option input { margin: 0; accent-color: var(--vscode-focusBorder); }
 
-    /* ---- Sandbox warning: header chip + expandable panel ---- */
+    /* ---- Sandbox warning: header chip + overlay popover (no layout height) ---- */
+    .sandbox-control { position: relative; flex: none; }
     #sandboxBannerToggle {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      flex: none;
       width: 18px;
       height: 18px;
       margin: 0 2px 0 0;
@@ -629,18 +639,23 @@ export class WebviewController {
     }
     .sandbox-banner-icon { width: 11px; height: 11px; }
     #sandboxBanner {
+      position: absolute;
+      top: calc(100% + 4px);
+      right: 0;
+      z-index: 31;
       display: flex;
       align-items: flex-start;
       gap: 8px;
-      flex: none;
-      margin: 0 8px 4px;
-      padding: 5px 8px;
+      width: min(280px, calc(100vw - 16px));
+      margin: 0;
+      padding: 8px 10px;
       font-size: 11px;
       line-height: 1.4;
       color: var(--vscode-inputValidation-warningForeground, var(--vscode-foreground));
       background: var(--vscode-inputValidation-warningBackground, rgba(255, 200, 0, .12));
       border: 1px solid var(--vscode-inputValidation-warningBorder, rgba(255, 200, 0, .5));
       border-radius: 6px;
+      box-shadow: 0 4px 14px var(--vscode-widget-shadow, rgba(0, 0, 0, .3));
     }
     #sandboxBanner[hidden] { display: none; }
     .sandbox-banner-text { flex: 1; min-width: 0; }
@@ -1501,12 +1516,38 @@ export class WebviewController {
       border-radius: 8px;
     }
     #queueRow[hidden] { display: none; }
+    .queue-heading-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }
     .queue-heading {
+      flex: 1;
+      min-width: 0;
       color: var(--muted);
       font-size: 10px;
       font-weight: 600;
       letter-spacing: .02em;
       text-transform: uppercase;
+    }
+    .queue-run-selected {
+      flex: none;
+      padding: 2px 7px;
+      color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+      background: var(--vscode-button-secondaryBackground, transparent);
+      border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+      border-radius: 5px;
+      font: inherit;
+      font-size: 10px;
+      cursor: pointer;
+    }
+    .queue-run-selected:hover:not(:disabled) {
+      background: var(--vscode-toolbar-hoverBackground);
+    }
+    .queue-run-selected:disabled {
+      opacity: .45;
+      cursor: default;
     }
     .queue-item {
       display: flex;
@@ -1514,6 +1555,12 @@ export class WebviewController {
       gap: 6px;
       min-width: 0;
       font-size: 11px;
+    }
+    .queue-select {
+      flex: none;
+      margin: 0;
+      accent-color: var(--vscode-focusBorder);
+      cursor: pointer;
     }
     .queue-kind {
       flex: none;
@@ -1534,6 +1581,7 @@ export class WebviewController {
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+    .queue-parallel,
     .queue-remove {
       flex: none;
       padding: 0 3px;
@@ -1543,9 +1591,14 @@ export class WebviewController {
       border-radius: 3px;
       cursor: pointer;
     }
+    .queue-parallel:hover:not(:disabled),
     .queue-remove:hover {
       color: var(--vscode-foreground);
       background: var(--vscode-toolbar-hoverBackground);
+    }
+    .queue-parallel:disabled {
+      opacity: .45;
+      cursor: default;
     }
     .mention-chip {
       display: inline-flex;
@@ -1562,7 +1615,15 @@ export class WebviewController {
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      padding: 0;
+      color: inherit;
+      background: transparent;
+      border: 0;
+      font: inherit;
+      cursor: pointer;
+      text-align: left;
     }
+    .mention-chip-label:hover { text-decoration: underline; }
     .mention-remove {
       padding: 0 3px;
       color: inherit;
@@ -2137,12 +2198,18 @@ export class WebviewController {
   <div class="header">
     <span class="brand">Cursor</span>
     <span class="spacer"></span>
-    <button id="sandboxBannerToggle" type="button" hidden aria-expanded="false" aria-controls="sandboxBanner" title="${ui.expandSandboxBanner}" aria-label="${ui.sandboxBannerLabel}">
-      <svg class="sandbox-banner-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <path d="M8 1.6 1.8 4.3v3.4c0 3.6 2.5 5.9 6.2 7 3.7-1.1 6.2-3.4 6.2-7V4.3z"/>
-        <path d="M8 5.6v3.1M8 10.7v.05"/>
-      </svg>
-    </button>
+    <div class="sandbox-control">
+      <button id="sandboxBannerToggle" type="button" hidden aria-expanded="false" aria-controls="sandboxBanner" title="${ui.expandSandboxBanner}" aria-label="${ui.sandboxBannerLabel}">
+        <svg class="sandbox-banner-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M8 1.6 1.8 4.3v3.4c0 3.6 2.5 5.9 6.2 7 3.7-1.1 6.2-3.4 6.2-7V4.3z"/>
+          <path d="M8 5.6v3.1M8 10.7v.05"/>
+        </svg>
+      </button>
+      <div id="sandboxBanner" role="alert" hidden>
+        <span id="sandboxBannerText" class="sandbox-banner-text">${ui.sandboxBannerSafeText}</span>
+        <button id="sandboxBannerLearnMore" class="sandbox-banner-link" type="button">${ui.sandboxBannerLearnMore}</button>
+      </div>
+    </div>
     <button id="findInChatButton" class="icon-btn" type="button" title="${ui.findInChat}" aria-label="${ui.findInChat}" hidden>
       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="7" cy="7" r="4.2"/>
@@ -2203,11 +2270,6 @@ export class WebviewController {
         </button>
       </div>
     </div>
-  </div>
-
-  <div id="sandboxBanner" role="alert" hidden>
-    <span id="sandboxBannerText" class="sandbox-banner-text">${ui.sandboxBannerSafeText}</span>
-    <button id="sandboxBannerLearnMore" class="sandbox-banner-link" type="button">${ui.sandboxBannerLearnMore}</button>
   </div>
 
   <div id="parallelBar" hidden>
@@ -2543,6 +2605,8 @@ export class WebviewController {
     let workspacePaths = new Set();
     let workspaceBasenames = new Set();
     let attachmentRequestId = 0;
+    let pendingAttachmentResolves = 0;
+    const attachmentResolveWaiters = [];
     let availableModels = [];
     let selectedModelId = "auto";
     let modelParamState = {};
@@ -2551,6 +2615,7 @@ export class WebviewController {
     let selectedSkills = [];
     let availableMcpServers = [];
     let queuedMessages = [];
+    let selectedQueueIds = new Set();
     let followOutput = true;
 
     let parallelBarExpanded = false;
@@ -2804,6 +2869,7 @@ export class WebviewController {
       addMenuRow("▧", i18n.image, {
         onClick: () => {
           attachmentRequestId += 1;
+          markAttachmentResolveStarted();
           vscode.postMessage({ type: "pickImages", requestId: attachmentRequestId });
           closeAddMenu();
         },
@@ -4268,9 +4334,12 @@ export class WebviewController {
         chip.className = "mention-chip";
         chip.title = file.path;
 
-        const label = document.createElement("span");
+        const label = document.createElement("button");
         label.className = "mention-chip-label";
+        label.type = "button";
         label.textContent = "@" + file.path;
+        label.title = i18n.openFile + ": " + file.path;
+        label.addEventListener("click", () => vscode.postMessage({ type: "openFile", path: file.path }));
         const remove = document.createElement("button");
         remove.className = "mention-remove";
         remove.type = "button";
@@ -4310,12 +4379,17 @@ export class WebviewController {
         || lower.includes("code.uri");
     }
 
+    function isImageMimeType(type) {
+      return String(type || "").toLowerCase().startsWith("image/");
+    }
+
     function isFileDrag(transfer) {
       if (!transfer) return false;
       const types = Array.from(transfer.types || []).map((type) => String(type).toLowerCase());
       return (transfer.files?.length || 0) > 0
-        || Array.from(transfer.items || []).some((item) => item.kind === "file")
+        || Array.from(transfer.items || []).some((item) => item.kind === "file" || isImageMimeType(item.type))
         || types.includes("files")
+        || types.some(isImageMimeType)
         || types.some(isUriTransferType);
     }
 
@@ -4331,7 +4405,7 @@ export class WebviewController {
       };
       for (const file of Array.from(transfer?.files || [])) addFile(file);
       for (const item of Array.from(transfer?.items || [])) {
-        if (item.kind === "file") addFile(item.getAsFile());
+        if (item.kind === "file" || isImageMimeType(item.type)) addFile(item.getAsFile());
       }
       return files;
     }
@@ -4404,16 +4478,23 @@ export class WebviewController {
       return "clipboard-image-" + String(index + 1) + "." + extension;
     }
 
-    async function transferFileUploads(transfer) {
+    async function transferFileUploads(files) {
       const uploads = [];
-      const files = transferredFiles(transfer).slice(0, 20);
-      for (const [index, file] of files.entries()) {
-        if (file.path || file.webkitRelativePath) continue;
+      for (const [index, file] of files.slice(0, 20).entries()) {
+        // Clipboard screenshots are in-memory blobs. Prefer bytes even when the
+        // host stamps a non-resolvable Electron \`path\` onto the File object.
+        const hasOsPath = Boolean(file.path || file.webkitRelativePath);
+        const looksLikeClipboardImage = isImageMimeType(file.type)
+          || /^image\.(png|jpe?g|gif|webp)$/i.test(String(file.name || ""))
+          || /^clipboard-image-/i.test(String(file.name || ""));
+        if (hasOsPath && !looksLikeClipboardImage) continue;
         if (file.size > ${MAX_DROPPED_FILE_BYTES}) continue;
         try {
+          // Send a plain number[] so hosts that still JSON-encode webview
+          // messages (or mishandle TypedArrays) still revive the bytes.
           uploads.push({
             name: fallbackFileName(file, index),
-            data: new Uint8Array(await file.arrayBuffer()),
+            data: Array.from(new Uint8Array(await file.arrayBuffer())),
           });
         } catch {
           // The host may expose metadata without allowing the file contents to be read.
@@ -4426,22 +4507,64 @@ export class WebviewController {
       composerCard.classList.toggle("drag-active", active);
     }
 
-    async function resolveTransferredFiles(transfer, includePlainText, failureText) {
-      const references = transferFileReferences(transfer, includePlainText);
-      const uploads = references.length === 0
-        ? await transferFileUploads(transfer)
-        : [];
-      if (references.length === 0 && uploads.length === 0) {
-        status.textContent = failureText;
-        return;
-      }
-      attachmentRequestId += 1;
-      vscode.postMessage({
-        type: "resolveAttachments",
-        requestId: attachmentRequestId,
-        references,
-        uploads,
+    function notifyAttachmentIdle() {
+      if (pendingAttachmentResolves > 0) return;
+      const waiters = attachmentResolveWaiters.splice(0, attachmentResolveWaiters.length);
+      for (const resolve of waiters) resolve();
+    }
+
+    function markAttachmentResolveStarted() {
+      pendingAttachmentResolves += 1;
+    }
+
+    function markAttachmentResolveFinished() {
+      pendingAttachmentResolves = Math.max(0, pendingAttachmentResolves - 1);
+      notifyAttachmentIdle();
+    }
+
+    function waitForPendingAttachments() {
+      if (pendingAttachmentResolves === 0) return Promise.resolve();
+      return new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+          const index = attachmentResolveWaiters.indexOf(onReady);
+          if (index >= 0) attachmentResolveWaiters.splice(index, 1);
+          resolve();
+        }, 15000);
+        const onReady = () => {
+          clearTimeout(timeout);
+          resolve();
+        };
+        attachmentResolveWaiters.push(onReady);
       });
+    }
+
+    async function resolveTransferredFiles(transfer, includePlainText, failureText) {
+      // Capture File handles synchronously — clipboard DataTransfer clears after paste returns.
+      const files = transferredFiles(transfer);
+      const references = transferFileReferences(transfer, includePlainText);
+      markAttachmentResolveStarted();
+      try {
+        const uploads = await transferFileUploads(files);
+        // Prefer in-memory uploads when present (clipboard images), else path references.
+        const useUploads = uploads.length > 0;
+        const resolvedReferences = useUploads ? [] : references;
+        if (resolvedReferences.length === 0 && uploads.length === 0) {
+          status.textContent = failureText;
+          markAttachmentResolveFinished();
+          return;
+        }
+        attachmentRequestId += 1;
+        vscode.postMessage({
+          type: "resolveAttachments",
+          requestId: attachmentRequestId,
+          references: resolvedReferences,
+          uploads,
+        });
+        // Host reply (resolvedAttachments) clears the pending gate.
+      } catch {
+        status.textContent = failureText;
+        markAttachmentResolveFinished();
+      }
     }
 
     function isNearBottom() {
@@ -4793,15 +4916,70 @@ export class WebviewController {
     function renderQueue() {
       queueRow.innerHTML = "";
       queueRow.hidden = queuedMessages.length === 0;
-      if (queuedMessages.length === 0) return;
+      if (queuedMessages.length === 0) {
+        selectedQueueIds = new Set();
+        return;
+      }
 
+      const visibleIds = new Set(queuedMessages.map((item) => item.id));
+      selectedQueueIds = new Set(
+        [...selectedQueueIds].filter((id) => visibleIds.has(id)),
+      );
+      const parallelSlotsOpen = activeChatRuns < maximumChatRuns;
+      const selectableItems = queuedMessages.filter((item) => item.kind !== "interrupt");
+      const selectedCount = selectableItems.filter((item) => selectedQueueIds.has(item.id)).length;
+
+      const headingRow = document.createElement("div");
+      headingRow.className = "queue-heading-row";
       const heading = document.createElement("div");
       heading.className = "queue-heading";
       heading.textContent = i18n.queuedMessages + " (" + queuedMessages.length + ")";
-      queueRow.appendChild(heading);
+      headingRow.appendChild(heading);
+      if (selectableItems.length > 0) {
+        const runSelected = document.createElement("button");
+        runSelected.className = "queue-run-selected";
+        runSelected.type = "button";
+        runSelected.textContent = i18n.runSelectedParallel;
+        runSelected.title = i18n.runSelectedParallelTitle;
+        runSelected.disabled = selectedCount === 0 || !parallelSlotsOpen;
+        if (!parallelSlotsOpen) {
+          runSelected.title = i18n.parallelLimitReached
+            + " (" + activeChatRuns + "/" + maximumChatRuns + ")";
+        }
+        runSelected.addEventListener("click", () => {
+          const ids = selectableItems
+            .filter((item) => selectedQueueIds.has(item.id))
+            .map((item) => item.id);
+          if (ids.length === 0) return;
+          selectedQueueIds = new Set();
+          vscode.postMessage({ type: "launchQueuedParallel", ids });
+        });
+        headingRow.appendChild(runSelected);
+      }
+      queueRow.appendChild(headingRow);
+
       for (const item of queuedMessages) {
         const row = document.createElement("div");
         row.className = "queue-item " + (item.kind === "interrupt" ? "interrupt" : "queued");
+        const canLaunchParallel = item.kind !== "interrupt";
+
+        if (canLaunchParallel) {
+          const select = document.createElement("input");
+          select.className = "queue-select";
+          select.type = "checkbox";
+          select.checked = selectedQueueIds.has(item.id);
+          select.title = i18n.selectQueued;
+          select.setAttribute("aria-label", i18n.selectQueued);
+          select.addEventListener("change", () => {
+            if (select.checked) {
+              selectedQueueIds.add(item.id);
+            } else {
+              selectedQueueIds.delete(item.id);
+            }
+            renderQueue();
+          });
+          row.appendChild(select);
+        }
 
         const kind = document.createElement("span");
         kind.className = "queue-kind";
@@ -4814,12 +4992,31 @@ export class WebviewController {
         text.title = item.prompt;
         row.appendChild(text);
 
+        if (canLaunchParallel) {
+          const parallel = document.createElement("button");
+          parallel.className = "queue-parallel";
+          parallel.type = "button";
+          parallel.textContent = "⧉";
+          parallel.title = parallelSlotsOpen
+            ? i18n.runQueuedParallel
+            : i18n.parallelLimitReached + " (" + activeChatRuns + "/" + maximumChatRuns + ")";
+          parallel.setAttribute("aria-label", i18n.runQueuedParallel);
+          parallel.disabled = !parallelSlotsOpen;
+          parallel.addEventListener("click", (event) => {
+            event.stopPropagation();
+            selectedQueueIds.delete(item.id);
+            vscode.postMessage({ type: "launchQueuedParallel", id: item.id });
+          });
+          row.appendChild(parallel);
+        }
+
         const remove = document.createElement("button");
         remove.className = "queue-remove";
         remove.type = "button";
         remove.textContent = "×";
         remove.title = i18n.removeQueued;
         remove.addEventListener("click", () => {
+          selectedQueueIds.delete(item.id);
           vscode.postMessage({ type: "removeQueuedMessage", id: item.id });
         });
         row.appendChild(remove);
@@ -5020,14 +5217,16 @@ export class WebviewController {
       followOutput = isNearBottom();
     }, { passive: true });
 
-    function submitMessage(action = "send") {
+    async function submitMessage(action = "send") {
+      await waitForPendingAttachments();
       const consumed = consumeLeadingSlashCommand(prompt.value.trim());
       if (consumed.profile) {
         runProfile = consumed.profile;
         updateProfileChip();
       }
       const text = consumed.text;
-      if (!text && !consumed.commandId) {
+      const files = selectedFiles.slice();
+      if (!text && !consumed.commandId && files.length === 0) {
         if (consumed.profile) {
           prompt.value = "";
           closeSlashPicker();
@@ -5035,14 +5234,13 @@ export class WebviewController {
         }
         return;
       }
-      const files = selectedFiles.slice();
       const displayText = consumed.bestOfN
         ? (text ? "/compare " + text : "/compare")
         : consumed.orchestrate
           ? (text ? "/orchestrate " + text : "/orchestrate")
         : consumed.commandId
           ? (text ? "/" + consumed.commandId + " " + text : "/" + consumed.commandId)
-          : text;
+          : (text || (files.length > 0 ? i18n.attachedImagePrompt : text));
 
       if (consumed.bestOfN) {
         if (!text) {
@@ -5074,10 +5272,11 @@ export class WebviewController {
         return;
       }
 
+      const sendText = text || (files.length > 0 ? i18n.attachedImagePrompt : text);
       if (running) {
         const type = action === "interrupt" ? "interruptMessage" : "queueMessage";
         clearComposerMessage();
-        vscode.postMessage(messagePayload(type, text, files, consumed.commandId));
+        vscode.postMessage(messagePayload(type, sendText, files, consumed.commandId));
         prompt.focus();
         return;
       }
@@ -5089,7 +5288,7 @@ export class WebviewController {
       assistantNode = addAssistantMessage("");
       clearComposerMessage();
       primeRunningSound();
-      vscode.postMessage(messagePayload("send", text, files, consumed.commandId));
+      vscode.postMessage(messagePayload("send", sendText, files, consumed.commandId));
     }
 
     sendButton.addEventListener("click", () => {
@@ -5222,12 +5421,14 @@ export class WebviewController {
       closeModelPicker();
       closeAddMenu();
       setMoreMenuOpen(false);
+      setSandboxBannerExpanded(false);
     });
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {
         closeModelPicker();
         closeAddMenu();
         setMoreMenuOpen(false);
+        setSandboxBannerExpanded(false);
       }
     });
     document.addEventListener("pointerdown", (event) => {
@@ -5239,6 +5440,13 @@ export class WebviewController {
       }
       if (!moreMenu.hidden && !document.querySelector(".more-control").contains(event.target)) {
         setMoreMenuOpen(false);
+      }
+      if (
+        sandboxBanner
+        && !sandboxBanner.hidden
+        && !document.querySelector(".sandbox-control")?.contains(event.target)
+      ) {
+        setSandboxBannerExpanded(false);
       }
     });
     findInChatButton.addEventListener("click", () => openFindBar());
@@ -5405,17 +5613,32 @@ export class WebviewController {
       if (!document.hidden && restorePromptOnWindowFocus) schedulePromptFocusRestore();
     });
     prompt.addEventListener("paste", (event) => {
+      const clipboard = event.clipboardData;
+      const plain = clipboard?.getData("text/plain") ?? "";
+      const hasImagePayload = Boolean(
+        clipboard
+        && (
+          Array.from(clipboard.items || []).some((item) => isImageMimeType(item.type))
+          || Array.from(clipboard.types || []).some(isImageMimeType)
+          || Array.from(clipboard.files || []).some((file) => isImageMimeType(file.type))
+        ),
+      );
+      // Screenshots must win even when the clipboard also carries text/HTML.
+      if (hasImagePayload && isFileDrag(clipboard)) {
+        event.preventDefault();
+        void resolveTransferredFiles(clipboard, false, i18n.pasteFailed);
+        return;
+      }
       // Voice tools like Typeless paste polished text. Prefer that over file-drag
       // heuristics, which can otherwise swallow the paste when clipboard also
       // advertises file/URI payloads.
-      const plain = event.clipboardData?.getData("text/plain") ?? "";
       if (plain.length > 0) {
         schedulePromptFocusRestore();
         return;
       }
-      if (!isFileDrag(event.clipboardData)) return;
+      if (!isFileDrag(clipboard)) return;
       event.preventDefault();
-      void resolveTransferredFiles(event.clipboardData, false, i18n.pasteFailed);
+      void resolveTransferredFiles(clipboard, false, i18n.pasteFailed);
     });
     prompt.addEventListener("input", () => {
       autoGrow();
@@ -5542,13 +5765,16 @@ export class WebviewController {
           renderFileResults();
           break;
         case "resolvedAttachments":
-          for (const file of data.files || []) {
-            if (!selectedFiles.some((selected) => selected.path === file.path)) {
-              selectedFiles.push(file);
+          if (data.requestId === attachmentRequestId) {
+            for (const file of data.files || []) {
+              if (!selectedFiles.some((selected) => selected.path === file.path)) {
+                selectedFiles.push(file);
+              }
             }
+            renderMentionChips();
+            prompt.focus();
           }
-          renderMentionChips();
-          prompt.focus();
+          markAttachmentResolveFinished();
           break;
         case "integrations":
           availableSkills = data.skills || [];
@@ -5706,6 +5932,7 @@ export class WebviewController {
           maximumChatRuns = Math.max(1, Number(data.maximumRuns) || 3);
           parallelTasks = Array.isArray(data.tasks) ? data.tasks : [];
           renderParallelBar();
+          renderQueue();
           if (running) {
             status.textContent = i18n.running + "…"
               + (activeChatRuns > 1 ? " · " + activeChatRuns + " " + i18n.activeAgents : "");
