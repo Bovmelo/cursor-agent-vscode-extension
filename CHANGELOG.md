@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.14
+
 - Persist each chat's workspace folder in multi-root workspaces, and let the footer label pick a different root
 - Automatically three-way merge non-overlapping parallel-agent edits, with confirmed AI-assisted resolution for overlapping text conflicts
 - Default and migrate Windows to Safe worktree mode, require a first-run sandbox warning acknowledgement, and keep a non-dismissible warning visible during direct-workspace modes
