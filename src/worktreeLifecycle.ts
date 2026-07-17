@@ -209,6 +209,7 @@ export async function cleanupOrphanedManagedWorktrees(
   worktreesHomeSegments: readonly string[],
   onLog?: (message: string) => void,
   now = Date.now(),
+  isProcessAlive: (pid: number) => boolean = processIsAlive,
 ): Promise<string[]> {
   let porcelain: string;
   try {
@@ -223,7 +224,7 @@ export async function cleanupOrphanedManagedWorktrees(
       continue;
     }
     const lease = await readLease(worktreePath);
-    if (lease && processIsAlive(lease.pid)) {
+    if (lease && isProcessAlive(lease.pid)) {
       continue;
     }
     if (!lease && !(await unleasedWorktreeIsOld(worktreePath, now))) {
