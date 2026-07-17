@@ -2,9 +2,13 @@
 
 ## Unreleased
 
+## 0.1.18 - 2026-07-18
+
 - Merge the five sidebar tree views into one **Workspace** tree (Sessions / Inbox / Rules / Background / Audit) so the Agent chat view can use more vertical space
+- Let queued follow-ups launch as additional parallel agents (same slot limit), and requeue messages that fail before a run is reserved
 - Harden remaining safety gaps: run hooks/verification via `execFile` (no shell), symlink-aware path containment, transactional isolated apply with rollback, shared chat/Supervisor apply queue and file ownership, unified sensitive-path defaults, and skip baseline backups for excluded paths
 - Scrub secret-like files from isolated worktrees before agents run, run pre-edit hooks for Supervisor/background worktrees, and drop background-worker API key copies after agent creation
+- Route Windows `.cmd` hooks through `cmd.exe`, and tighten chat UI with compact sessions and a collapsible sandbox banner
 
 ## 0.1.17 - 2026-07-18
 

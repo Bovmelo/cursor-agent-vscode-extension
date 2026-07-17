@@ -1,0 +1,5 @@
+{
+  "cursorSubscription.verificationCommands": [
+    "node --run validate"
+  ]
+}
