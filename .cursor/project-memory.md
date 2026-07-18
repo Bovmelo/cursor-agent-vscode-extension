@@ -104,7 +104,7 @@ Default verification discovery (change sessions): npm scripts named `validate`, 
 | Approval / safe worktree policy | `safety.ts` (`shouldUseIsolatedWorktree`, modes) |
 | Worktree apply | `isolatedWorktree.ts`, `parallelOwnership.ts` |
 | Supervisor inbox | `supervisor.ts`, `supervisorScheduling.ts` |
-| Slash `/orchestrate` or `/compare` | `orchestrator.ts` (synthesis gets subtask summaries/files), `bestOfN.ts` (isolated verify + auto-select/judge), `autoRepair.ts`, wired from `extension.ts` |
+| Slash `/orchestrate` or `/compare` | `orchestrator.ts` (plan may get truncated source-chat handoff via `orchestrateHandoffConversation`; synthesis gets subtask summaries/files), `bestOfN.ts` (isolated verify + auto-select/judge), `autoRepair.ts`, wired from `extension.ts` |
 | Settings / feature flags | `package.json` `contributes.configuration`, gated via `enableAiNativeFeatures` and per-feature keys |
 | Rules/Skills/MCP toggles | `integrationCatalog.ts`, `integrationToggles.ts` |
 | Commit message from SCM | `generateCommitMessage.ts` |

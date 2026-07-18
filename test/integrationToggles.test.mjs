@@ -51,3 +51,52 @@ test("disabling migrates legacy toggle state to the stable ID", () => {
   const disabled = toggleIntegration({ disabledIds: [legacyId] }, stableId, false, [legacyId]);
   assert.deepEqual(disabled.disabledIds, [stableId]);
 });
+
+test("enabling one shared-legacy item does not enable its sibling", () => {
+  const legacyId = legacyIntegrationToggleId("skill", "app", "review");
+  const idA = integrationToggleId(
+    "skill",
+    "file:///C%3A/work/client-a",
+    "C:\\work\\client-a\\.cursor\\skills\\review\\SKILL.md",
+  );
+  const idB = integrationToggleId(
+    "skill",
+    "file:///D%3A/work/client-a",
+    "D:\\work\\client-a\\.cursor\\skills\\review\\SKILL.md",
+  );
+  const state = { disabledIds: [legacyId] };
+
+  const after = toggleIntegration(state, idA, true, [legacyId], { [legacyId]: [idB] });
+
+  assert.equal(isIntegrationEnabled(after, idA, [legacyId]), true);
+  assert.equal(isIntegrationEnabled(after, idB, [legacyId]), false);
+  assert.ok(!after.disabledIds.includes(legacyId));
+  assert.deepEqual(after.disabledIds, [idB]);
+});
+
+test("disabling keeps a shared legacyId while writing the stable id", () => {
+  const legacyId = legacyIntegrationToggleId("skill", "app", "review");
+  const idA = integrationToggleId(
+    "skill",
+    "file:///C%3A/work/client-a",
+    "C:\\work\\client-a\\.cursor\\skills\\review\\SKILL.md",
+  );
+  const idB = integrationToggleId(
+    "skill",
+    "file:///D%3A/work/client-a",
+    "D:\\work\\client-a\\.cursor\\skills\\review\\SKILL.md",
+  );
+
+  const disabled = toggleIntegration(
+    { disabledIds: [legacyId] },
+    idA,
+    false,
+    [legacyId],
+    { [legacyId]: [idB] },
+  );
+
+  assert.ok(disabled.disabledIds.includes(idA));
+  assert.ok(disabled.disabledIds.includes(legacyId));
+  assert.equal(isIntegrationEnabled(disabled, idA, [legacyId]), false);
+  assert.equal(isIntegrationEnabled(disabled, idB, [legacyId]), false);
+});

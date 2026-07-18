@@ -11,6 +11,7 @@ import {
   buildSynthesisPrompt,
   createOrchestratorExperiment,
   extractSubagentName,
+  formatTranscriptForHandoff,
   launchOrchestratorSubtasks,
   markSubtaskConversation,
   markSubtaskLaunch,
@@ -177,6 +178,41 @@ test("launchOrchestratorSubtasks queues work when concurrency is zero", async ()
     0,
   );
   assert.deepEqual(events, ["persist", "launch"]);
+});
+
+test("orchestrator plan prompt hands off prior conversation transcript", () => {
+  const excerpt = formatTranscriptForHandoff([
+    { role: "user", text: "we use JWT in auth.ts" },
+    { role: "assistant", text: "Noted, auth uses JWT.", files: ["src/auth.ts"] },
+  ]);
+  assert.match(excerpt, /JWT/);
+  assert.match(excerpt, /src\/auth\.ts/);
+
+  const prompt = buildOrchestratorPlanPrompt("split the remaining work", false, excerpt);
+  assert.match(prompt, /Prior conversation context/);
+  assert.match(prompt, /Do not assume subtask agents/);
+  assert.match(prompt, /JWT/);
+
+  const withoutHandoff = buildOrchestratorPlanPrompt("split the remaining work");
+  assert.doesNotMatch(withoutHandoff, /Prior conversation context/);
+
+  let experiment = createOrchestratorExperiment("split the remaining work", {
+    sourceConversationId: "source-1",
+    sourceTranscriptExcerpt: excerpt,
+  });
+  assert.equal(experiment.sourceConversationId, "source-1");
+  const retry = resolveOrchestratorPlan(experiment, "I will create a plan.");
+  assert.equal(retry.kind, "retry");
+  assert.match(retry.kind === "retry" ? retry.prompt : "", /JWT/);
+
+  const longEntries = Array.from({ length: 40 }, (_, index) => ({
+    role: index % 2 === 0 ? "user" : "assistant",
+    text: `turn-${index} ${"x".repeat(400)}`,
+  }));
+  const truncated = formatTranscriptForHandoff(longEntries, 1_200);
+  assert.match(truncated, /earlier turns truncated/);
+  assert.match(truncated, /turn-39/);
+  assert.ok(truncated.length <= 1_200 + 40);
 });
 
 test("orchestrator retries malformed plans once then falls back to execution", () => {

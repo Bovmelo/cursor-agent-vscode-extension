@@ -24,12 +24,69 @@ export interface OrchestratorExperiment {
   planAttempts?: number;
   planConversationId?: string;
   synthesisConversationId?: string;
+  /** Conversation that invoked /orchestrate (normal chat only). */
+  sourceConversationId?: string;
+  /** Truncated prior transcript injected into the planning prompt only. */
+  sourceTranscriptExcerpt?: string;
   subtasks: OrchestratorSubtask[];
   status: "planning" | "running" | "synthesizing" | "completed" | "failed";
   error?: string;
 }
 
-export function createOrchestratorExperiment(prompt: string): OrchestratorExperiment {
+/** Soft cap for prior-chat text embedded in the orchestrator plan prompt. */
+export const ORCHESTRATOR_HANDOFF_MAX_CHARS = 8_000;
+
+export interface OrchestratorHandoffEntry {
+  role: "user" | "assistant";
+  text: string;
+  files?: string[];
+}
+
+/**
+ * Serialize recent chat turns for plan-phase handoff. Prefers the newest
+ * content when the transcript exceeds maxChars.
+ */
+export function formatTranscriptForHandoff(
+  entries: OrchestratorHandoffEntry[],
+  maxChars = ORCHESTRATOR_HANDOFF_MAX_CHARS,
+): string {
+  const parts: string[] = [];
+  for (const entry of entries) {
+    const text = entry.text.trim();
+    if (!text) {
+      continue;
+    }
+    const lines = [
+      `### ${entry.role === "user" ? "User" : "Assistant"}`,
+      text,
+    ];
+    if (entry.files?.length) {
+      lines.push(`Edited files: ${entry.files.slice(0, 40).join(", ")}`);
+    }
+    parts.push(lines.join("\n"));
+  }
+  if (parts.length === 0) {
+    return "";
+  }
+  const joined = parts.join("\n\n");
+  if (joined.length <= maxChars) {
+    return joined;
+  }
+  const suffix = joined.slice(joined.length - maxChars);
+  const boundary = suffix.indexOf("\n### ");
+  const clipped = boundary > 0 && boundary < 240
+    ? suffix.slice(boundary + 1)
+    : suffix;
+  return `…[earlier turns truncated]\n\n${clipped}`;
+}
+
+export function createOrchestratorExperiment(
+  prompt: string,
+  options?: {
+    sourceConversationId?: string;
+    sourceTranscriptExcerpt?: string;
+  },
+): OrchestratorExperiment {
   return {
     id: randomUUID(),
     prompt,
@@ -37,6 +94,8 @@ export function createOrchestratorExperiment(prompt: string): OrchestratorExperi
     planAttempts: 1,
     subtasks: [],
     status: "planning",
+    sourceConversationId: options?.sourceConversationId,
+    sourceTranscriptExcerpt: options?.sourceTranscriptExcerpt,
   };
 }
 
@@ -129,20 +188,38 @@ function extractJsonArrays(text: string): string[] {
   return arrays;
 }
 
-export function buildOrchestratorPlanPrompt(prompt: string, retry = false): string {
-  return [
+export function buildOrchestratorPlanPrompt(
+  prompt: string,
+  retry = false,
+  sourceTranscript?: string,
+): string {
+  const lines = [
     retry
       ? "Your previous response omitted the required machine-readable subtask list."
       : "Create a parallel execution plan for the request below.",
     "Original request:",
     prompt,
     "",
+  ];
+  const handoff = sourceTranscript?.trim();
+  if (handoff) {
+    lines.push(
+      "Prior conversation context (from the chat where /orchestrate was invoked):",
+      "Embed any necessary details from this history into each subtask prompt so subtasks remain complete standalone agent instructions.",
+      "Do not assume subtask agents can see this history.",
+      "",
+      handoff,
+      "",
+    );
+  }
+  lines.push(
     "Return only this exact structure, with 2-8 independent executable subtasks:",
     "<ORCHESTRATOR_SUBTASKS>",
     '[{"title":"first task","prompt":"complete standalone agent instructions"},{"title":"second task","prompt":"complete standalone agent instructions"}]',
     "</ORCHESTRATOR_SUBTASKS>",
     "Do not include commentary outside the tags. Do not edit files during planning.",
-  ].join("\n");
+  );
+  return lines.join("\n");
 }
 
 export type OrchestratorPlanResolution =
@@ -161,7 +238,11 @@ export function resolveOrchestratorPlan(
     return {
       kind: "retry",
       experiment: { ...experiment, planAttempts: (experiment.planAttempts ?? 1) + 1 },
-      prompt: buildOrchestratorPlanPrompt(experiment.prompt, true),
+      prompt: buildOrchestratorPlanPrompt(
+        experiment.prompt,
+        true,
+        experiment.sourceTranscriptExcerpt,
+      ),
     };
   }
   return {

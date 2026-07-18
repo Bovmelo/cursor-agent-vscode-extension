@@ -13,6 +13,26 @@ export interface PullRequestRecovery {
   pushStatus: "not-attempted" | "unconfirmed" | "confirmed";
 }
 
+export type PullRequestRecoveryAction = "checkout" | "retry";
+
+export function pullRequestRecoveryActions(
+  _recovery: PullRequestRecovery,
+): PullRequestRecoveryAction[] {
+  return ["checkout", "retry"];
+}
+
+export function pullRequestRecoveryActionLabel(
+  action: PullRequestRecoveryAction,
+  japanese = false,
+): string {
+  if (action === "checkout") {
+    return japanese
+      ? "保持したブランチをチェックアウト"
+      : "Checkout preserved branch";
+  }
+  return japanese ? "PR作成を再試行" : "Retry PR create";
+}
+
 export function pullRequestRecoveryMessage(
   recovery: PullRequestRecovery,
   japanese = false,

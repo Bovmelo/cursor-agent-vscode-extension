@@ -2,10 +2,18 @@
 
 ## Unreleased
 
+- Collapse the chat Working/処理中 progress accordion by default while a run is in progress; users can still expand it to inspect steps
+- Hand off truncated prior chat history into the `/orchestrate` planning prompt (`orchestrateHandoffConversation`, default on) so the planner can embed needed context into standalone subtask instructions
+- Make the PARALLEL AGENTS bar more compact so more chat space stays available above the composer
 - Restore chat input focus synchronously when Typeless hands control back, preventing its text from arriving before the prompt caret is ready
 - Prevent chat runs from remaining on "Preparing the run" indefinitely by showing connection phases, allowing cancellation before a Run handle exists, and discarding stalled SDK runs after a configurable timeout
 - Feed `/orchestrate` subtask summaries and changed files into the synthesis prompt so the final pass reconciles real results instead of rediscovering work
 - Run `/compare` candidate verification inside each isolated worktree, auto-select a winner from verification and quality signals (`bestOfNAutoSelect`), and break ties with an optional plan-mode AI judge (`bestOfNAutoJudge`)
+- Default `bestOfNAutoJudge` to off so tied `/compare` scores do not spend plan quota on an AI judge unless explicitly enabled
+- Weight `/compare` auto-select toward candidates with isolated change artifacts, and offer apply/PR actions only when the winner has one
+- Keep Rules/Skills/MCP toggles sibling-safe across same-named multi-root folders while still honoring and migrating legacy disabled IDs
+- Bound chat run cleanup to `runPreparationTimeoutSeconds` with a 60s floor so slow cancel/dispose is less likely to prompt a false reload, and delay orphan worktree removal behind a live-lease check plus a 10-minute grace period
+- When PR creation fails after a successful branch commit, preserve the commit and offer checkout / retry-PR recovery actions with stage-aware guidance (push vs `gh pr create`)
 - Scope automatic repair prompts to the failing verification output and the session's edited files
 
 ## 0.1.18 - 2026-07-18

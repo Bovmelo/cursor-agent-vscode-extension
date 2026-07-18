@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import {
   loadIntegrationCatalog,
   previewIntegrationText,
+  siblingsSharingLegacyIds,
   toggleIntegration,
   type IntegrationItem,
   type IntegrationToggleState,
@@ -127,9 +128,10 @@ implements vscode.TreeDataProvider<CatalogNode>, vscode.Disposable {
     }
     const item = this.items.find((candidate) => candidate.id === id);
     const current = this.state.get<IntegrationToggleState>(INTEGRATION_TOGGLE_KEY);
+    const siblingsSharingLegacy = siblingsSharingLegacyIds(this.items, item);
     await this.state.update(
       INTEGRATION_TOGGLE_KEY,
-      toggleIntegration(current, id, enabled, item?.legacyIds),
+      toggleIntegration(current, id, enabled, item?.legacyIds, siblingsSharingLegacy),
     );
     await this.refresh();
   }

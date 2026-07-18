@@ -26,6 +26,42 @@ export function legacyIntegrationToggleId(
   return `${kind}:${folderName}:${suffix}`;
 }
 
+/** Catalog item IDs (excluding the toggled item) that share each legacy ID. */
+export type IntegrationToggleSiblings =
+  | ReadonlyMap<string, readonly string[]>
+  | Readonly<Record<string, readonly string[]>>;
+
+function siblingsFor(
+  legacyId: string,
+  siblingsSharingLegacy: IntegrationToggleSiblings,
+): readonly string[] {
+  if (siblingsSharingLegacy instanceof Map) {
+    return siblingsSharingLegacy.get(legacyId) ?? [];
+  }
+  return (siblingsSharingLegacy as Readonly<Record<string, readonly string[]>>)[legacyId] ?? [];
+}
+
+/**
+ * Builds a legacyId → sibling stable-id map from the current catalog.
+ * Only legacy IDs belonging to `item` are included; `item.id` is excluded.
+ */
+export function siblingsSharingLegacyIds(
+  items: readonly { id: string; legacyIds?: readonly string[] }[],
+  item: { id: string; legacyIds?: readonly string[] } | undefined,
+): Record<string, string[]> {
+  const legacyIds = item?.legacyIds ?? [];
+  const result: Record<string, string[]> = {};
+  for (const legacyId of legacyIds) {
+    result[legacyId] = items
+      .filter((candidate) => (
+        candidate.id !== item!.id
+        && candidate.legacyIds?.includes(legacyId)
+      ))
+      .map((candidate) => candidate.id);
+  }
+  return result;
+}
+
 export function isIntegrationEnabled(
   state: IntegrationToggleState | undefined,
   id: string,
@@ -40,18 +76,34 @@ export function toggleIntegration(
   id: string,
   enabled: boolean,
   legacyIds: readonly string[] = [],
+  siblingsSharingLegacy: IntegrationToggleSiblings = {},
 ): IntegrationToggleState {
   const disabled = new Set(state?.disabledIds ?? []);
   if (enabled) {
     disabled.delete(id);
     for (const legacyId of legacyIds) {
-      disabled.delete(legacyId);
+      const siblings = siblingsFor(legacyId, siblingsSharingLegacy);
+      if (siblings.length === 0) {
+        disabled.delete(legacyId);
+      } else {
+        // Migrate siblings onto stable disabled IDs before dropping the shared
+        // legacy entry; otherwise clearing legacy would re-enable them.
+        for (const siblingId of siblings) {
+          disabled.add(siblingId);
+        }
+        disabled.delete(legacyId);
+      }
     }
   } else {
     disabled.add(id);
-    // Replace legacy state with the stable ID once the user changes this item.
+    // Prefer the stable ID. Drop a legacy entry only when no catalog sibling
+    // still shares it; otherwise keep the shared legacy so siblings remain
+    // disabled without an accidental enable.
     for (const legacyId of legacyIds) {
-      disabled.delete(legacyId);
+      const siblings = siblingsFor(legacyId, siblingsSharingLegacy);
+      if (siblings.length === 0) {
+        disabled.delete(legacyId);
+      }
     }
   }
   return { disabledIds: [...disabled].sort() };

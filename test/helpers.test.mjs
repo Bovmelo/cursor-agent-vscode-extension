@@ -228,6 +228,61 @@ test("best-of-N auto-select aborts when a winner is already set after judge awai
   );
 });
 
+test("best-of-N auto-select skips artifact-less completed candidates", () => {
+  assert.equal(
+    selectBestOfNWinner([
+      {
+        conversationId: "a",
+        title: "A",
+        completed: true,
+        failed: false,
+        hasArtifact: false,
+        changedFileCount: 0,
+        totalTokens: 10,
+        lastAssistant: "done, no files",
+      },
+      {
+        conversationId: "b",
+        title: "B",
+        completed: true,
+        failed: false,
+        hasArtifact: false,
+        changedFileCount: 0,
+        totalTokens: 20,
+        lastAssistant: "also done, no files",
+      },
+    ]),
+    undefined,
+  );
+
+  const selection = selectBestOfNWinner([
+    {
+      conversationId: "empty",
+      title: "Empty",
+      completed: true,
+      failed: false,
+      hasArtifact: false,
+      changedFileCount: 0,
+      verificationSuccess: true,
+      totalTokens: 5,
+      lastAssistant: "no changes",
+    },
+    {
+      conversationId: "with-files",
+      title: "With files",
+      completed: true,
+      failed: false,
+      hasArtifact: true,
+      changedFileCount: 1,
+      verificationSuccess: false,
+      totalTokens: 50,
+      lastAssistant: "patched one file",
+    },
+  ]);
+  assert.equal(selection?.winnerId, "with-files");
+  assert.equal(selection?.tied, false);
+});
+
 test("auto-repair prompt stays scoped to verification failures", () => {
   const prompt = buildAutoRepairPrompt({
     attempt: 1,

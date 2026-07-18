@@ -675,7 +675,7 @@ export class WebviewController {
     /* ---- Parallel agents ---- */
     #parallelBar {
       flex: none;
-      padding: 2px 8px 4px;
+      padding: 2px 8px 2px;
       border-top: 1px solid var(--vscode-widget-border, transparent);
       border-bottom: 1px solid var(--vscode-widget-border, transparent);
       background: var(--vscode-sideBarSectionHeader-background, transparent);
@@ -686,7 +686,7 @@ export class WebviewController {
       align-items: center;
       gap: 6px;
       width: 100%;
-      min-height: 26px;
+      min-height: 22px;
       margin: 0;
       padding: 2px 4px;
       color: var(--muted);
@@ -717,11 +717,11 @@ export class WebviewController {
       transition: transform .12s ease;
     }
     #parallelBar.expanded .parallel-chevron { transform: rotate(90deg); }
-    #parallelBarBody { padding: 0 0 4px; }
+    #parallelBarBody { padding: 0 0 2px; }
     #parallelBarBody[hidden] { display: none; }
     #parallelTaskList {
       display: flex;
-      gap: 6px;
+      gap: 4px;
       overflow-x: auto;
       padding-bottom: 2px;
       scrollbar-width: thin;
@@ -729,12 +729,12 @@ export class WebviewController {
     #startParallelAgentButton {
       display: flex;
       width: 100%;
-      min-height: 28px;
+      min-height: 22px;
       align-items: center;
       justify-content: center;
       gap: 6px;
-      margin: 0 0 7px;
-      padding: 4px 10px;
+      margin: 0 0 4px;
+      padding: 2px 8px;
       color: var(--vscode-button-foreground);
       background: var(--vscode-button-background);
       border: 1px solid transparent;
@@ -759,7 +759,7 @@ export class WebviewController {
     }
     #startParallelAgentButton[hidden] { display: none; }
     .parallel-launch-plus {
-      font-size: 16px;
+      font-size: 14px;
       font-weight: 400;
       line-height: 1;
     }
@@ -776,10 +776,11 @@ export class WebviewController {
       border-radius: 999px;
     }
     .parallel-task.has-activity {
-      border-radius: 12px;
+      border-radius: 10px;
     }
     .parallel-task-activity {
       display: block;
+      flex: 1;
       min-width: 0;
       max-width: 100%;
       color: var(--muted);
@@ -796,8 +797,9 @@ export class WebviewController {
       min-width: 0;
       flex: 1;
       display: flex;
-      flex-direction: column;
-      gap: 1px;
+      flex-direction: row;
+      align-items: baseline;
+      gap: 4px;
       overflow: hidden;
     }
     .parallel-task.active {
@@ -818,7 +820,7 @@ export class WebviewController {
       flex: 1;
       align-items: center;
       gap: 6px;
-      padding: 5px 5px 5px 8px;
+      padding: 2px 4px 2px 6px;
       text-align: left;
     }
     .parallel-task-main:hover,
@@ -1041,10 +1043,10 @@ export class WebviewController {
     .parallel-group {
       display: flex;
       flex-direction: column;
-      gap: 4px;
+      gap: 2px;
       flex: none;
       min-width: min-content;
-      padding: 4px 6px;
+      padding: 2px 6px;
       border: 1px solid var(--vscode-widget-border, transparent);
       border-radius: 8px;
       background: color-mix(in srgb, var(--vscode-sideBar-background) 92%, var(--vscode-foreground) 8%);
@@ -4825,7 +4827,7 @@ export class WebviewController {
     function createProgressPanel(steps = [], state = "running") {
       const node = document.createElement("details");
       node.className = "chat-progress" + (state === "running" ? " running" : "");
-      node.open = state === "running" || state === "error" || state === "stopped";
+      node.open = state === "error" || state === "stopped";
       const summary = document.createElement("summary");
       const spinner = document.createElement("span");
       spinner.className = "progress-spinner";

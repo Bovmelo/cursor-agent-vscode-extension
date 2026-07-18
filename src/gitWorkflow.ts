@@ -25,9 +25,12 @@ async function run(
 
 export { slugifyBranchTitle };
 export {
+  pullRequestRecoveryActionLabel,
+  pullRequestRecoveryActions,
   pullRequestRecoveryMessage,
   type PullRequestFailureStage,
   type PullRequestRecovery,
+  type PullRequestRecoveryAction,
 } from "./gitWorkflowRecovery.js";
 
 /** A recoverable post-commit failure; callers can show the retained branch details. */
@@ -188,5 +191,116 @@ export async function createBranchCommitAndPullRequest(options: {
       }, error, japanese);
     }
     throw error;
+  }
+}
+
+/** Check out the branch that still holds the preserved post-commit work. */
+export async function checkoutPreservedPullRequestBranch(
+  root: string,
+  recovery: PullRequestRecovery,
+  japanese = false,
+): Promise<void> {
+  if (!vscode.workspace.isTrusted) {
+    throw new Error(
+      japanese
+        ? "保持したブランチをチェックアウトするには、信頼済みワークスペースが必要です。"
+        : "Checking out the preserved branch requires a trusted workspace.",
+    );
+  }
+  if (recovery.branch.startsWith("-")) {
+    throw new Error(
+      japanese ? "保持ブランチ名が無効です。" : "The preserved branch name is invalid.",
+    );
+  }
+  await run(root, "git", [
+    "rev-parse",
+    "--verify",
+    "--end-of-options",
+    `${recovery.commit}^{commit}`,
+  ]);
+  await run(root, "git", ["checkout", recovery.branch]);
+  const head = (await run(root, "git", ["rev-parse", "HEAD"])).stdout.trim();
+  if (head !== recovery.commit) {
+    throw new Error(
+      japanese
+        ? `ブランチ ${recovery.branch} の HEAD (${head}) が保持コミット ${recovery.commit} と一致しません。`
+        : `Branch ${recovery.branch} HEAD (${head}) does not match preserved commit ${recovery.commit}.`,
+    );
+  }
+}
+
+/**
+ * Retry push (when needed) and `gh pr create` for a branch that already has a
+ * preserved commit. Never rewrites or discards that commit.
+ */
+export async function retryPullRequestCreation(options: {
+  root: string;
+  title: string;
+  body?: string;
+  recovery: PullRequestRecovery;
+  japanese?: boolean;
+}): Promise<{ branch: string; url?: string }> {
+  const { root, title, recovery, japanese = false } = options;
+  if (!vscode.workspace.isTrusted) {
+    throw new Error(
+      japanese
+        ? "プルリクエストを作成するには、信頼済みワークスペースが必要です。"
+        : "Creating a pull request requires a trusted workspace.",
+    );
+  }
+  const baseBranch = vscode.workspace.getConfiguration("cursorSubscription")
+    .get<string>("defaultBaseBranch", "main")
+    || "main";
+  if (baseBranch.startsWith("-")) {
+    throw new Error("The pull-request base branch is invalid.");
+  }
+
+  let pushStatus = recovery.pushStatus;
+  let failureStage: PullRequestRecovery["failureStage"] = "push";
+
+  try {
+    await checkoutPreservedPullRequestBranch(root, recovery, japanese);
+
+    if (pushStatus !== "confirmed") {
+      pushStatus = "unconfirmed";
+      await run(root, "git", ["push", "-u", "origin", "HEAD"]);
+      pushStatus = "confirmed";
+    }
+
+    failureStage = "create-pull-request";
+    const bodyFile = path.join(tmpdir(), `cursor-pr-body-${randomUUID()}.md`);
+    await writeFile(bodyFile, options.body?.trim() || title, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    let pr: { stdout: string; stderr: string };
+    try {
+      pr = await run(root, "gh", [
+        "pr",
+        "create",
+        "--title",
+        title.replace(/[\r\n]+/g, " ").slice(0, 120),
+        "--body-file",
+        bodyFile,
+        "--base",
+        baseBranch,
+        "--head",
+        recovery.branch,
+      ]);
+    } finally {
+      await rm(bodyFile, { force: true }).catch(() => undefined);
+    }
+    const url = pr.stdout.trim().split(/\r?\n/).find((line) => /^https?:\/\//.test(line));
+    return { branch: recovery.branch, url };
+  } catch (error) {
+    if (error instanceof PullRequestCreationError) {
+      throw error;
+    }
+    throw new PullRequestCreationError({
+      ...recovery,
+      failureStage,
+      pushStatus,
+    }, error, japanese);
   }
 }

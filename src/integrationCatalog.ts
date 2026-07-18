@@ -27,6 +27,7 @@ export {
   integrationToggleId,
   isIntegrationEnabled,
   legacyIntegrationToggleId,
+  siblingsSharingLegacyIds,
   toggleIntegration,
   type IntegrationToggleState,
 } from "./integrationToggles.js";

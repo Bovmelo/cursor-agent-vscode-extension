@@ -529,9 +529,15 @@
         },
         "cursorSubscription.bestOfNAutoJudge": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "order": 2,
           "description": "%config.bestOfNAutoJudge.description%"
+        },
+        "cursorSubscription.orchestrateHandoffConversation": {
+          "type": "boolean",
+          "default": true,
+          "order": 2,
+          "description": "%config.orchestrateHandoffConversation.description%"
         },
         "cursorSubscription.offerPullRequestAfterVerify": {
           "type": "boolean",

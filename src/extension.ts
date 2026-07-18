@@ -53,7 +53,14 @@ import {
 } from "./bestOfN.js";
 import { buildContextPreview } from "./contextEstimate.js";
 import { generateCommitMessage, resolveRootUri } from "./generateCommitMessage.js";
-import { createBranchCommitAndPullRequest } from "./gitWorkflow.js";
+import {
+  checkoutPreservedPullRequestBranch,
+  createBranchCommitAndPullRequest,
+  PullRequestCreationError,
+  pullRequestRecoveryActionLabel,
+  pullRequestRecoveryActions,
+  retryPullRequestCreation,
+} from "./gitWorkflow.js";
 import { runConfiguredHooks } from "./hooks.js";
 import {
   applyAiConflictResolution,
@@ -110,6 +117,7 @@ import {
   buildSynthesisPrompt,
   createOrchestratorExperiment,
   extractSubagentName,
+  formatTranscriptForHandoff,
   launchOrchestratorSubtasks,
   markSubtaskConversation,
   markSubtaskLaunch,
@@ -1827,7 +1835,28 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return;
     }
 
-    const experiment = createOrchestratorExperiment(trimmed);
+    const source = this.activeConversation();
+    const handoffEnabled = this.alertConfiguration()
+      .get<boolean>("orchestrateHandoffConversation", true);
+    let sourceConversationId: string | undefined;
+    let sourceTranscriptExcerpt: string | undefined;
+    if (
+      handoffEnabled
+      && source
+      && !source.orchestratorExperimentId
+      && source.transcript.length > 0
+    ) {
+      const excerpt = formatTranscriptForHandoff(source.transcript);
+      if (excerpt) {
+        sourceConversationId = source.id;
+        sourceTranscriptExcerpt = excerpt;
+      }
+    }
+
+    const experiment = createOrchestratorExperiment(trimmed, {
+      sourceConversationId,
+      sourceTranscriptExcerpt,
+    });
     const workspaceFolderUri = this.resolveChatWorkspace()?.uri.toString();
     const planConversation: Conversation = {
       id: randomUUID(),
@@ -1851,7 +1880,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.postView();
     this.postWorkspaceLabel();
 
-    const planPrompt = buildOrchestratorPlanPrompt(trimmed);
+    const planPrompt = buildOrchestratorPlanPrompt(
+      trimmed,
+      false,
+      experiment.sourceTranscriptExcerpt,
+    );
 
     await this.enqueueMessage(
       planPrompt,
@@ -3288,23 +3321,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         files: relativeFiles.length > 0 ? relativeFiles : undefined,
         japanese: IS_JAPANESE,
       });
-      const openLabel = localize("Open pull request", "PRを開く");
-      const followUp = result.url
-        ? await vscode.window.showInformationMessage(
-          localize(
-            `Created ${result.branch}`,
-            `${result.branch} を作成しました`,
-          ),
-          openLabel,
-        )
-        : undefined;
-      if (followUp === openLabel && result.url) {
-        await vscode.env.openExternal(vscode.Uri.parse(result.url));
-      }
+      await this.showPullRequestCreated(result.branch, result.url);
     } catch (error) {
-      void vscode.window.showErrorMessage(
-        error instanceof Error ? error.message : String(error),
-      );
+      await this.handlePullRequestCreationFailure(error, {
+        root,
+        title,
+      });
     }
   }
 
@@ -3483,7 +3505,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         return;
       }
 
-      const autoJudgeEnabled = this.alertConfiguration().get<boolean>("bestOfNAutoJudge", true);
+      const autoJudgeEnabled = this.alertConfiguration().get<boolean>("bestOfNAutoJudge", false);
       const shouldJudge = selection.tied
         && autoJudgeEnabled
         && vscode.workspace.isTrusted;
@@ -3497,7 +3519,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               {
                 autoSelectEnabled: this.alertConfiguration().get<boolean>("bestOfNAutoSelect", true),
                 requireAutoJudge: true,
-                autoJudgeEnabled: this.alertConfiguration().get<boolean>("bestOfNAutoJudge", true),
+                autoJudgeEnabled: this.alertConfiguration().get<boolean>("bestOfNAutoJudge", false),
               },
             )) {
               return;
@@ -3521,7 +3543,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             if (shouldAbortBestOfNAutoSelect(latestForVerdict, {
               autoSelectEnabled: this.alertConfiguration().get<boolean>("bestOfNAutoSelect", true),
               requireAutoJudge: true,
-              autoJudgeEnabled: this.alertConfiguration().get<boolean>("bestOfNAutoJudge", true),
+              autoJudgeEnabled: this.alertConfiguration().get<boolean>("bestOfNAutoJudge", false),
             })) {
               return;
             }
@@ -4328,23 +4350,93 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         details: result.url,
         files: relativeFiles,
       });
-      const openLabel = localize("Open pull request", "PRを開く");
-      const followUp = result.url
-        ? await vscode.window.showInformationMessage(
-          localize(
-            `Pipeline created ${result.branch}`,
-            `パイプラインが ${result.branch} を作成しました`,
-          ),
-          openLabel,
-        )
-        : undefined;
-      if (followUp === openLabel && result.url) {
-        await vscode.env.openExternal(vscode.Uri.parse(result.url));
-      }
+      await this.showPullRequestCreated(
+        result.branch,
+        result.url,
+        localize(
+          `Pipeline created ${result.branch}`,
+          `パイプラインが ${result.branch} を作成しました`,
+        ),
+      );
     } catch (error) {
+      await this.handlePullRequestCreationFailure(error, {
+        root,
+        title,
+        body,
+      });
+    }
+  }
+
+  private async showPullRequestCreated(
+    branch: string,
+    url: string | undefined,
+    message?: string,
+  ): Promise<void> {
+    const openLabel = localize("Open pull request", "PRを開く");
+    const followUp = url
+      ? await vscode.window.showInformationMessage(
+        message ?? localize(
+          `Created ${branch}`,
+          `${branch} を作成しました`,
+        ),
+        openLabel,
+      )
+      : undefined;
+    if (followUp === openLabel && url) {
+      await vscode.env.openExternal(vscode.Uri.parse(url));
+    }
+  }
+
+  private async handlePullRequestCreationFailure(
+    error: unknown,
+    context: { root: string; title: string; body?: string },
+  ): Promise<void> {
+    if (!(error instanceof PullRequestCreationError)) {
       void vscode.window.showErrorMessage(
         error instanceof Error ? error.message : String(error),
       );
+      return;
+    }
+
+    const actions = pullRequestRecoveryActions(error.recovery);
+    const labels = actions.map((action) =>
+      pullRequestRecoveryActionLabel(action, IS_JAPANESE)
+    );
+    const answer = await vscode.window.showErrorMessage(error.message, ...labels);
+    if (!answer) {
+      return;
+    }
+    const chosen = actions.find(
+      (action) => pullRequestRecoveryActionLabel(action, IS_JAPANESE) === answer,
+    );
+    if (!chosen) {
+      return;
+    }
+
+    try {
+      if (chosen === "checkout") {
+        await checkoutPreservedPullRequestBranch(
+          context.root,
+          error.recovery,
+          IS_JAPANESE,
+        );
+        void vscode.window.showInformationMessage(localize(
+          `Checked out ${error.recovery.branch}`,
+          `${error.recovery.branch} をチェックアウトしました`,
+        ));
+        return;
+      }
+
+      const result = await retryPullRequestCreation({
+        root: context.root,
+        title: context.title,
+        body: context.body,
+        recovery: error.recovery,
+        japanese: IS_JAPANESE,
+      });
+      await this.showPullRequestCreated(result.branch, result.url);
+    } catch (recoveryError) {
+      await this.handlePullRequestCreationFailure(recoveryError, context);
     }
   }
 
@@ -7566,14 +7658,16 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   ): Promise<void> {
     const configured = this.alertConfiguration()
       .get<number>("runPreparationTimeoutSeconds", 120);
+    // Cleanup can take as long as run preparation; never hard-cap below 60s
+    // so a slow cancel/dispose is not mistaken for a stuck agent.
     const configuredMs = Number.isFinite(configured)
-      ? Math.max(15_000, configured * 1_000)
+      ? Math.max(60_000, configured * 1_000)
       : 120_000;
     await waitForRunPreparation(() => operation, {
       // Preparation cancellation is already signalled on this path. Cleanup
-      // needs its own live signal and a short independent deadline.
+      // needs its own live signal and the configured preparation deadline.
       signal: new AbortController().signal,
-      timeoutMs: Math.min(30_000, configuredMs),
+      timeoutMs: configuredMs,
       phase,
     });
   }

@@ -160,7 +160,9 @@ export function selectBestOfNWinner(
   const scored = evidence
     .map((item) => scoreBestOfNCandidate(item))
     .sort((left, right) => right.score - left.score || left.conversationId.localeCompare(right.conversationId));
-  const eligible = scored.filter((item) => item.completed && !item.failed);
+  const eligible = scored.filter(
+    (item) => item.completed && !item.failed && item.hasArtifact,
+  );
   if (eligible.length === 0) {
     return undefined;
   }
