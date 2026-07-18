@@ -1,5 +1,15 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdir, readFile, realpath, stat, unlink, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -13,6 +23,14 @@ interface WorktreeLease {
   pid: number;
   root: string;
   createdAt: number;
+  parentIdentity?: DirectoryIdentity;
+  worktreeIdentity?: DirectoryIdentity;
+}
+
+interface DirectoryIdentity {
+  canonicalPath: string;
+  dev: string;
+  ino: string;
 }
 
 export interface ManagedWorktreeOptions {
@@ -81,7 +99,17 @@ async function readLease(worktreePath: string): Promise<WorktreeLease | undefine
       && typeof parsed.root === "string"
       && typeof parsed.createdAt === "number"
     ) {
-      return parsed as WorktreeLease;
+      return {
+        pid: parsed.pid,
+        root: parsed.root,
+        createdAt: parsed.createdAt,
+        parentIdentity: isDirectoryIdentity(parsed.parentIdentity)
+          ? parsed.parentIdentity
+          : undefined,
+        worktreeIdentity: isDirectoryIdentity(parsed.worktreeIdentity)
+          ? parsed.worktreeIdentity
+          : undefined,
+      };
     }
   } catch {
     // Missing and malformed leases are handled using the directory-age grace period.
@@ -97,18 +125,156 @@ async function removeLease(worktreePath: string): Promise<void> {
   }
 }
 
+function isMissingError(error: unknown): boolean {
+  return error instanceof Error
+    && "code" in error
+    && (error as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+function isDirectoryIdentity(value: unknown): value is DirectoryIdentity {
+  return Boolean(
+    value
+    && typeof value === "object"
+    && "canonicalPath" in value
+    && typeof value.canonicalPath === "string"
+    && "dev" in value
+    && typeof value.dev === "string"
+    && "ino" in value
+    && typeof value.ino === "string",
+  );
+}
+
+async function captureDirectoryIdentity(
+  candidate: string,
+): Promise<DirectoryIdentity | undefined> {
+  try {
+    const details = await lstat(candidate, { bigint: true });
+    if (details.isSymbolicLink() || !details.isDirectory() || details.ino === 0n) {
+      throw new Error(`Managed worktree path is not a stable directory: ${candidate}`);
+    }
+    return {
+      canonicalPath: await realpath(candidate),
+      dev: String(details.dev),
+      ino: String(details.ino),
+    };
+  } catch (error) {
+    if (isMissingError(error)) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+function sameDirectoryIdentity(
+  expected: DirectoryIdentity,
+  current: DirectoryIdentity | undefined,
+): boolean {
+  return Boolean(
+    current
+    && path.relative(expected.canonicalPath, current.canonicalPath) === ""
+    && expected.dev === current.dev
+    && expected.ino === current.ino,
+  );
+}
+
+async function requireDirectoryIdentity(
+  candidate: string,
+  expected: DirectoryIdentity,
+): Promise<void> {
+  const current = await captureDirectoryIdentity(candidate);
+  if (!sameDirectoryIdentity(expected, current)) {
+    throw new Error(`Managed worktree path changed before cleanup: ${candidate}`);
+  }
+}
+
+/**
+ * Remove links before recursively deleting an agent-controlled worktree.
+ * Git for Windows can traverse directory junctions during worktree removal,
+ * so Git is only asked to prune its registration after this directory is gone.
+ */
+async function unlinkWorktreeLinks(
+  worktreePath: string,
+  parentIdentity: DirectoryIdentity,
+  worktreeIdentity: DirectoryIdentity,
+): Promise<void> {
+  await requireDirectoryIdentity(path.dirname(worktreePath), parentIdentity);
+  await requireDirectoryIdentity(worktreePath, worktreeIdentity);
+  const canonicalRoot = worktreeIdentity.canonicalPath;
+  const visit = async (directory: string): Promise<void> => {
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (isMissingError(error)) {
+        return;
+      }
+      throw error;
+    }
+    for (const entry of entries) {
+      const candidate = path.join(directory, entry.name);
+      let details;
+      try {
+        details = await lstat(candidate);
+      } catch (error) {
+        if (isMissingError(error)) {
+          continue;
+        }
+        throw error;
+      }
+      if (details.isSymbolicLink()) {
+        await unlink(candidate);
+        continue;
+      }
+      if (!details.isDirectory()) {
+        continue;
+      }
+      const canonicalDirectory = await realpath(candidate);
+      if (!isInside(canonicalRoot, canonicalDirectory)) {
+        throw new Error(`Managed worktree directory resolves outside its root: ${candidate}`);
+      }
+      await visit(candidate);
+    }
+  };
+
+  await visit(canonicalRoot);
+  await requireDirectoryIdentity(path.dirname(worktreePath), parentIdentity);
+  await requireDirectoryIdentity(worktreePath, worktreeIdentity);
+}
+
 export async function removeManagedWorktree(
   root: string,
   worktreePath: string,
   onLog?: (message: string) => void,
 ): Promise<boolean> {
   try {
-    try {
-      await unlink(path.join(worktreePath, "node_modules"));
-    } catch {
-      // node_modules may not have been linked.
+    const lease = await readLease(worktreePath);
+    const currentParent = await captureDirectoryIdentity(path.dirname(worktreePath));
+    if (!currentParent) {
+      throw new Error(`Managed worktree parent is missing: ${path.dirname(worktreePath)}`);
     }
-    await runGit(root, ["worktree", "remove", "--force", worktreePath]);
+    if (lease?.parentIdentity && !sameDirectoryIdentity(lease.parentIdentity, currentParent)) {
+      throw new Error(`Managed worktree parent changed before cleanup: ${worktreePath}`);
+    }
+    const currentWorktree = await captureDirectoryIdentity(worktreePath);
+    if (currentWorktree) {
+      const parentIdentity = lease?.parentIdentity;
+      const worktreeIdentity = lease?.worktreeIdentity;
+      if (!parentIdentity || !worktreeIdentity) {
+        throw new Error(`Managed worktree identity lease is unavailable: ${worktreePath}`);
+      }
+      if (!sameDirectoryIdentity(worktreeIdentity, currentWorktree)) {
+        throw new Error(`Managed worktree changed before cleanup: ${worktreePath}`);
+      }
+      await unlinkWorktreeLinks(
+        worktreePath,
+        parentIdentity,
+        worktreeIdentity,
+      );
+      // Node's recursive removal unlinks symlinks and Windows junctions instead
+      // of traversing their targets. Identity is rechecked immediately above,
+      // after every link has been removed from the agent-controlled tree.
+      await rm(worktreePath, { recursive: true, force: true });
+    }
   } catch (error) {
     onLog?.(
       `[${new Date().toISOString()}] Could not remove worktree ${worktreePath}: ${
@@ -118,7 +284,9 @@ export async function removeManagedWorktree(
     return false;
   }
   try {
-    await runGit(root, ["worktree", "prune"]);
+    // The worktree directory is already gone, so Git only removes its internal
+    // registration and cannot traverse agent-controlled filesystem entries.
+    await runGit(root, ["worktree", "prune", "--expire", "now"]);
   } catch (error) {
     onLog?.(
       `[${new Date().toISOString()}] Worktree was removed but Git prune failed: ${
@@ -137,14 +305,33 @@ export async function createManagedWorktree(
   const worktreesRoot = options.worktreesRoot
     ?? managedWorktreesRoot(options.worktreesHomeSegment);
   await mkdir(worktreesRoot, { recursive: true });
+  const parentIdentity = await captureDirectoryIdentity(worktreesRoot);
+  if (!parentIdentity) {
+    throw new Error(`Managed worktree parent is unavailable: ${worktreesRoot}`);
+  }
   const worktreePath = path.join(worktreesRoot, options.id);
+  const lease: WorktreeLease = {
+    pid: process.pid,
+    root: path.resolve(options.root),
+    createdAt: Date.now(),
+    parentIdentity,
+  };
   await writeFile(
     worktreeLeasePath(worktreePath),
-    JSON.stringify({ pid: process.pid, root: path.resolve(options.root), createdAt: Date.now() }),
+    JSON.stringify(lease),
     "utf8",
   );
   try {
     await runGit(options.root, ["worktree", "add", "--detach", worktreePath, "HEAD"]);
+    const worktreeIdentity = await captureDirectoryIdentity(worktreePath);
+    if (!worktreeIdentity) {
+      throw new Error(`Managed worktree was not created: ${worktreePath}`);
+    }
+    await writeFile(
+      worktreeLeasePath(worktreePath),
+      JSON.stringify({ ...lease, worktreeIdentity }),
+      "utf8",
+    );
     return worktreePath;
   } catch (error) {
     const removed = await removeManagedWorktree(options.root, worktreePath, options.onLog);

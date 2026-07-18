@@ -165,6 +165,11 @@ try {
   await cleanupIsolatedWorktree(session, Uri.file(storage));
   assert.equal(await isMissing(session.worktreePath), true);
   assert.equal(await isMissing(path.join(storage, "baselines", session.id)), true);
+  assert.equal(await readFile(outsideVictim, "utf8"), "outside original\n");
+  assert.equal(
+    await readFile(path.join(outsideSource, "payload.txt"), "utf8"),
+    "outside secret\n",
+  );
   assert.doesNotMatch(await runGit(repository, ["worktree", "list", "--porcelain"]), /integration/);
 } finally {
   try {

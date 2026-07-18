@@ -3,7 +3,11 @@ import {
   access,
   mkdir,
   mkdtemp,
+  readFile,
+  rename,
   rm,
+  symlink,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -13,6 +17,7 @@ import {
   cleanupOrphanedManagedWorktrees,
   createManagedWorktree,
   linkManagedNodeModules,
+  removeManagedWorktree,
   runGit,
   withManagedWorktree,
   worktreeLeasePath,
@@ -85,9 +90,10 @@ test("managed worktrees clean up preparation failures and dead-process orphans",
       "a live extension-host lease must protect another window's worktree",
     );
 
+    const orphanLease = JSON.parse(await readFile(worktreeLeasePath(orphanPath), "utf8"));
     await writeFile(
       worktreeLeasePath(orphanPath),
-      JSON.stringify({ pid: 2_147_483_647, root: repository, createdAt: Date.now() }),
+      JSON.stringify({ ...orphanLease, pid: 2_147_483_647 }),
       "utf8",
     );
     const removed = await cleanupOrphanedManagedWorktrees(repository, [homeSegment], undefined, {
@@ -101,6 +107,38 @@ test("managed worktrees clean up preparation failures and dead-process orphans",
       await runGit(repository, ["worktree", "list", "--porcelain"]),
       /orphaned-run/,
     );
+
+    const guardedPath = await createManagedWorktree({
+      id: "parent-swap",
+      root: repository,
+      worktreesHomeSegment: homeSegment,
+      worktreesRoot: managedRoot,
+    });
+    const displacedRoot = path.join(temporary, "managed-worktrees-before-swap");
+    const replacementRoot = path.join(temporary, "replacement-managed-root");
+    const replacementWorktree = path.join(replacementRoot, "parent-swap");
+    const outsideSentinel = path.join(replacementWorktree, "outside.txt");
+    await mkdir(replacementWorktree, { recursive: true });
+    await writeFile(outsideSentinel, "outside-safe\n", "utf8");
+    let parentSwapped = false;
+    try {
+      await rename(managedRoot, displacedRoot);
+      await symlink(
+        replacementRoot,
+        managedRoot,
+        process.platform === "win32" ? "junction" : "dir",
+      );
+      parentSwapped = true;
+      assert.equal(await removeManagedWorktree(repository, guardedPath), false);
+      assert.equal(await readFile(outsideSentinel, "utf8"), "outside-safe\n");
+    } finally {
+      if (parentSwapped) {
+        await unlink(managedRoot);
+        await rename(displacedRoot, managedRoot);
+      }
+    }
+    assert.equal(await removeManagedWorktree(repository, guardedPath), true);
+    assert.equal(await missing(guardedPath), true);
   } finally {
     try {
       const worktrees = await runGit(repository, ["worktree", "list", "--porcelain"]);
