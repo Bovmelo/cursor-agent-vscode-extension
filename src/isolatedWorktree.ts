@@ -122,6 +122,20 @@ function isNodeError(error: unknown, code: string): boolean {
 }
 
 function sameFileIdentity(left: BigIntStats, right: BigIntStats): boolean {
+  if (process.platform === "win32") {
+    // Node 22 reports the volume identifier from FileHandle.stat(), but
+    // lstat() reports dev=0 for the same Windows file. The file index remains
+    // stable across both calls, so require that non-zero identity and compare
+    // dev whenever both APIs expose it. A real non-zero device mismatch still
+    // fails closed.
+    return left.ino !== 0n
+      && left.ino === right.ino
+      && (
+        left.dev === right.dev
+        || left.dev === 0n
+        || right.dev === 0n
+      );
+  }
   return left.dev === right.dev && left.ino === right.ino;
 }
 

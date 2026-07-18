@@ -7,6 +7,7 @@
 - Enforce Workspace Trust at every privileged execution boundary, including hooks, verification, Supervisor/background agents, and SDK sandbox fallback paths
 - Persist detached worker process identity and hard-stop terminal cancellations so orphan recovery cannot revive or leave background work running
 - Add accessible webview controls and status semantics, plus real VS Code 1.101 Extension Host E2E coverage on Windows and Linux CI
+- Keep isolated-worktree file identity checks compatible with Node 22 on Windows while retaining symlink, junction, and hard-link rejection
 - Show `/orchestrate` detail as a visual flow: Plan → parallel subtasks → always-visible Synthesis (parallel bar ordered the same way)
 - Collapse the chat Working/処理中 progress accordion by default while a run is in progress; users can still expand it to inspect steps
 - Hand off truncated prior chat history into the `/orchestrate` planning prompt (`orchestrateHandoffConversation`, default on) so the planner can embed needed context into standalone subtask instructions
