@@ -417,7 +417,7 @@ export class WebviewController {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta
     http-equiv="Content-Security-Policy"
-    content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src ${webview.cspSource} 'nonce-${nonce}';"
+    content="default-src 'none'; img-src ${webview.cspSource} https: data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src ${webview.cspSource} 'nonce-${nonce}';"
   >
   <title>Cursor Agent</title>
   <style>
@@ -4727,11 +4727,23 @@ export class WebviewController {
       return body?.innerText?.trim() ?? "";
     }
 
+    function isAllowedMarkdownImageSource(value) {
+      return /^(?:https:\\/\\/|vscode-resource:|vscode-webview-resource:)/i.test(value)
+        || /^data:image\\/(?:avif|gif|jpe?g|png|webp);base64,[a-z0-9+\\/=]+$/i.test(value);
+    }
+
     function renderMarkdown(messageNode, raw) {
       const body = messageBody(messageNode);
-      body.innerHTML = DOMPurify.sanitize(marked.parse(raw), {
+      const template = document.createElement("template");
+      template.innerHTML = DOMPurify.sanitize(marked.parse(raw), {
         ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|[^a-z]|[a-z+.-]+(?:[^a-z+.\-:]|$))/i,
+        FORBID_ATTR: ["srcset"],
       });
+      for (const image of template.content.querySelectorAll("img[src]")) {
+        const src = image.getAttribute("src") ?? "";
+        if (!isAllowedMarkdownImageSource(src)) image.removeAttribute("src");
+      }
+      body.replaceChildren(template.content);
       for (const anchor of body.querySelectorAll("a[href]")) {
         const href = anchor.getAttribute("href") ?? "";
         if (/^https?:\\/\\//i.test(href)) {

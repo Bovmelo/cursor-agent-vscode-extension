@@ -1,11 +1,21 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
+import { constants as fsConstants, type BigIntStats } from "node:fs";
+import {
+  lstat,
+  mkdir,
+  open,
+  type FileHandle,
+  rmdir,
+  unlink,
+} from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
   canApplyAgainstBaseline,
   hashBytes,
   isPathInside,
+  resolveCanonicalPath,
   safeResolvePath,
   safeResolvePathResolved,
 } from "./safety.js";
@@ -89,6 +99,375 @@ async function safePathResolved(
     return await safeResolvePathResolved(root, relative);
   } catch {
     throw new Error(`Path escapes the ${pathEscapeLabel} workspace: ${relative}`);
+  }
+}
+
+interface FileSnapshot {
+  exists: boolean;
+  bytes?: Uint8Array;
+  mode?: number;
+}
+
+interface AnchoredMutationTarget {
+  canonicalRoot: string;
+  lexicalPath: string;
+  operationPath: string;
+  parentHandle?: FileHandle;
+}
+
+function isNodeError(error: unknown, code: string): boolean {
+  return error instanceof Error
+    && "code" in error
+    && (error as NodeJS.ErrnoException).code === code;
+}
+
+function sameFileIdentity(left: BigIntStats, right: BigIntStats): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function pathChangedError(relative: string): Error {
+  return new Error(`The apply target changed while it was being validated: ${relative}`);
+}
+
+function pathEscapeError(relative: string, pathEscapeLabel: string): Error {
+  return new Error(`Path escapes the ${pathEscapeLabel} workspace: ${relative}`);
+}
+
+async function removeCreatedMutationDirectory(
+  directory: string,
+  identity: BigIntStats,
+): Promise<void> {
+  try {
+    const canonical = await resolveCanonicalPath(directory);
+    const current = await lstat(canonical, { bigint: true });
+    if (current.isDirectory() && sameFileIdentity(identity, current)) {
+      await rmdir(canonical);
+    }
+  } catch {
+    // Best effort: never remove a directory whose identity no longer matches.
+  }
+}
+
+/**
+ * Create missing parent directories one component at a time and reject symlink
+ * ancestors. The target is revalidated again after its parent is opened below.
+ */
+async function ensureMutationParent(
+  canonicalRoot: string,
+  relative: string,
+  pathEscapeLabel: string,
+): Promise<string> {
+  const lexicalTarget = safePath(canonicalRoot, relative, pathEscapeLabel);
+  const parent = path.dirname(lexicalTarget);
+  const parentRelative = path.relative(canonicalRoot, parent);
+  if (!parentRelative) {
+    return canonicalRoot;
+  }
+
+  let current = canonicalRoot;
+  for (const segment of parentRelative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    let createdByUs: BigIntStats | undefined;
+    try {
+      const state = await lstat(current, { bigint: true });
+      if (state.isSymbolicLink() || !state.isDirectory()) {
+        throw pathEscapeError(relative, pathEscapeLabel);
+      }
+    } catch (error) {
+      if (!isNodeError(error, "ENOENT")) {
+        throw error;
+      }
+      const currentRelative = path.relative(canonicalRoot, current);
+      await safePathResolved(canonicalRoot, currentRelative, pathEscapeLabel);
+      try {
+        await mkdir(current);
+      } catch (mkdirError) {
+        if (!isNodeError(mkdirError, "EEXIST")) {
+          throw mkdirError;
+        }
+      }
+      const created = await lstat(current, { bigint: true });
+      if (created.isSymbolicLink() || !created.isDirectory()) {
+        throw pathEscapeError(relative, pathEscapeLabel);
+      }
+      createdByUs = created;
+    }
+    try {
+      await safePathResolved(
+        canonicalRoot,
+        path.relative(canonicalRoot, current),
+        pathEscapeLabel,
+      );
+    } catch (error) {
+      if (createdByUs) {
+        await removeCreatedMutationDirectory(current, createdByUs);
+      }
+      throw error;
+    }
+  }
+  return parent;
+}
+
+async function verifyHandleMatchesPath(
+  handle: FileHandle,
+  file: string,
+  requireDirectory: boolean,
+): Promise<void> {
+  const [opened, current] = await Promise.all([
+    handle.stat({ bigint: true }),
+    lstat(file, { bigint: true }),
+  ]);
+  const correctType = requireDirectory
+    ? opened.isDirectory() && current.isDirectory()
+    : opened.isFile() && current.isFile();
+  if (
+    !correctType
+    || current.isSymbolicLink()
+    || !sameFileIdentity(opened, current)
+    || (!requireDirectory && opened.nlink !== 1n)
+  ) {
+    throw new Error("The filesystem entry changed while it was being validated.");
+  }
+}
+
+/**
+ * Anchor mutations to a verified directory handle on Linux. Other platforms
+ * still verify the opened file handle against the re-resolved path before any
+ * bytes are changed.
+ */
+async function mutationTarget(
+  root: string,
+  relative: string,
+  pathEscapeLabel: string,
+): Promise<AnchoredMutationTarget> {
+  const canonicalRoot = await resolveCanonicalPath(root);
+  const lexicalPath = safePath(canonicalRoot, relative, pathEscapeLabel);
+  const parent = await ensureMutationParent(canonicalRoot, relative, pathEscapeLabel);
+  await safePathResolved(canonicalRoot, relative, pathEscapeLabel);
+
+  if (process.platform !== "linux") {
+    return { canonicalRoot, lexicalPath, operationPath: lexicalPath };
+  }
+
+  const directoryFlags = fsConstants.O_RDONLY
+    | (fsConstants.O_DIRECTORY ?? 0)
+    | (fsConstants.O_NOFOLLOW ?? 0);
+  const parentHandle = await open(parent, directoryFlags);
+  try {
+    await safePathResolved(
+      canonicalRoot,
+      path.relative(canonicalRoot, parent) || ".",
+      pathEscapeLabel,
+    );
+    await verifyHandleMatchesPath(parentHandle, parent, true);
+    return {
+      canonicalRoot,
+      lexicalPath,
+      operationPath: `/proc/self/fd/${parentHandle.fd}/${path.basename(lexicalPath)}`,
+      parentHandle,
+    };
+  } catch (error) {
+    await parentHandle.close();
+    throw error;
+  }
+}
+
+async function verifyMutationHandle(
+  target: AnchoredMutationTarget,
+  relative: string,
+  pathEscapeLabel: string,
+  handle: FileHandle,
+): Promise<void> {
+  await safePathResolved(target.canonicalRoot, relative, pathEscapeLabel);
+  await verifyHandleMatchesPath(handle, target.operationPath, false);
+  await verifyHandleMatchesPath(handle, target.lexicalPath, false);
+}
+
+async function readHandle(handle: FileHandle): Promise<Uint8Array> {
+  return new Uint8Array(await handle.readFile());
+}
+
+/** Read content and mode from the same verified handle so a source swap cannot import outside data. */
+async function readValidatedFile(
+  root: string,
+  relative: string,
+  pathEscapeLabel: string,
+): Promise<FileSnapshot> {
+  const canonicalRoot = await resolveCanonicalPath(root);
+  const lexicalPath = safePath(canonicalRoot, relative, pathEscapeLabel);
+  let handle: FileHandle | undefined;
+  try {
+    await safePathResolved(canonicalRoot, relative, pathEscapeLabel);
+    handle = await open(
+      lexicalPath,
+      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+    );
+    await safePathResolved(canonicalRoot, relative, pathEscapeLabel);
+    await verifyHandleMatchesPath(handle, lexicalPath, false);
+    const [bytes, state] = await Promise.all([readHandle(handle), handle.stat()]);
+    return { exists: true, bytes, mode: state.mode };
+  } catch (error) {
+    if (isNodeError(error, "ENOENT") && !handle) {
+      return { exists: false };
+    }
+    if (isNodeError(error, "ENOENT") || isNodeError(error, "ELOOP")) {
+      throw pathChangedError(relative);
+    }
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function removeCreatedMutationFile(
+  target: AnchoredMutationTarget,
+  handle: FileHandle,
+): Promise<void> {
+  try {
+    const [opened, canonical] = await Promise.all([
+      handle.stat({ bigint: true }),
+      resolveCanonicalPath(target.lexicalPath),
+    ]);
+    const current = await lstat(canonical, { bigint: true });
+    if (current.isFile() && sameFileIdentity(opened, current)) {
+      await unlink(canonical);
+    }
+  } catch {
+    // Best effort: only remove a path that still identifies the file this call created.
+  }
+}
+
+async function writeHandle(handle: FileHandle, bytes: Uint8Array): Promise<void> {
+  await handle.truncate(0);
+  let offset = 0;
+  while (offset < bytes.byteLength) {
+    const result = await handle.write(
+      bytes,
+      offset,
+      bytes.byteLength - offset,
+      offset,
+    );
+    if (result.bytesWritten <= 0) {
+      throw new Error("Unable to finish writing the apply target.");
+    }
+    offset += result.bytesWritten;
+  }
+}
+
+function snapshotMatches(
+  actual: Uint8Array,
+  expected: FileSnapshot | undefined,
+  created: boolean,
+): boolean {
+  if (!expected) {
+    return true;
+  }
+  if (!expected.exists) {
+    return created && actual.byteLength === 0;
+  }
+  return Boolean(expected.bytes)
+    && hashBytes(actual) === hashBytes(expected.bytes!);
+}
+
+async function writeMutationFile(
+  root: string,
+  relative: string,
+  bytes: Uint8Array,
+  expected: FileSnapshot | undefined,
+  pathEscapeLabel: string,
+  desiredMode?: number,
+): Promise<void> {
+  const target = await mutationTarget(root, relative, pathEscapeLabel);
+  let handle: FileHandle | undefined;
+  let created = false;
+  try {
+    const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+    if (expected?.exists === false) {
+      handle = await open(
+        target.operationPath,
+        fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollow,
+        0o666,
+      );
+      created = true;
+    } else {
+      try {
+        handle = await open(target.operationPath, fsConstants.O_RDWR | noFollow);
+      } catch (error) {
+        if (expected || !isNodeError(error, "ENOENT")) {
+          throw error;
+        }
+        handle = await open(
+          target.operationPath,
+          fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollow,
+          0o666,
+        );
+        created = true;
+      }
+    }
+    await verifyMutationHandle(target, relative, pathEscapeLabel, handle);
+    const actual = await readHandle(handle);
+    if (!snapshotMatches(actual, expected, created)) {
+      throw pathChangedError(relative);
+    }
+    await writeHandle(handle, bytes);
+    if (desiredMode !== undefined && process.platform !== "win32") {
+      const written = await handle.stat();
+      const nextMode = (written.mode & ~0o111) | (desiredMode & 0o111);
+      if (nextMode !== written.mode) {
+        await handle.chmod(nextMode);
+      }
+    }
+  } catch (error) {
+    if (created && handle) {
+      await removeCreatedMutationFile(target, handle);
+    }
+    if (
+      isNodeError(error, "EEXIST")
+      || isNodeError(error, "ENOENT")
+      || isNodeError(error, "ELOOP")
+    ) {
+      throw pathChangedError(relative);
+    }
+    throw error;
+  } finally {
+    await handle?.close();
+    await target.parentHandle?.close();
+  }
+}
+
+async function deleteMutationFile(
+  root: string,
+  relative: string,
+  expected: FileSnapshot | undefined,
+  pathEscapeLabel: string,
+): Promise<void> {
+  const target = await mutationTarget(root, relative, pathEscapeLabel);
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(
+      target.operationPath,
+      fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0),
+    );
+    await verifyMutationHandle(target, relative, pathEscapeLabel, handle);
+    const actual = await readHandle(handle);
+    if (!snapshotMatches(actual, expected, false)) {
+      throw pathChangedError(relative);
+    }
+    // Repeat the identity checks immediately before the path-based unlink. On
+    // Linux operationPath is anchored to the already verified parent handle.
+    await verifyMutationHandle(target, relative, pathEscapeLabel, handle);
+    await unlink(target.operationPath);
+  } catch (error) {
+    if (
+      isNodeError(error, "ENOENT")
+      || isNodeError(error, "ELOOP")
+    ) {
+      throw pathChangedError(relative);
+    }
+    throw error;
+  } finally {
+    await handle?.close();
+    await target.parentHandle?.close();
   }
 }
 
@@ -452,14 +831,12 @@ export async function applyIsolatedChange(
     options?.missingBaselineMessage,
   );
 
-  const mainFile = await safePathResolved(session.root, change.relative, pathEscapeLabel);
-  const currentMain = await fileState(mainFile);
-  const proposed = await safePathResolved(
+  const currentMain = await readValidatedFile(session.root, change.relative, pathEscapeLabel);
+  const proposedState = await readValidatedFile(
     session.worktreePath,
     change.relative,
     pathEscapeLabel,
   );
-  const proposedState = await fileState(proposed);
   const unchanged = canApplyAgainstBaseline(
     {
       exists: baseline.exists,
@@ -500,8 +877,14 @@ export async function applyIsolatedChange(
         && merged.bytes
         && !hasConflictMarkers(merged.bytes)
       ) {
-        await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(mainFile)));
-        await vscode.workspace.fs.writeFile(vscode.Uri.file(mainFile), merged.bytes);
+        await writeMutationFile(
+          session.root,
+          change.relative,
+          merged.bytes,
+          currentMain,
+          pathEscapeLabel,
+          proposedState.mode,
+        );
         return "merged";
       }
     }
@@ -512,14 +895,24 @@ export async function applyIsolatedChange(
   }
 
   if (proposedState.exists) {
-    await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(mainFile)));
-    await vscode.workspace.fs.copy(
-      vscode.Uri.file(proposed),
-      vscode.Uri.file(mainFile),
-      { overwrite: true },
+    if (!proposedState.bytes) {
+      throw pathChangedError(change.relative);
+    }
+    await writeMutationFile(
+      session.root,
+      change.relative,
+      proposedState.bytes,
+      currentMain,
+      pathEscapeLabel,
+      proposedState.mode,
     );
   } else if (currentMain.exists) {
-    await vscode.workspace.fs.delete(vscode.Uri.file(mainFile), { recursive: false });
+    await deleteMutationFile(
+      session.root,
+      change.relative,
+      currentMain,
+      pathEscapeLabel,
+    );
   }
   return "applied";
 }
@@ -547,7 +940,7 @@ export async function applyIsolatedChanges(
   const applied: string[] = [];
   const merged: string[] = [];
   const conflicts: Array<{ relative: string; error: string }> = [];
-  const snapshots: Array<{ relative: string; previous: { exists: boolean; bytes?: Uint8Array } }> = [];
+  const snapshots: Array<{ relative: string; previous: FileSnapshot }> = [];
   const transactional = options?.transactional !== false;
   const pathEscapeLabel = options?.pathEscapeLabel ?? "isolated worktree";
 
@@ -556,12 +949,7 @@ export async function applyIsolatedChanges(
       continue;
     }
     try {
-      const mainFile = await safePathResolved(
-        session.root,
-        change.relative,
-        pathEscapeLabel,
-      );
-      const previous = await fileState(mainFile);
+      const previous = await readValidatedFile(session.root, change.relative, pathEscapeLabel);
       const outcome = await applyIsolatedChange(session, storageRoot, change, options);
       if (outcome !== "already-applied") {
         snapshots.push({ relative: change.relative, previous });
@@ -579,24 +967,23 @@ export async function applyIsolatedChanges(
         const rolledBack: string[] = [];
         for (const entry of [...snapshots].reverse()) {
           try {
-            const target = await safePathResolved(
-              session.root,
-              entry.relative,
-              pathEscapeLabel,
-            );
             if (entry.previous.exists && entry.previous.bytes) {
-              await vscode.workspace.fs.createDirectory(
-                vscode.Uri.file(path.dirname(target)),
-              );
-              await vscode.workspace.fs.writeFile(
-                vscode.Uri.file(target),
+              await writeMutationFile(
+                session.root,
+                entry.relative,
                 entry.previous.bytes,
+                undefined,
+                pathEscapeLabel,
+                entry.previous.mode,
               );
             } else {
               try {
-                await vscode.workspace.fs.delete(vscode.Uri.file(target), {
-                  recursive: false,
-                });
+                await deleteMutationFile(
+                  session.root,
+                  entry.relative,
+                  undefined,
+                  pathEscapeLabel,
+                );
               } catch {
                 // File may already be absent.
               }
@@ -643,14 +1030,8 @@ export async function prepareAiConflictResolution(
     relative,
     options?.missingBaselineMessage,
   );
-  const mainFile = await safePathResolved(session.root, relative, pathEscapeLabel);
-  const proposedFile = await safePathResolved(
-    session.worktreePath,
-    relative,
-    pathEscapeLabel,
-  );
-  const currentMain = await fileState(mainFile);
-  const proposed = await fileState(proposedFile);
+  const currentMain = await readValidatedFile(session.root, relative, pathEscapeLabel);
+  const proposed = await readValidatedFile(session.worktreePath, relative, pathEscapeLabel);
   if (
     !baseline.exists
     || !baseline.bytes
@@ -670,7 +1051,14 @@ export async function prepareAiConflictResolution(
   if (merge.clean || !merge.bytes || !hasConflictMarkers(merge.bytes)) {
     return undefined;
   }
-  await vscode.workspace.fs.writeFile(vscode.Uri.file(proposedFile), merge.bytes);
+  await writeMutationFile(
+    session.worktreePath,
+    relative,
+    merge.bytes,
+    proposed,
+    pathEscapeLabel,
+    proposed.mode,
+  );
   return {
     relative,
     expectedMainHash: hashBytes(currentMain.bytes),
@@ -688,17 +1076,11 @@ export async function applyAiConflictResolution(
   },
 ): Promise<void> {
   const pathEscapeLabel = options?.pathEscapeLabel ?? "isolated worktree";
-  const mainFile = await safePathResolved(
+  const currentMain = await readValidatedFile(
     session.root,
     prepared.relative,
     pathEscapeLabel,
   );
-  const proposedFile = await safePathResolved(
-    session.worktreePath,
-    prepared.relative,
-    pathEscapeLabel,
-  );
-  const currentMain = await fileState(mainFile);
   if (
     !currentMain.exists
     || !currentMain.bytes
@@ -709,14 +1091,25 @@ export async function applyAiConflictResolution(
         ?? "The workspace file changed during AI conflict resolution.",
     );
   }
-  const resolved = await fileState(proposedFile);
+  const resolved = await readValidatedFile(
+    session.worktreePath,
+    prepared.relative,
+    pathEscapeLabel,
+  );
   if (!resolved.exists || !resolved.bytes || hasConflictMarkers(resolved.bytes)) {
     throw new Error(
       options?.markersMessage
         ?? "The AI did not remove every conflict marker.",
     );
   }
-  await vscode.workspace.fs.writeFile(vscode.Uri.file(mainFile), resolved.bytes);
+  await writeMutationFile(
+    session.root,
+    prepared.relative,
+    resolved.bytes,
+    currentMain,
+    pathEscapeLabel,
+    resolved.mode,
+  );
 }
 
 export async function cleanupIsolatedWorktree(

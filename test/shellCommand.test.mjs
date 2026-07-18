@@ -4,9 +4,10 @@ import {
   parseCommandLine,
   quoteForCmd,
   runConfiguredCommand,
+  runExecutableCommand,
   toExecFileInvocation,
 } from "../out/shellCommand.js";
-import { minimalShellEnv } from "../out/shellEnv.js";
+import { githubCliEnv, minimalShellEnv } from "../out/shellEnv.js";
 import { isPathInside, resolveCanonicalPath, safeResolvePathResolved } from "../out/safety.js";
 import { mkdtemp, mkdir, symlink, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -28,22 +29,75 @@ test("parseCommandLine tokenizes quotes and rejects shell metacharacters", () =>
 });
 
 test("toExecFileInvocation routes Windows batch files through cmd.exe", () => {
-  assert.deepEqual(quoteForCmd("plain"), "plain");
-  assert.deepEqual(quoteForCmd("has space"), '"has space"');
-  assert.deepEqual(quoteForCmd('say "hi"'), '"say ""hi"""');
+  assert.equal(quoteForCmd("plain"), '^"plain^"');
+  assert.equal(quoteForCmd("has space"), '^"has^ space^"');
+  assert.doesNotMatch(quoteForCmd('say "hi" & done'), /(^|[^\^])["&]/);
 
   const npm = parseCommandLine("npm run validate");
   const invocation = toExecFileInvocation(npm);
   if (process.platform === "win32") {
     assert.equal(invocation.file.toLowerCase().endsWith("cmd.exe"), true);
-    assert.deepEqual(invocation.args.slice(0, 3), ["/d", "/s", "/c"]);
-    assert.equal(invocation.args[3], "npm run validate");
+    assert.deepEqual(invocation.args.slice(0, 4), ["/d", "/s", "/v:off", "/c"]);
+    assert.match(invocation.args[4], /npm/);
+    assert.equal(invocation.windowsVerbatimArguments, true);
   } else {
     assert.deepEqual(invocation, npm);
   }
 
   const node = parseCommandLine("node ./scripts/run.js");
   assert.deepEqual(toExecFileInvocation(node), node);
+});
+
+test("toExecFileInvocation treats a bare gh command as a Windows shim", () => {
+  const invocation = toExecFileInvocation({
+    file: "gh",
+    args: ["pr", "create", "--title", "fix & verify"],
+  }, "win32");
+  assert.equal(invocation.file.toLowerCase().endsWith("cmd.exe"), true);
+  assert.deepEqual(invocation.args.slice(0, 4), ["/d", "/s", "/v:off", "/c"]);
+  assert.equal(invocation.windowsVerbatimArguments, true);
+  assert.match(invocation.args[4], /^"gh /);
+  assert.doesNotMatch(invocation.args[4], /[^\^]&/);
+  assert.throws(
+    () => toExecFileInvocation({ file: "gh", args: ["line 1\nline 2"] }, "win32"),
+    /line breaks/i,
+  );
+});
+
+test("runExecutableCommand preserves arguments passed to a gh.cmd shim", async () => {
+  if (process.platform !== "win32") {
+    return;
+  }
+  const root = await mkdtemp(path.join(tmpdir(), "cursor-gh-shim-"));
+  try {
+    const probe = path.join(root, "probe.mjs");
+    await writeFile(probe, "console.log(JSON.stringify(process.argv.slice(2)));\n");
+    await writeFile(
+      path.join(root, "gh.cmd"),
+      `@echo off\r\n@"${process.execPath}" "${probe}" %*\r\n`,
+    );
+    const env = minimalShellEnv();
+    delete env.Path;
+    env.PATH = root;
+    const { stdout } = await runExecutableCommand(
+      "gh",
+      ["hello world", "fix & verify", 'say "hi"', "%PATH% !bang!"],
+      {
+        cwd: root,
+        timeout: 60_000,
+        maxBuffer: 1024 * 1024,
+        env,
+      },
+    );
+    assert.deepEqual(JSON.parse(stdout), [
+      "hello world",
+      "fix & verify",
+      'say "hi"',
+      "%PATH% !bang!",
+    ]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("runConfiguredCommand can spawn a platform command without EINVAL", async () => {
@@ -65,6 +119,23 @@ test("runConfiguredCommand can spawn a platform command without EINVAL", async (
     assert.equal(stdout.trim(), "1.2.3");
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("GitHub CLI environment forwards auth without unrelated secrets", () => {
+  const previousToken = process.env.GH_TOKEN;
+  const previousUnrelated = process.env.CURSOR_TEST_UNRELATED_SECRET;
+  try {
+    process.env.GH_TOKEN = "test-token";
+    process.env.CURSOR_TEST_UNRELATED_SECRET = "do-not-forward";
+    const env = githubCliEnv();
+    assert.equal(env.GH_TOKEN, "test-token");
+    assert.equal(env.CURSOR_TEST_UNRELATED_SECRET, undefined);
+  } finally {
+    if (previousToken === undefined) delete process.env.GH_TOKEN;
+    else process.env.GH_TOKEN = previousToken;
+    if (previousUnrelated === undefined) delete process.env.CURSOR_TEST_UNRELATED_SECRET;
+    else process.env.CURSOR_TEST_UNRELATED_SECRET = previousUnrelated;
   }
 });
 

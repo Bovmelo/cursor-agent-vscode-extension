@@ -1,6 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { execFile as execFileCallback } from "node:child_process";
-import { promisify } from "node:util";
 import { Buffer } from "node:buffer";
 import { appendFile, mkdir } from "node:fs/promises";
 import * as path from "node:path";
@@ -175,6 +173,8 @@ import {
   takeNextQueuedMessage,
   type SafetyApprovalMode,
 } from "./safety.js";
+import { runExecutableCommand } from "./shellCommand.js";
+import { githubCliEnv } from "./shellEnv.js";
 
 const API_KEY_SECRET = "cursorSubscription.apiKey";
 const CONVERSATIONS_KEY = "cursorSubscription.conversations";
@@ -192,7 +192,6 @@ const BUDGET_WARNED_KEY_PREFIX = "cursorSubscription.budgetWarned";
 const MAX_INLINE_COMPLETION_CACHE = 32;
 const INLINE_COMPLETION_STATS_KEY = "cursorSubscription.inlineCompletionStats";
 const VIEW_ID = "cursorSubscription.chatView";
-const execFileAsync = promisify(execFileCallback);
 const DEFAULT_MODEL = "auto";
 const IS_JAPANESE = vscode.env.language.toLowerCase().startsWith("ja");
 const MAX_DROPPED_FILE_BYTES = 20 * 1024 * 1024;
@@ -2079,14 +2078,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     root: string,
   ): Promise<Array<{ number: number; title: string; body: string; url: string }>> {
     try {
-      const { stdout } = await execFileAsync(
+      const { stdout } = await runExecutableCommand(
         "gh",
         ["issue", "list", "--limit", "20", "--json", "number,title,body,url"],
         {
           cwd: root,
-          encoding: "utf8",
           maxBuffer: 4 * 1024 * 1024,
-          windowsHide: true,
+          env: githubCliEnv(),
         },
       );
       const parsed = JSON.parse(stdout) as unknown;
@@ -3238,6 +3236,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     files: string[],
     force = false,
   ): Promise<void> {
+    if (!vscode.workspace.isTrusted) {
+      void vscode.window.showWarningMessage(localize(
+        "Creating a pull request requires a trusted workspace.",
+        "プルリクエストを作成するには、信頼済みワークスペースが必要です。",
+      ));
+      return;
+    }
     if (
       !force
       && !this.alertConfiguration().get<boolean>("offerPullRequestAfterVerify", true)

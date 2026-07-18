@@ -40,3 +40,28 @@ test("manifest localization references exist in both supported locales", async (
   );
   assert.deepEqual(Object.keys(japanese).sort(), Object.keys(english).sort());
 });
+
+test("workspace mutations that can execute or apply agent output require trust", async () => {
+  const [extensionSource, backgroundSource, gitWorkflowSource] = await Promise.all([
+    readFile(new URL("src/extension.ts", root), "utf8"),
+    readFile(new URL("src/backgroundJobs.ts", root), "utf8"),
+    readFile(new URL("src/gitWorkflow.ts", root), "utf8"),
+  ]);
+
+  const pullRequestPath = extensionSource.slice(
+    extensionSource.indexOf("private async offerCreatePullRequest("),
+    extensionSource.indexOf("public async newChat("),
+  );
+  const backgroundApplyPath = backgroundSource.slice(
+    backgroundSource.indexOf("public async apply("),
+    backgroundSource.indexOf("public async cancel("),
+  );
+
+  assert.match(pullRequestPath, /!vscode\.workspace\.isTrusted/u);
+  assert.match(backgroundApplyPath, /!vscode\.workspace\.isTrusted/u);
+  assert.match(backgroundApplyPath, /isAuthenticatedWorkerCancellation/u);
+  assert.match(
+    gitWorkflowSource.slice(gitWorkflowSource.indexOf("createBranchCommitAndPullRequest")),
+    /!vscode\.workspace\.isTrusted/u,
+  );
+});

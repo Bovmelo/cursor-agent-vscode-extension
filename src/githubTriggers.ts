@@ -1,9 +1,6 @@
-import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
-import { promisify } from "node:util";
-import { minimalShellEnv } from "./shellEnv.js";
-
-const execFileAsync = promisify(execFileCallback);
+import { githubCliEnv } from "./shellEnv.js";
+import { runExecutableCommand } from "./shellCommand.js";
 
 export interface GitHubSupervisorSignal {
   source: "ci" | "pr-comment";
@@ -135,7 +132,7 @@ export function parseGitHubSupervisorSignals(raw: string): GitHubSupervisorSigna
 }
 
 export async function scanCurrentGitHubPullRequest(root: string): Promise<GitHubSupervisorSignal[]> {
-  const { stdout } = await execFileAsync(
+  const { stdout } = await runExecutableCommand(
     "gh",
     [
       "pr",
@@ -145,24 +142,22 @@ export async function scanCurrentGitHubPullRequest(root: string): Promise<GitHub
     ],
     {
       cwd: root,
-      windowsHide: true,
       timeout: 30_000,
       maxBuffer: 8 * 1024 * 1024,
-      env: minimalShellEnv(),
+      env: githubCliEnv(),
     },
   );
   const snapshot = JSON.parse(stdout) as GitHubPrSnapshot;
   if (snapshot.number) {
     try {
-      const { stdout: inlineRaw } = await execFileAsync(
+      const { stdout: inlineRaw } = await runExecutableCommand(
         "gh",
         ["api", `repos/{owner}/{repo}/pulls/${snapshot.number}/comments`],
         {
           cwd: root,
-          windowsHide: true,
           timeout: 30_000,
           maxBuffer: 8 * 1024 * 1024,
-          env: minimalShellEnv(),
+          env: githubCliEnv(),
         },
       );
       const inlineComments = JSON.parse(inlineRaw) as Array<{

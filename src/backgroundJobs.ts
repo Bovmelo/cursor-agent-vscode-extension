@@ -7,6 +7,7 @@ import * as vscode from "vscode";
 import type { BackgroundJob, BackgroundWorkerInput } from "./backgroundJobTypes.js";
 import {
   backgroundWorkerProtocolPaths,
+  isAuthenticatedWorkerCancellation,
   isAuthenticatedWorkerHeartbeat,
   WORKER_STARTUP_GRACE_MS,
   type BackgroundWorkerCancellation,
@@ -195,8 +196,32 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
   }
 
   public async apply(target?: BackgroundNode | string): Promise<void> {
+    if (!vscode.workspace.isTrusted) {
+      void vscode.window.showWarningMessage(this.text(
+        "Applying background-agent changes requires a trusted workspace.",
+        "バックグラウンドAgentの変更を適用するには、信頼済みワークスペースが必要です。",
+      ));
+      return;
+    }
     const job = this.resolve(target);
     if (!job || job.status !== "completed") {
+      return;
+    }
+    let cancellationRequested = false;
+    if (job.workerToken) {
+      try {
+        const cancellation = JSON.parse(
+          await readFile(backgroundWorkerProtocolPaths(job.jobFile).cancellation, "utf8"),
+        ) as BackgroundWorkerCancellation;
+        cancellationRequested = isAuthenticatedWorkerCancellation(job.workerToken, cancellation);
+      } catch {
+        // No authenticated cancellation request exists, so the completed result is applyable.
+      }
+    }
+    if (cancellationRequested) {
+      job.status = "cancelled";
+      await this.save(job);
+      this.changed.fire(undefined);
       return;
     }
     job.status = "applying";

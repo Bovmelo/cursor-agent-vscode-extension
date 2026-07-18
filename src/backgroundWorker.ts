@@ -1,4 +1,7 @@
 import { readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Agent, type LocalAgentOptions, type RunResult } from "@cursor/sdk";
 import type { BackgroundJob, BackgroundJobStatus, BackgroundWorkerInput } from "./backgroundJobTypes.js";
 import {
@@ -12,6 +15,7 @@ const SUPPORTS_LOCAL_SANDBOX = process.platform !== "win32";
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const CANCELLATION_POLL_MS = 1_000;
 const HARD_CANCEL_GRACE_MS = 5_000;
+const terminalSaveQueues = new Map<string, Promise<void>>();
 
 async function readStandardInput(): Promise<string> {
   const chunks: Buffer[] = [];
@@ -32,19 +36,58 @@ async function saveJob(job: BackgroundJob): Promise<void> {
   await rename(temporary, job.jobFile);
 }
 
-async function saveTerminalJob(
+async function saveTerminalJobNow(
   jobFile: string,
   workerToken: string,
   status: BackgroundJobStatus,
   update: Partial<Pick<BackgroundJob, "assistantText" | "usage" | "error">> = {},
 ): Promise<void> {
-  const latest = await loadJob(jobFile);
-  if (latest.workerToken !== workerToken) {
+  let latest = await loadJob(jobFile);
+  if (latest.workerToken !== workerToken || latest.status === "cancelled") {
+    return;
+  }
+  if (status !== "cancelled" && await cancellationRequested(jobFile, workerToken)) {
+    latest.status = "cancelled";
+    latest.error = undefined;
+    await saveJob(latest);
     return;
   }
   latest.status = status;
   Object.assign(latest, update);
   await saveJob(latest);
+
+  // The host creates the authenticated sidecar before persisting `cancelled`.
+  // Checking again after the atomic rename closes the window where the worker
+  // loaded `running`, the host saved `cancelled`, and the worker then replaced it.
+  if (status === "cancelled" || !(await cancellationRequested(jobFile, workerToken))) {
+    return;
+  }
+  latest = await loadJob(jobFile);
+  if (latest.workerToken !== workerToken || latest.status === "cancelled") {
+    return;
+  }
+  latest.status = "cancelled";
+  latest.error = undefined;
+  await saveJob(latest);
+}
+
+export async function saveTerminalJob(
+  jobFile: string,
+  workerToken: string,
+  status: BackgroundJobStatus,
+  update: Partial<Pick<BackgroundJob, "assistantText" | "usage" | "error">> = {},
+): Promise<void> {
+  const previous = terminalSaveQueues.get(jobFile) ?? Promise.resolve();
+  const operation = previous.then(() => saveTerminalJobNow(jobFile, workerToken, status, update));
+  const queued = operation.catch(() => {});
+  terminalSaveQueues.set(jobFile, queued);
+  try {
+    await operation;
+  } finally {
+    if (terminalSaveQueues.get(jobFile) === queued) {
+      terminalSaveQueues.delete(jobFile);
+    }
+  }
 }
 
 async function cancellationRequested(jobFile: string, workerToken: string): Promise<boolean> {
@@ -73,9 +116,23 @@ async function main(): Promise<void> {
   if (job.workerToken !== workerToken) {
     throw new Error("Background worker identity does not match the job.");
   }
+  if (job.status !== "starting") {
+    apiKey = undefined;
+    return;
+  }
+  if (await cancellationRequested(jobFile, workerToken)) {
+    apiKey = undefined;
+    await saveTerminalJob(jobFile, workerToken, "cancelled");
+    return;
+  }
   job.pid = process.pid;
   job.status = "running";
   await saveJob(job);
+  if (await cancellationRequested(jobFile, workerToken)) {
+    apiKey = undefined;
+    await saveTerminalJob(jobFile, workerToken, "cancelled");
+    return;
+  }
 
   const protocol = backgroundWorkerProtocolPaths(jobFile);
   let heartbeatQueue = Promise.resolve();
@@ -253,7 +310,7 @@ async function main(): Promise<void> {
   }
 }
 
-void main().catch(async (error) => {
+async function reportFatalWorkerError(error: unknown): Promise<void> {
   const jobFile = process.argv[2];
   const workerToken = process.argv[3];
   if (!jobFile || !workerToken) {
@@ -261,14 +318,29 @@ void main().catch(async (error) => {
     return;
   }
   try {
-    const job = await loadJob(jobFile);
-    if (job.workerToken === workerToken && job.status !== "cancelled") {
-      job.status = "error";
-      job.error = error instanceof Error ? error.message : String(error);
-      await saveJob(job);
-    }
+    await saveTerminalJob(jobFile, workerToken, "error", {
+      error: error instanceof Error ? error.message : String(error),
+    });
   } catch {
     // The parent will report an unreadable or unresponsive job file.
   }
   process.exitCode = 1;
-});
+}
+
+const workerEntrypoint = process.argv[1];
+const currentModule = fileURLToPath(import.meta.url);
+function canonicalEntrypoint(file: string): string {
+  try {
+    return realpathSync(file);
+  } catch {
+    return resolve(file);
+  }
+}
+const isDirectExecution = workerEntrypoint !== undefined
+  && (process.platform === "win32"
+    ? canonicalEntrypoint(workerEntrypoint).toLowerCase()
+      === canonicalEntrypoint(currentModule).toLowerCase()
+    : canonicalEntrypoint(workerEntrypoint) === canonicalEntrypoint(currentModule));
+if (isDirectExecution) {
+  void main().catch(reportFatalWorkerError);
+}

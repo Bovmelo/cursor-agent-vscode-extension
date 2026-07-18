@@ -1,27 +1,25 @@
-import { execFile as execFileCallback } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { promisify } from "node:util";
+import { rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
 import * as vscode from "vscode";
 import { branchStartsAtBase, slugifyBranchTitle } from "./pureUtils.js";
-import { minimalShellEnv } from "./shellEnv.js";
+import { githubCliEnv } from "./shellEnv.js";
+import { runExecutableCommand } from "./shellCommand.js";
 import {
   pullRequestRecoveryMessage,
   type PullRequestRecovery,
 } from "./gitWorkflowRecovery.js";
-
-const execFileAsync = promisify(execFileCallback);
 
 async function run(
   cwd: string,
   command: string,
   args: string[],
 ): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync(command, args, {
+  return runExecutableCommand(command, args, {
     cwd,
-    encoding: "utf8",
     maxBuffer: 4 * 1024 * 1024,
-    windowsHide: true,
-    env: minimalShellEnv(),
+    env: command === "gh" ? githubCliEnv() : undefined,
   });
 }
 
@@ -59,6 +57,13 @@ export async function createBranchCommitAndPullRequest(options: {
   japanese?: boolean;
 }): Promise<{ branch: string; url?: string }> {
   const { root, title, japanese = false } = options;
+  if (!vscode.workspace.isTrusted) {
+    throw new Error(
+      japanese
+        ? "プルリクエストを作成するには、信頼済みワークスペースが必要です。"
+        : "Creating a pull request requires a trusted workspace.",
+    );
+  }
   const baseBranch = options.baseBranch?.trim()
     || vscode.workspace.getConfiguration("cursorSubscription").get<string>("defaultBaseBranch", "main")
     || "main";
@@ -139,18 +144,29 @@ export async function createBranchCommitAndPullRequest(options: {
     pushStatus = "confirmed";
 
     failureStage = "create-pull-request";
-    const pr = await run(root, "gh", [
-      "pr",
-      "create",
-      "--title",
-      title.slice(0, 120),
-      "--body",
-      options.body?.trim() || title,
-      "--base",
-      baseBranch,
-      "--head",
-      branch,
-    ]);
+    const bodyFile = path.join(tmpdir(), `cursor-pr-body-${randomUUID()}.md`);
+    await writeFile(bodyFile, options.body?.trim() || title, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    let pr: { stdout: string; stderr: string };
+    try {
+      pr = await run(root, "gh", [
+        "pr",
+        "create",
+        "--title",
+        title.replace(/[\r\n]+/g, " ").slice(0, 120),
+        "--body-file",
+        bodyFile,
+        "--base",
+        baseBranch,
+        "--head",
+        branch,
+      ]);
+    } finally {
+      await rm(bodyFile, { force: true }).catch(() => undefined);
+    }
     const url = pr.stdout.trim().split(/\r?\n/).find((line) => /^https?:\/\//.test(line));
     return { branch, url };
   } catch (error) {

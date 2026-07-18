@@ -1,14 +1,3 @@
-export const DEFAULT_SENSITIVE_GLOBS = [
-  "**/.env*",
-  "**/*secret*",
-  "**/*credential*",
-  "**/*.pem",
-  "**/*.key",
-  "**/package-lock.json",
-  "**/pnpm-lock.yaml",
-  "**/yarn.lock",
-];
-
 /** Paths removed from isolated worktrees so agents cannot read secret bytes. */
 export const DEFAULT_SECRET_CONTENT_GLOBS = [
   "**/.env*",
@@ -16,6 +5,24 @@ export const DEFAULT_SECRET_CONTENT_GLOBS = [
   "**/*credential*",
   "**/*.pem",
   "**/*.key",
+  "**/.netrc",
+  "**/_netrc",
+  "**/.npmrc",
+  "**/.pypirc",
+  "**/.gem/credentials",
+  "**/.yarnrc",
+  "**/.yarnrc.yml",
+  "**/.docker/config.json",
+  "**/.config/gh/hosts.yml",
+  "**/.kube/config",
+];
+
+/** Secret-bearing paths plus generated files agents should not modify. */
+export const DEFAULT_SENSITIVE_GLOBS = [
+  ...DEFAULT_SECRET_CONTENT_GLOBS,
+  "**/package-lock.json",
+  "**/pnpm-lock.yaml",
+  "**/yarn.lock",
 ];
 
 export function globRegex(pattern: string): RegExp {

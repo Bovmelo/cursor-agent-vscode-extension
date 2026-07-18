@@ -13,6 +13,17 @@ export interface ParsedCommand {
   args: string[];
 }
 
+export interface ExecFileInvocation extends ParsedCommand {
+  windowsVerbatimArguments?: boolean;
+}
+
+export interface RunExecutableCommandOptions {
+  cwd: string;
+  timeout?: number;
+  maxBuffer: number;
+  env?: NodeJS.ProcessEnv;
+}
+
 /**
  * Quote-aware tokenization for configured commands.
  * Rejects shell operators so callers can use execFile without `shell: true`.
@@ -85,15 +96,25 @@ function resolveWindowsExecutable(file: string): string {
   return file;
 }
 
-/** Quote one argv token for `cmd.exe /d /s /c` without enabling a full shell. */
+const CMD_META = /([()\][%!^"`<>&|;, *?])/g;
+
+function escapeCmdCommand(command: string): string {
+  return command.replace(CMD_META, "^$1");
+}
+
+/**
+ * Quote one arbitrary argv token for `cmd.exe /d /s /c`.
+ *
+ * This follows the quoting strategy used by mature spawn wrappers and keeps
+ * PR titles/bodies as data rather than cmd.exe syntax while preserving Windows
+ * argv escaping for any executable launched by the shim.
+ */
 export function quoteForCmd(argument: string): string {
-  if (argument.length === 0) {
-    return '""';
-  }
-  if (!/[\s"]/.test(argument)) {
-    return argument;
-  }
-  return `"${argument.replace(/"/g, '""')}"`;
+  let escaped = argument
+    .replace(/(\\*)"/g, '$1$1\\"')
+    .replace(/(\\*)$/, "$1$1");
+  escaped = `"${escaped}"`.replace(CMD_META, "^$1");
+  return escaped;
 }
 
 /**
@@ -111,23 +132,49 @@ function windowsCmdExe(): string {
   return "cmd.exe";
 }
 
-export function toExecFileInvocation(parsed: ParsedCommand): ParsedCommand {
-  if (process.platform !== "win32") {
+export function toExecFileInvocation(
+  parsed: ParsedCommand,
+  platform: NodeJS.Platform = process.platform,
+): ExecFileInvocation {
+  if (platform !== "win32") {
     return parsed;
   }
   const base = path.basename(parsed.file);
   const isBatch = /\.(cmd|bat)$/i.test(parsed.file);
-  const isPkgManager = /^(npm|npx|pnpm|yarn|corepack)(\.cmd)?$/i.test(base);
-  if (!isBatch && !isPkgManager) {
+  const isKnownShim = /^(npm|npx|pnpm|yarn|corepack|gh)(\.cmd)?$/i.test(base);
+  if (!isBatch && !isKnownShim) {
     return parsed;
   }
-  // Prefer the bare name inside cmd.exe so PATHEXT resolves the shim.
-  const file = parsed.file.replace(/\.cmd$/i, "");
-  const commandLine = [file, ...parsed.args].map(quoteForCmd).join(" ");
+  if (/\r|\n/.test(parsed.file) || parsed.args.some((argument) => /\r|\n/.test(argument))) {
+    throw new Error("Windows batch commands do not support line breaks in arguments.");
+  }
+  const commandLine = `"${[
+    escapeCmdCommand(parsed.file),
+    ...parsed.args.map((argument) => quoteForCmd(argument)),
+  ].join(" ")}"`;
   return {
     file: windowsCmdExe(),
-    args: ["/d", "/s", "/c", commandLine],
+    args: ["/d", "/s", "/v:off", "/c", commandLine],
+    windowsVerbatimArguments: true,
   };
+}
+
+/** Run a program while supporting `.cmd` shims on Windows without `shell: true`. */
+export async function runExecutableCommand(
+  file: string,
+  args: string[],
+  options: RunExecutableCommandOptions,
+): Promise<{ stdout: string; stderr: string }> {
+  const invocation = toExecFileInvocation({ file, args });
+  return execFileAsync(invocation.file, invocation.args, {
+    cwd: options.cwd,
+    windowsHide: true,
+    windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+    timeout: options.timeout,
+    maxBuffer: options.maxBuffer,
+    env: options.env ?? minimalShellEnv(),
+    encoding: "utf8",
+  });
 }
 
 export async function runConfiguredCommand(
@@ -138,13 +185,10 @@ export async function runConfiguredCommand(
     maxBuffer: number;
   },
 ): Promise<{ stdout: string; stderr: string }> {
-  const invocation = toExecFileInvocation(parseCommandLine(command));
-  return execFileAsync(invocation.file, invocation.args, {
+  const parsed = parseCommandLine(command);
+  return runExecutableCommand(parsed.file, parsed.args, {
     cwd: options.cwd,
-    windowsHide: true,
     timeout: options.timeout,
     maxBuffer: options.maxBuffer,
-    env: minimalShellEnv(),
-    encoding: "utf8",
   });
 }
