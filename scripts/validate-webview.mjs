@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 
 const source = readFileSync(new URL("../out/webviewController.js", import.meta.url), "utf8");
+const extensionHostSource = readFileSync(new URL("../src/extension.ts", import.meta.url), "utf8");
 const marker = "return /* html */ `<!doctype html>";
 const markerIndex = source.indexOf(marker);
 if (markerIndex < 0) {
@@ -109,4 +110,97 @@ if (!clientScript.includes("const attachmentsReady = await waitForPendingAttachm
   throw new Error("Attachment-resolution timeout must block sending and show a retryable error");
 }
 
+const regularPromptRestoreSource = clientScript.match(
+  /function restorePromptFocusNow\(\) \{[\s\S]*?\n    \}/u,
+)?.[0];
+const hostPromptRestoreSource = clientScript.match(
+  /function restorePromptFocusFromHost\(\) \{[\s\S]*?\n    \}/u,
+)?.[0];
+if (!regularPromptRestoreSource || !hostPromptRestoreSource) {
+  throw new Error("Prompt focus-restoration helpers were not found");
+}
+
+const createPromptFocusHarness = new Function(
+  "document",
+  "prompt",
+  "restorationTarget",
+  `
+    let restorePromptOnWindowFocus = restorationTarget;
+    ${regularPromptRestoreSource}
+    ${hostPromptRestoreSource}
+    return { restorePromptFocusNow, restorePromptFocusFromHost };
+  `,
+);
+const promptFocusHarness = ({ documentFocused, restorationTarget, activePrompt = false }) => {
+  const focusCalls = [];
+  const prompt = {
+    focus: (options) => focusCalls.push(options),
+  };
+  const document = {
+    activeElement: activePrompt ? prompt : {},
+    hasFocus: () => documentFocused,
+  };
+  return {
+    focusCalls,
+    ...createPromptFocusHarness(document, prompt, restorationTarget),
+  };
+};
+
+const inactiveRegularRestore = promptFocusHarness({
+  documentFocused: false,
+  restorationTarget: true,
+});
+inactiveRegularRestore.restorePromptFocusNow();
+if (inactiveRegularRestore.focusCalls.length !== 0) {
+  throw new Error("Scheduled prompt focus retries must not bypass document.hasFocus()");
+}
+
+const inactiveHostRestore = promptFocusHarness({
+  documentFocused: false,
+  restorationTarget: true,
+  activePrompt: true,
+});
+if (inactiveHostRestore.restorePromptFocusFromHost() !== true
+  || inactiveHostRestore.focusCalls.length !== 1
+  || inactiveHostRestore.focusCalls[0]?.preventScroll !== true) {
+  throw new Error("The host window-focus signal must retry prompt focus before the webview reports focus");
+}
+
+const cancelledHostRestore = promptFocusHarness({
+  documentFocused: false,
+  restorationTarget: false,
+});
+if (cancelledHostRestore.restorePromptFocusFromHost() !== false
+  || cancelledHostRestore.focusCalls.length !== 0) {
+  throw new Error("The host window-focus signal must not revive a cancelled prompt focus target");
+}
+
+const activeHostRestore = promptFocusHarness({
+  documentFocused: true,
+  restorationTarget: true,
+  activePrompt: true,
+});
+activeHostRestore.restorePromptFocusFromHost();
+if (activeHostRestore.focusCalls.length !== 0) {
+  throw new Error("The host window-focus signal must not refocus an already-active prompt");
+}
+
+if (!clientScript.includes("if (restorePromptFocusFromHost()) schedulePromptFocusRestore();")
+  || !clientScript.includes("if (event.target !== prompt) cancelPromptFocusRestore();")
+  || !clientScript.includes("document.contains(event.relatedTarget)")
+  || !clientScript.includes('type: "promptDictationHotkey",')
+  || !clientScript.includes("occurredAt: Date.now(),")) {
+  throw new Error("Prompt focus restoration must retry after host focus and remain cancellable by webview UI use");
+}
+
+const providerStart = extensionHostSource.indexOf("class CursorChatProvider");
+const constructorStart = extensionHostSource.indexOf("  constructor(", providerStart);
+const constructorEnd = extensionHostSource.indexOf("\n  public setApplyCoordination(", constructorStart);
+const providerConstructor = extensionHostSource.slice(constructorStart, constructorEnd);
+if (!providerConstructor.includes("this.disposables.push(vscode.window.onDidChangeWindowState")
+  || !providerConstructor.includes("this.promptFocusHandoff.hostWindowFocusChanged(")
+  || !providerConstructor.includes('this.post({ type: "hostWindowFocused" });')
+  || [...extensionHostSource.matchAll(/onDidChangeWindowState/gu)].length !== 1) {
+  throw new Error("The extension host must scope one disposable window-focus listener to a prompt handoff");
+}
 console.log(`Validated ${inlineScripts.length} inline webview script(s).`);

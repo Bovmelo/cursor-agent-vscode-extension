@@ -409,6 +409,7 @@ export function findConflictingFiles(
 
 export type WebviewIncomingType =
   | "ready"
+  | "promptDictationHotkey"
   | "send"
   | "queueMessage"
   | "interruptMessage"
@@ -451,6 +452,7 @@ export type WebviewIncomingType =
 
 const WEBVIEW_TYPES = new Set<string>([
   "ready",
+  "promptDictationHotkey",
   "send",
   "queueMessage",
   "interruptMessage",
@@ -515,6 +517,7 @@ export interface ParsedWebviewMessage {
   uploads?: { name?: unknown; data?: unknown }[];
   pinned?: boolean;
   format?: string;
+  occurredAt?: number;
 }
 
 function asStringArray(value: unknown): string[] | undefined {
@@ -549,6 +552,15 @@ export function parseWebviewMessage(raw: unknown): ParsedWebviewMessage | undefi
 
   if (type === "openExternal" && typeof message.path !== "string") {
     return undefined;
+  }
+
+  if (type === "promptDictationHotkey") {
+    if (
+      typeof message.occurredAt !== "number"
+      || !Number.isFinite(message.occurredAt)
+    ) {
+      return undefined;
+    }
   }
 
   const requiresId = type === "removeQueuedMessage"
@@ -616,5 +628,6 @@ export function parseWebviewMessage(raw: unknown): ParsedWebviewMessage | undefi
       : undefined,
     pinned: typeof message.pinned === "boolean" ? message.pinned : undefined,
     format: typeof message.format === "string" ? message.format : undefined,
+    occurredAt: typeof message.occurredAt === "number" ? message.occurredAt : undefined,
   };
 }

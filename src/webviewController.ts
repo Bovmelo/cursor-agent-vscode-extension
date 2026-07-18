@@ -5589,6 +5589,17 @@ export class WebviewController {
       prompt.focus({ preventScroll: true });
     }
 
+    function restorePromptFocusFromHost() {
+      if (!restorePromptOnWindowFocus) return false;
+      // The extension host sees the native VS Code window regain focus before
+      // the webview document necessarily reports it. Only that host signal may
+      // bypass document.hasFocus(); scheduled retries keep the stricter guard.
+      if (!document.hasFocus() || document.activeElement !== prompt) {
+        prompt.focus({ preventScroll: true });
+      }
+      return true;
+    }
+
     function schedulePromptFocusRestore() {
       restorePromptOnWindowFocus = true;
       const generation = ++promptFocusRestoreGeneration;
@@ -5684,7 +5695,23 @@ export class WebviewController {
       requestContextPreview();
     });
     prompt.addEventListener("click", updateComposerSuggestions);
+    function isTypelessHotkey(event) {
+      return event.code === "AltRight"
+        && event.key !== "AltGraph"
+        && !event.ctrlKey
+        && !event.metaKey
+        && !event.shiftKey;
+    }
+    function reportTypelessHotkey() {
+      vscode.postMessage({
+        type: "promptDictationHotkey",
+        occurredAt: Date.now(),
+      });
+    }
     prompt.addEventListener("keydown", (event) => {
+      // Observe Typeless's Windows default without suppressing the key. AltGr
+      // reports AltGraph and/or Ctrl+Alt, so international input stays intact.
+      if (isTypelessHotkey(event)) reportTypelessHotkey();
       // Dictation / IME confirmation uses Enter and keyCode 229; never treat as send.
       if (event.isComposing || event.keyCode === 229) return;
       if (!filePicker.hidden) {
@@ -5739,6 +5766,9 @@ export class WebviewController {
 
     window.addEventListener("message", ({ data }) => {
       switch (data.type) {
+        case "hostWindowFocused":
+          if (restorePromptFocusFromHost()) schedulePromptFocusRestore();
+          break;
         case "authState":
           auth.style.display = data.configured ? "none" : "block";
           authChip.style.display = data.configured ? "none" : "inline-flex";

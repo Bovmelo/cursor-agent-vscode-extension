@@ -145,6 +145,7 @@ import {
 } from "./usageStats.js";
 import { pickWorkspaceFolder, resolveWorkspaceFolder, configurationFor, workspaceDisplayName, resolveAbsoluteInWorkspace, resolveAbsoluteInWorkspaceResolved, workspaceFolderFromUri, defaultWorkspaceFolder } from "./workspaceFolder.js";
 import { WebviewController } from "./webviewController.js";
+import { PromptFocusHandoff } from "./promptFocusHandoff.js";
 import { cleanupOrphanedManagedWorktrees } from "./worktreeLifecycle.js";
 import { ApplyQueue, FileOwnershipCoordinator } from "./parallelOwnership.js";
 import { AuditTimelineController } from "./auditTimeline.js";
@@ -613,6 +614,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private readonly disposables: vscode.Disposable[] = [];
   private readonly conversationStore: ConversationStore;
   private readonly webviewController: WebviewController;
+  private readonly promptFocusHandoff = new PromptFocusHandoff();
   private readonly agentFactory: AgentFactory;
   private readonly attachmentService: AttachmentService;
   private readonly chatRuntimes = new Map<string, ChatRuntime>();
@@ -688,6 +690,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       SUPPORTS_LOCAL_SANDBOX,
       MAX_DROPPED_FILE_BYTES,
     );
+    this.disposables.push(vscode.window.onDidChangeWindowState((state) => {
+      if (this.promptFocusHandoff.hostWindowFocusChanged(
+        state.focused,
+        this.webviewController.visible,
+      )) {
+        this.post({ type: "hostWindowFocused" });
+      }
+    }));
     this.agentFactory = new AgentFactory({
       supportsLocalSandbox: SUPPORTS_LOCAL_SANDBOX,
       isJapanese: IS_JAPANESE,
@@ -750,6 +760,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.webviewReady = false;
     this.webviewController.attach(view, () => {
       this.webviewReady = false;
+      this.promptFocusHandoff.reset();
     });
 
     view.webview.onDidReceiveMessage(
@@ -759,6 +770,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           return;
         }
         switch (message.type) {
+          case "promptDictationHotkey":
+            this.promptFocusHandoff.dictationHotkeyStarted(
+              message.occurredAt ?? Date.now(),
+              vscode.window.state.focused,
+              this.webviewController.visible,
+            );
+            break;
           case "ready":
             this.webviewReady = true;
             await this.ensureWindowsSafeModeMigrated();

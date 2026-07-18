@@ -367,6 +367,14 @@ test("webview message schema validation accepts known shapes and rejects junk", 
   const ready = parseWebviewMessage({ type: "ready" });
   assert.equal(ready?.type, "ready");
 
+  assert.equal(parseWebviewMessage({ type: "promptDictationHotkey" }), undefined);
+  const hotkeyDown = parseWebviewMessage({
+    type: "promptDictationHotkey",
+    occurredAt: 123,
+  });
+  assert.equal(hotkeyDown?.type, "promptDictationHotkey");
+  assert.equal(hotkeyDown?.occurredAt, 123);
+
   const pickWorkspace = parseWebviewMessage({ type: "pickWorkspaceFolder" });
   assert.equal(pickWorkspace?.type, "pickWorkspaceFolder");
 
