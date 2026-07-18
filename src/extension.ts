@@ -41,10 +41,16 @@ import {
   type ReviewFinding,
   type VerificationResult,
 } from "./aiNative.js";
+import { buildAutoRepairPrompt } from "./autoRepair.js";
 import {
+  buildBestOfNJudgePrompt,
   createBestOfNExperiment,
   experimentCandidates,
+  parseBestOfNWinnerVerdict,
   pickWinner,
+  selectBestOfNWinner,
+  shouldAbortBestOfNAutoSelect,
+  type BestOfNCandidateEvidence,
   type BestOfNExperiment,
 } from "./bestOfN.js";
 import { buildContextPreview } from "./contextEstimate.js";
@@ -74,6 +80,10 @@ import {
   type ProjectCommand,
 } from "./projectCommands.js";
 import { RunningSoundController } from "./runningSound.js";
+import {
+  isRunPreparationError,
+  waitForRunPreparation,
+} from "./runPreparation.js";
 import {
   AiSupervisorController,
   type SupervisorTaskTarget,
@@ -107,6 +117,7 @@ import {
   markSubtaskLaunch,
   markSubtaskStatus,
   orchestratorSummaries,
+  prepareOrchestratorResume,
   resolveOrchestratorPlan,
   type OrchestratorActivity,
   type OrchestratorExperiment,
@@ -641,8 +652,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private bestOfNExperiments: BestOfNExperiment[];
   private readonly bestOfNArtifacts = new Map<
     string,
-    { session: IsolatedWorktreeSession; changes: IsolatedChange[]; root: string }
+    {
+      session: IsolatedWorktreeSession;
+      changes: IsolatedChange[];
+      root: string;
+      verification?: VerificationResult;
+    }
   >();
+  private readonly bestOfNAutoSelectInFlight = new Set<string>();
   private orchestratorExperiments: OrchestratorExperiment[];
   private orchestratorUpdateChain: Promise<void> = Promise.resolve();
   private credentialRevocation?: {
@@ -761,6 +778,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             }
             await this.publishAuthState();
             await this.flushPendingChatFiles();
+            // Chat queues are in-memory. Rebuild pending orchestration launches
+            // from persisted experiment state after an extension-host restart.
+            void this.resumePendingOrchestratorSubtasks();
             if (!SUPPORTS_LOCAL_SANDBOX) {
               void this.ensureSandboxWarningAcknowledged().catch((error) => {
                 this.output.appendLine(
@@ -1941,6 +1961,120 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.postOrchestratorActivity(conversationId, null);
   }
 
+  private async resumePendingOrchestratorSubtasks(): Promise<void> {
+    const pending = await this.withOrchestratorLock(async () => {
+      const conversationExists = (conversationId: string): boolean =>
+        this.conversations.some((candidate) => candidate.id === conversationId);
+      const isBusy = (conversationId: string): boolean =>
+        this.isConversationBusy(conversationId);
+      const isQueued = (conversationId: string): boolean =>
+        this.messageQueue.some((item) => item.conversationId === conversationId);
+
+      const prepared = prepareOrchestratorResume(this.orchestratorExperiments, {
+        conversationExists,
+        isBusy,
+        isQueued,
+      });
+      this.orchestratorExperiments = prepared.experiments;
+
+      const launches = [...prepared.launches];
+      let createdSynthesis = false;
+      for (const experimentId of prepared.needsSynthesisConversation) {
+        const index = this.orchestratorExperiments.findIndex(
+          (experiment) => experiment.id === experimentId,
+        );
+        if (index < 0) {
+          continue;
+        }
+        let experiment = this.orchestratorExperiments[index];
+        if (
+          experiment.status !== "synthesizing"
+          || experiment.synthesisConversationId
+        ) {
+          continue;
+        }
+        const workspaceFolderUri = this.resolveChatWorkspace()?.uri.toString();
+        const synthesisConversation: Conversation = {
+          id: randomUUID(),
+          title: makeConversationTitle(`[Synthesis] ${experiment.prompt}`),
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          workspaceFolderUri,
+          orchestratorExperimentId: experiment.id,
+          orchestratorRole: "synthesis",
+          transcript: [],
+        };
+        this.conversations.unshift(synthesisConversation);
+        experiment = {
+          ...experiment,
+          synthesisConversationId: synthesisConversation.id,
+        };
+        this.orchestratorExperiments[index] = experiment;
+        createdSynthesis = true;
+        launches.push({
+          prompt: buildSynthesisPrompt(experiment),
+          conversationId: synthesisConversation.id,
+          kind: "synthesis",
+        });
+      }
+
+      await this.saveOrchestratorExperiments();
+      if (createdSynthesis) {
+        await this.saveConversations();
+      }
+      return launches;
+    });
+    for (const launch of pending) {
+      this.deferOrchestratorMessage(launch.prompt, "agent", launch.conversationId);
+    }
+  }
+
+  private deferOrchestratorMessage(
+    prompt: string,
+    profile: RunProfile,
+    conversationId: string,
+  ): void {
+    setTimeout(() => {
+      void this.enqueueMessage(
+        prompt,
+        false,
+        [],
+        profile,
+        [],
+        false,
+        undefined,
+        false,
+        conversationId,
+      ).catch((error) => {
+        this.output.appendLine(
+          `[${new Date().toISOString()}] Could not enqueue orchestrator task: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
+    }, 0);
+  }
+
+  private async markOrchestratorSubtaskRunning(conversationId: string): Promise<void> {
+    await this.withOrchestratorLock(async () => {
+      const index = this.orchestratorExperiments.findIndex((experiment) =>
+        experiment.status === "running"
+        && experiment.subtasks.some((subtask) =>
+          subtask.conversationId === conversationId && subtask.status === "pending"
+        )
+      );
+      if (index < 0) {
+        return;
+      }
+      this.orchestratorExperiments[index] = markSubtaskLaunch(
+        this.orchestratorExperiments[index],
+        conversationId,
+        "running",
+      );
+      await this.saveOrchestratorExperiments();
+    });
+  }
+
   private async listGhIssues(
     root: string,
   ): Promise<Array<{ number: number; title: string; body: string; url: string }>> {
@@ -2104,17 +2238,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         if (resolution.kind === "retry") {
           this.orchestratorExperiments[planIndex] = experiment;
           await this.saveOrchestratorExperiments();
-          await this.enqueueMessage(
-            resolution.prompt,
-            false,
-            [],
-            "plan",
-            [],
-            false,
-            undefined,
-            false,
-            conversationId,
-          );
+          this.deferOrchestratorMessage(resolution.prompt, "plan", conversationId);
           return;
         }
         if (resolution.usedFallback) {
@@ -2157,26 +2281,6 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           0,
           Math.max(1, maximumParallelAgents) - this.activeRunCount(),
         );
-        if (availableParallelAgents === 0) {
-          for (const launch of launches) {
-            experiment = markSubtaskLaunch(
-              experiment,
-              launch.conversationId,
-              "failed",
-              "No parallel agent slots available.",
-            );
-          }
-          this.orchestratorExperiments[planIndex] = experiment;
-          await this.saveOrchestratorExperiments();
-          await this.saveConversations();
-          void vscode.window.showWarningMessage(
-            localize(
-              experiment.error ?? "Orchestrator subtasks could not launch because no parallel agent slots were available.",
-              experiment.error ?? "並列Agentスロットがないため、オーケストレーターのサブタスクを起動できませんでした。",
-            ),
-          );
-          return;
-        }
         await launchOrchestratorSubtasks(
           launches,
           async () => {
@@ -2185,37 +2289,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             await this.saveConversations();
           },
           async (launch) => {
-            const slots = Math.max(
-              0,
-              Math.max(1, maximumParallelAgents) - this.activeRunCount(),
-            );
-            if (slots === 0) {
-              experiment = markSubtaskLaunch(
-                experiment,
-                launch.conversationId,
-                "failed",
-                "No parallel agent slots available.",
-              );
-              this.orchestratorExperiments[planIndex] = experiment;
-              await this.saveOrchestratorExperiments();
-              return;
-            }
-            await this.enqueueMessage(
-              launch.prompt,
-              false,
-              [],
-              "agent",
-              [],
-              false,
-              undefined,
-              false,
-              launch.conversationId,
-            );
-            experiment = markSubtaskLaunch(experiment, launch.conversationId, "running");
-            this.orchestratorExperiments[planIndex] = experiment;
-            await this.saveOrchestratorExperiments();
+            this.deferOrchestratorMessage(launch.prompt, "agent", launch.conversationId);
+            // If capacity is exhausted, enqueueMessage retains this pending
+            // subtask in the normal chat queue until a slot becomes free.
           },
-          availableParallelAgents,
+          Math.max(1, availableParallelAgents),
         );
         return;
       }
@@ -2226,10 +2304,21 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           && experiment.subtasks.some((subtask) => subtask.conversationId === conversationId),
       );
       if (subtaskIndex >= 0) {
+        const conversation = this.conversations.find((item) => item.id === conversationId);
+        const lastAssistant = conversation
+          ? [...conversation.transcript]
+            .reverse()
+            .find((entry) => entry.role === "assistant")
+          : undefined;
+        const summary = (assistantText || lastAssistant?.text || "").trim();
         let experiment = markSubtaskStatus(
           this.orchestratorExperiments[subtaskIndex],
           conversationId,
           progressState === "completed" ? "completed" : "failed",
+          {
+            summary: summary || undefined,
+            changedFiles: lastAssistant?.files,
+          },
         );
         if (experiment.status === "failed") {
           this.orchestratorExperiments[subtaskIndex] = experiment;
@@ -2267,15 +2356,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           this.orchestratorExperiments[subtaskIndex] = experiment;
           await this.saveOrchestratorExperiments();
           await this.saveConversations();
-          await this.enqueueMessage(
+          this.deferOrchestratorMessage(
             buildSynthesisPrompt(experiment),
-            false,
-            [],
             "agent",
-            [],
-            false,
-            undefined,
-            false,
             synthesisConversation.id,
           );
           return;
@@ -3299,13 +3382,195 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     ));
     void vscode.window.showInformationMessage(
       localize(
-        `Started best-of-${runCount}. Compare the parallel chats and pick a winner from history when ready.`,
-        `best-of-${runCount}を開始しました。並列チャットを比較し、履歴から勝者を選べます。`,
+        `Started best-of-${runCount}. Candidates verify in isolation; a winner is selected automatically when all finish (or pick one from history).`,
+        `best-of-${runCount}を開始しました。候補は隔離検証され、全完了後に自動で勝者を選びます（履歴からの手動選択も可）。`,
       ),
     );
   }
 
-  private async pickBestOfNWinner(conversationId: string): Promise<void> {
+  private collectBestOfNEvidence(
+    experiment: BestOfNExperiment,
+  ): BestOfNCandidateEvidence[] {
+    return experiment.conversationIds.flatMap((id) => {
+      const conversation = this.conversations.find((item) => item.id === id);
+      if (!conversation) {
+        return [];
+      }
+      const lastAssistant = [...conversation.transcript]
+        .reverse()
+        .find((entry) => entry.role === "assistant");
+      const artifact = this.bestOfNArtifacts.get(id);
+      const failed = lastAssistant?.error === true
+        || lastAssistant?.progressState === "error"
+        || lastAssistant?.progressState === "stopped";
+      const completed = Boolean(lastAssistant) && !this.isConversationBusy(id);
+      const verification = artifact?.verification;
+      return [{
+        conversationId: id,
+        title: conversation.title,
+        completed,
+        failed,
+        hasArtifact: (artifact?.changes.length ?? 0) > 0,
+        changedFileCount: artifact?.changes.length ?? lastAssistant?.files?.length ?? 0,
+        changedFiles: artifact?.changes.map((change) => change.relative)
+          ?? lastAssistant?.files,
+        verificationSuccess: verification
+          ? (verification.skipped ? undefined : verification.success)
+          : undefined,
+        verificationSkipped: verification?.skipped === true,
+        totalTokens: conversation.tokenUsage?.totalTokens ?? 0,
+        lastAssistant: lastAssistant?.text?.slice(0, 2_000),
+      }];
+    });
+  }
+
+  private async maybeAutoSelectBestOfNWinner(experimentId: string): Promise<void> {
+    if (!this.alertConfiguration().get<boolean>("bestOfNAutoSelect", true)) {
+      return;
+    }
+    if (this.bestOfNAutoSelectInFlight.has(experimentId)) {
+      return;
+    }
+    const index = this.bestOfNExperiments.findIndex((item) => item.id === experimentId);
+    if (index < 0) {
+      return;
+    }
+    const experiment = this.bestOfNExperiments[index];
+    if (shouldAbortBestOfNAutoSelect(experiment, { autoSelectEnabled: true })) {
+      return;
+    }
+    if (experiment.conversationIds.some((id) => this.isConversationBusy(id))) {
+      return;
+    }
+    const evidence = this.collectBestOfNEvidence(experiment);
+    if (evidence.length === 0 || evidence.some((item) => !item.completed)) {
+      return;
+    }
+
+    this.bestOfNAutoSelectInFlight.add(experimentId);
+    try {
+      let selection = selectBestOfNWinner(evidence);
+      if (!selection) {
+        void vscode.window.showWarningMessage(
+          localize(
+            "All best-of-N candidates failed. No winner was selected.",
+            "best-of-Nの候補がすべて失敗したため、勝者を選べませんでした。",
+          ),
+        );
+        return;
+      }
+
+      const autoJudgeEnabled = this.alertConfiguration().get<boolean>("bestOfNAutoJudge", true);
+      const shouldJudge = selection.tied
+        && autoJudgeEnabled
+        && vscode.workspace.isTrusted;
+      if (shouldJudge) {
+        const apiKey = await this.context.secrets.get(API_KEY_SECRET);
+        const workspace = this.resolveChatWorkspace();
+        if (apiKey && workspace) {
+          try {
+            if (shouldAbortBestOfNAutoSelect(
+              this.bestOfNExperiments.find((item) => item.id === experimentId),
+              {
+                autoSelectEnabled: this.alertConfiguration().get<boolean>("bestOfNAutoSelect", true),
+                requireAutoJudge: true,
+                autoJudgeEnabled: this.alertConfiguration().get<boolean>("bestOfNAutoJudge", true),
+              },
+            )) {
+              return;
+            }
+            const result = await Agent.prompt(
+              buildBestOfNJudgePrompt(experiment.prompt, evidence),
+              {
+                apiKey,
+                model: this.selectedModelSelection(),
+                name: "VS Code: Best-of-N Judge",
+                mode: "plan",
+                local: { cwd: workspace.uri.fsPath, settingSources: [] },
+              },
+            );
+            if (result.usage) {
+              await this.recordUsage("chat", result.usage);
+            }
+            const latestForVerdict = this.bestOfNExperiments.find(
+              (item) => item.id === experimentId,
+            );
+            if (shouldAbortBestOfNAutoSelect(latestForVerdict, {
+              autoSelectEnabled: this.alertConfiguration().get<boolean>("bestOfNAutoSelect", true),
+              requireAutoJudge: true,
+              autoJudgeEnabled: this.alertConfiguration().get<boolean>("bestOfNAutoJudge", true),
+            })) {
+              return;
+            }
+            const verdict = result.status === "finished"
+              ? parseBestOfNWinnerVerdict(
+                  result.result ?? "",
+                  latestForVerdict?.conversationIds ?? experiment.conversationIds,
+                )
+              : undefined;
+            if (verdict) {
+              selection = {
+                winnerId: verdict.winnerId,
+                reasons: verdict.reasons.length > 0
+                  ? verdict.reasons
+                  : ["AI judge selected this candidate"],
+                tied: false,
+                method: "judge",
+              };
+            }
+          } catch (error) {
+            this.output.appendLine(
+              `[${new Date().toISOString()}] Best-of-N judge failed: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
+        }
+      }
+
+      const latestIndex = this.bestOfNExperiments.findIndex(
+        (item) => item.id === experimentId,
+      );
+      if (latestIndex < 0) {
+        return;
+      }
+      const latest = this.bestOfNExperiments[latestIndex];
+      if (shouldAbortBestOfNAutoSelect(latest, {
+        autoSelectEnabled: this.alertConfiguration().get<boolean>("bestOfNAutoSelect", true),
+      })) {
+        return;
+      }
+      if (!latest.conversationIds.includes(selection.winnerId)) {
+        return;
+      }
+
+      const winnerConversation = this.conversations.find(
+        (item) => item.id === selection.winnerId,
+      );
+      if (!winnerConversation) {
+        return;
+      }
+      const reasons = selection.reasons;
+      this.bestOfNExperiments[latestIndex] = pickWinner(latest, selection.winnerId, {
+        autoSelected: true,
+        reasons,
+      });
+      await this.context.workspaceState.update(BEST_OF_N_KEY, this.bestOfNExperiments);
+      winnerConversation.pinned = true;
+      await this.saveConversations();
+
+      // Single toast via pickBestOfNWinner (alreadyPinned) — avoid duplicate
+      // InformationMessage from auto-select + pin.
+      await this.pickBestOfNWinner(selection.winnerId, { alreadyPinned: true });
+    } finally {
+      this.bestOfNAutoSelectInFlight.delete(experimentId);
+    }
+  }
+
+  private async pickBestOfNWinner(
+    conversationId: string,
+    options?: { alreadyPinned?: boolean },
+  ): Promise<void> {
     const conversation = this.conversations.find((item) => item.id === conversationId);
     if (!conversation?.experimentGroupId) {
       return;
@@ -3316,7 +3581,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (index < 0) {
       return;
     }
-    const experiment = pickWinner(this.bestOfNExperiments[index], conversationId);
+    const experiment = options?.alreadyPinned
+      ? this.bestOfNExperiments[index]
+      : pickWinner(this.bestOfNExperiments[index], conversationId);
     this.bestOfNExperiments[index] = experiment;
     conversation.pinned = true;
     await this.context.workspaceState.update(BEST_OF_N_KEY, this.bestOfNExperiments);
@@ -3334,12 +3601,16 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         stillRunning
           ? "Pinned the best-of-N winner. Wait for all candidates to finish before applying it."
           : hasArtifact
-            ? "Pinned the best-of-N winner. Its isolated changes can now be applied directly or turned into a pull request."
+            ? (options?.alreadyPinned
+              ? "Apply the auto-selected best-of-N winner, create a pull request, or delete the losing runs."
+              : "Pinned the best-of-N winner. Its isolated changes can now be applied directly or turned into a pull request.")
             : "Pinned the winning conversation from best-of-N.",
         stillRunning
           ? "best-of-Nの勝者をピン留めしました。全候補の完了後に適用できます。"
           : hasArtifact
-            ? "best-of-Nの勝者をピン留めしました。隔離された変更を直接適用またはPR化できます。"
+            ? (options?.alreadyPinned
+              ? "自動選択されたbest-of-Nの勝者を適用、PR作成、または敗者会話の削除ができます。"
+              : "best-of-Nの勝者をピン留めしました。隔離された変更を直接適用またはPR化できます。")
             : "best-of-Nの勝者会話をピン留めしました。",
       ),
       ...actions,
@@ -4810,6 +5081,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     runtime.busy = true;
     runtime.pendingCancel = false;
     runtime.mutating = profile !== "plan";
+    // A queued orchestrator task becomes running only after it has reserved a
+    // real chat-agent slot, keeping persisted/UI state aligned with execution.
+    await this.markOrchestratorSubtaskRunning(conversationId).catch((error) => {
+      this.output.appendLine(
+        `[${new Date().toISOString()}] Could not persist orchestrator running state: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
     if (queue?.fromQueue) {
       this.postIfActive(conversationId, {
         type: "queuedStarted",
@@ -5038,6 +5318,38 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       this.postIfActive(conversationId, { type: "chunk", text: assistantText });
     }
 
+    const preparationAbort = new AbortController();
+    runtime.preparationAbort = preparationAbort;
+    if (runtime.pendingCancel) {
+      preparationAbort.abort();
+    }
+    const configuredPreparationTimeout = this.alertConfiguration()
+      .get<number>("runPreparationTimeoutSeconds", 120);
+    const preparationTimeoutSeconds = Number.isFinite(configuredPreparationTimeout)
+      ? Math.min(600, Math.max(15, configuredPreparationTimeout))
+      : 120;
+    const preparationTimeoutMs = preparationTimeoutSeconds * 1_000;
+    const startupStep: ToolProgressEntry = {
+      id: `run-startup-${conversationId}`,
+      text: localize("Connecting to Cursor", "Cursorへ接続中"),
+      status: "running",
+    };
+    const updateStartupStep = (
+      text: string,
+      status: ToolProgressEntry["status"] = "running",
+    ): void => {
+      startupStep.text = text;
+      startupStep.status = status;
+      progressSteps.set(startupStep.id, { ...startupStep });
+      this.postIfActive(conversationId, {
+        type: "toolStatus",
+        callId: startupStep.id,
+        text,
+        status,
+      });
+    };
+    updateStartupStep(startupStep.text);
+
     try {
       const blockedProxy = detectBlockedProxyEnvironment();
       if (blockedProxy) {
@@ -5057,28 +5369,84 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         ...agentRoots.map((root) => path.resolve(root).toLowerCase()),
         this.integrationStateKey(conversation),
       ].join("\n");
+      const disposeLateAgent = async (lateAgent: CursorAgent): Promise<void> => {
+        try {
+          const currentAgent = runtime.agent;
+          if (currentAgent && currentAgent.agentId !== lateAgent.agentId) {
+            conversation.agentId = currentAgent.agentId;
+            await this.saveConversations();
+          } else if (conversation.agentId === lateAgent.agentId) {
+            conversation.agentId = undefined;
+            await this.saveConversations();
+          }
+        } catch (cleanupError) {
+          this.output.appendLine(
+            `[${new Date().toISOString()}] Failed to persist late-agent cleanup: ${
+              cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+            }`,
+          );
+        } finally {
+          try {
+            await lateAgent[Symbol.asyncDispose]();
+          } catch (disposeError) {
+            this.output.appendLine(
+              `[${new Date().toISOString()}] Failed to dispose late agent: ${
+                disposeError instanceof Error ? disposeError.message : String(disposeError)
+              }`,
+            );
+          }
+        }
+      };
       if (
         !runtime.agent
         || runtime.rootsKey !== rootsKey
       ) {
-        await this.disposeAgent(conversationId);
-        runtime.agent = await this.createOrResumeAgent(
+        if (runtime.agent) {
+          updateStartupStep(localize("Resetting Cursor agent", "Cursor Agentを再初期化中"));
+          await waitForRunPreparation(() => this.disposeAgent(conversationId), {
+            signal: preparationAbort.signal,
+            timeoutMs: preparationTimeoutMs,
+            phase: "resetting the Cursor agent",
+          });
+        }
+        updateStartupStep(localize("Connecting to Cursor", "Cursorへ接続中"));
+        runtime.agent = await waitForRunPreparation(() => this.createOrResumeAgent(
           apiKey,
           agentRoots,
           workspace.name,
           conversation,
-        );
+        ), {
+          signal: preparationAbort.signal,
+          timeoutMs: preparationTimeoutMs,
+          phase: "connecting to Cursor",
+          onLateResolve: disposeLateAgent,
+        });
         runtime.rootsKey = rootsKey;
       }
 
+      updateStartupStep(localize("Starting Cursor run", "Cursor Runを開始中"));
       const runMessage = images.length > 0 ? { text: composed, images } : composed;
       const runOptions = {
         model: modelSelection ?? this.selectedModelSelection(),
         mode: profile === "plan" ? "plan" as const : "agent" as const,
+        ...(runtime.forceNextRun ? { local: { force: true } } : {}),
       };
       let run: CursorRun;
+      const sendRun = (): Promise<CursorRun> => waitForRunPreparation(
+        () => runtime.agent!.send(runMessage, runOptions),
+        {
+          signal: preparationAbort.signal,
+          timeoutMs: preparationTimeoutMs,
+          phase: "starting the Cursor run",
+          onLateResolve: async (lateRun) => {
+            if (lateRun.supports("cancel")) {
+              await lateRun.cancel();
+            }
+          },
+        },
+      );
       try {
-        run = await runtime.agent.send(runMessage, runOptions);
+        run = await sendRun();
       } catch (error) {
         if (!this.isAgentBusyError(error)) {
           throw error;
@@ -5086,21 +5454,28 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         this.output.appendLine(
           `[${new Date().toISOString()}] Recovering stale active run for agent ${runtime.agent.agentId}.`,
         );
-        await this.recoverBusyAgent(
-          runtime,
-          apiKey,
-          agentRoots,
-          workspace.name,
-          conversation,
-          cwd,
-          rootsKey,
+        updateStartupStep(localize("Recovering stalled Cursor run", "停止したCursor Runを復旧中"));
+        runtime.agent = await waitForRunPreparation(
+          () => this.recoverBusyAgent(
+            runtime,
+            apiKey,
+            agentRoots,
+            workspace.name,
+            conversation,
+            cwd,
+          ),
+          {
+            signal: preparationAbort.signal,
+            timeoutMs: preparationTimeoutMs,
+            phase: "recovering a stalled Cursor run",
+            onLateResolve: disposeLateAgent,
+          },
         );
-        if (!runtime.agent) {
-          throw new Error(localize("The chat agent is unavailable.", "チャットAgentを利用できません。"));
-        }
-        run = await runtime.agent.send(runMessage, runOptions);
+        runtime.rootsKey = rootsKey;
+        run = await sendRun();
       }
       runtime.run = run;
+      runtime.forceNextRun = false;
       if (
         runtime.pendingCancel
         && run.supports("cancel")
@@ -5109,6 +5484,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         await run.cancel();
       }
 
+      updateStartupStep(localize("Waiting for Cursor response", "Cursorの応答を待機中"));
       const eventStream = run.stream();
       const resultPromise = run.wait();
       const terminalSignal = resultPromise.then(async (result) => {
@@ -5117,14 +5493,29 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         return { type: "result" as const, result };
       });
       let result: RunResult | undefined;
+      let waitingForFirstResponse = true;
       while (!result) {
-        const outcome = await Promise.race([
+        const nextOutcome = Promise.race([
           eventStream.next().then(
             (next) => ({ type: "event" as const, next }),
             (error: unknown) => ({ type: "streamError" as const, error }),
           ),
           terminalSignal,
         ]);
+        const outcome = waitingForFirstResponse
+          ? await waitForRunPreparation(() => nextOutcome, {
+              signal: preparationAbort.signal,
+              timeoutMs: preparationTimeoutMs,
+              phase: "waiting for the first Cursor response",
+              onLateResolve: () => {
+                void eventStream.return(undefined).catch(() => {});
+              },
+            })
+          : await nextOutcome;
+        if (waitingForFirstResponse) {
+          waitingForFirstResponse = false;
+          updateStartupStep(localize("Cursor responded", "Cursorから応答あり"), "completed");
+        }
         if (outcome.type === "result") {
           result = outcome.result;
           this.output.appendLine(
@@ -5214,15 +5605,55 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         const applyableChanges = changes.filter((change) => !change.excluded);
         if (bestOfNCandidate) {
           await this.cleanupBestOfNArtifact(conversationId);
+          let candidateVerification: VerificationResult | undefined;
+          if (
+            applyableChanges.length > 0
+            && this.featureEnabled("enableVerification")
+            && this.alertConfiguration().get<boolean>("autoVerify", true)
+          ) {
+            const verificationStep: ToolProgressEntry = {
+              id: `bestofn-verification-${run.id}`,
+              text: localize(
+                "Running candidate verification in isolated worktree",
+                "隔離worktreeで候補の検証を実行",
+              ),
+              status: "running",
+            };
+            progressSteps.set(verificationStep.id, verificationStep);
+            this.postIfActive(conversationId, {
+              type: "toolStatus",
+              callId: verificationStep.id,
+              text: verificationStep.text,
+              status: "running",
+            });
+            candidateVerification = await runVerification(
+              session.worktreePath,
+              this.alertConfiguration().get<string[]>("verificationCommands", []),
+              this.output,
+            );
+            verificationStep.status = candidateVerification.success ? "completed" : "error";
+            const verificationSummary = this.formatVerificationSummary(candidateVerification);
+            this.postIfActive(conversationId, {
+              type: "toolStatus",
+              callId: verificationStep.id,
+              text: verificationSummary,
+              status: verificationStep.status,
+            });
+            assistantText = `${assistantText}\n\n${verificationSummary}`.trim();
+            if (runtime.live) {
+              runtime.live.assistantText = assistantText;
+            }
+          }
           this.bestOfNArtifacts.set(conversationId, {
             session,
             changes: applyableChanges,
             root: workspaceRoot,
+            verification: candidateVerification,
           });
           preserveIsolatedWorktree = true;
           const comparisonSummary = localize(
-            `Prepared ${applyableChanges.length} isolated candidate change(s). Pick this run as the best-of-N winner to apply them or create a pull request.`,
-            `${applyableChanges.length}件の候補変更を隔離して準備しました。best-of-Nの勝者に選ぶと適用またはPR作成できます。`,
+            `Prepared ${applyableChanges.length} isolated candidate change(s). When all candidates finish, a winner can be selected automatically; you can also pick one from history.`,
+            `${applyableChanges.length}件の候補変更を隔離して準備しました。全候補の完了後に自動で勝者を選べます。履歴からの手動選択も可能です。`,
           );
           assistantText = `${assistantText}\n\n${comparisonSummary}`.trim();
           if (runtime.live) {
@@ -5444,6 +5875,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         result.status === "finished"
         && editedFiles.size > 0
         && !hasPendingReview
+        && !bestOfNCandidate
         && this.featureEnabled("enableVerification")
         && this.alertConfiguration().get<boolean>("autoVerify", true)
       ) {
@@ -5543,12 +5975,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             status: "running",
           });
           await this.enqueueMessage(
-            [
-              `Automatic verification failed (repair attempt ${attempts + 1}/${maxAttempts}).`,
-              "Diagnose the failure, make the smallest correction, and leave the workspace in a verified state.",
-              "",
+            buildAutoRepairPrompt({
+              attempt: attempts + 1,
+              maxAttempts,
               failures,
-            ].join("\n"),
+              editedFiles: [...editedFiles],
+            }),
             false,
             [],
             "agent",
@@ -5588,30 +6020,167 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         }
       }
     } catch (error) {
-      failed = true;
-      progressState = "error";
+      const preparationFailure = isRunPreparationError(error) ? error : undefined;
+      const wasCancelled = preparationFailure?.kind === "cancelled";
+      const timedOut = preparationFailure?.kind === "timeout";
+      failed = !wasCancelled;
+      progressState = wasCancelled ? "stopped" : "error";
       if (runtime.live) {
         runtime.live.progressState = progressState;
       }
-      this.output.appendLine(
-        `[${new Date().toISOString()}] Cursor Agent error: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-      const text =
-        error instanceof CursorAgentError
+
+      if (wasCancelled) {
+        updateStartupStep(localize("Run stopped", "実行を停止しました"), "stopped");
+      } else {
+        updateStartupStep(
+          timedOut
+            ? localize("Cursor did not respond in time", "Cursorの応答がタイムアウトしました")
+            : startupStep.text,
+          "error",
+        );
+        this.output.appendLine(
+          `[${new Date().toISOString()}] Cursor Agent error: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+
+      if (timedOut || (wasCancelled && !runtime.run)) {
+        const timedOutRun = runtime.run;
+        const canCancelTimedOutRun = timedOutRun?.supports("cancel") === true;
+        if (timedOutRun && canCancelTimedOutRun) {
+          runtime.cancellation ??= timedOutRun.cancel();
+        } else if (timedOutRun && runtime.agent) {
+          const staleAgent = runtime.agent;
+          runtime.agent = undefined;
+          runtime.rootsKey = undefined;
+          runtime.forceNextRun = false;
+          conversation.agentId = undefined;
+          runtime.cancellation ??= staleAgent[Symbol.asyncDispose]();
+        }
+        if (!timedOutRun && runtime.agent) {
+          // send() may still be pending without having returned a Run handle.
+          // Closing the agent is the only way to prove its executor is gone.
+          const staleAgent = runtime.agent;
+          runtime.agent = undefined;
+          runtime.rootsKey = undefined;
+          runtime.forceNextRun = false;
+          conversation.agentId = undefined;
+          runtime.cancellation ??= staleAgent[Symbol.asyncDispose]();
+        } else if (
+          timedOutRun
+          && canCancelTimedOutRun
+          && runtime.agent
+          && !runtime.isolatedWorktree
+        ) {
+          // Preserve conversation context, but force the SDK to expire any
+          // persisted active run before accepting the next follow-up.
+          runtime.forceNextRun = true;
+        } else if (!runtime.agent) {
+          runtime.rootsKey = undefined;
+          conversation.agentId = undefined;
+        }
+      }
+
+      const text = wasCancelled
+        ? localize("(Stopped)", "（停止しました）")
+        : timedOut
           ? localize(
-              `Could not start the connection to Cursor: ${error.message}`,
-              `Cursorへの接続を開始できませんでした: ${error.message}`,
+              `Cursor did not respond within ${preparationTimeoutSeconds} seconds. The stalled run was discarded; check the network, VPN, proxy, or API key, then try again.`,
+              `${preparationTimeoutSeconds}秒以内にCursorから応答がありませんでした。停止したRunは破棄しました。ネットワーク、VPN、プロキシ、APIキーを確認して再試行してください。`,
             )
-          : error instanceof Error
-            ? error.message
-            : String(error);
-      this.postIfActive(conversationId, { type: "error", text });
+          : error instanceof CursorAgentError
+            ? localize(
+                `Could not start the connection to Cursor: ${error.message}`,
+                `Cursorへの接続を開始できませんでした: ${error.message}`,
+              )
+            : error instanceof Error
+              ? error.message
+              : String(error);
+      if (!wasCancelled) {
+        this.postIfActive(conversationId, { type: "error", text });
+      }
       if (!assistantText) {
         assistantText = text;
       }
     } finally {
+      if (runtime.preparationAbort === preparationAbort) {
+        runtime.preparationAbort = undefined;
+      }
+      const cancellation = runtime.cancellation;
+      if (cancellation) {
+        updateStartupStep(
+          localize("Stopping the Cursor run", "Cursor Runの停止を待機中"),
+          "running",
+        );
+        try {
+          await this.waitForRunCleanup(cancellation, "stopping the Cursor run");
+        } catch (cancellationError) {
+          this.output.appendLine(
+            `[${new Date().toISOString()}] Cursor run cancellation failed: ${
+              cancellationError instanceof Error
+                ? cancellationError.message
+                : String(cancellationError)
+            }`,
+          );
+          const agent = runtime.agent;
+          if (agent) {
+            updateStartupStep(
+              localize("Closing the stalled Cursor agent", "停止したCursor Agentを終了中"),
+              "running",
+            );
+            try {
+              await this.waitForRunCleanup(
+                agent[Symbol.asyncDispose](),
+                "closing the stalled Cursor agent",
+              );
+              runtime.agent = undefined;
+              runtime.rootsKey = undefined;
+              runtime.forceNextRun = false;
+              conversation.agentId = undefined;
+            } catch (disposeError) {
+              this.output.appendLine(
+                `[${new Date().toISOString()}] Stalled agent could not be closed safely: ${
+                  disposeError instanceof Error ? disposeError.message : String(disposeError)
+                }`,
+              );
+              this.postIfActive(conversationId, {
+                type: "error",
+                text: localize(
+                  "The stalled Cursor agent could not be stopped safely. Reload the VS Code window before starting another run.",
+                  "停止したCursor Agentを安全に終了できませんでした。次のRunを開始する前にVS Codeウィンドウを再読み込みしてください。",
+                ),
+              });
+              // Keep the runtime busy and retain file ownership. Starting a
+              // second mutating run while this one may still be alive is unsafe.
+              updateStartupStep(
+                localize("Cursor agent requires reload", "Cursor Agentの再読み込みが必要です"),
+                "error",
+              );
+              runningSound.dispose();
+              throw disposeError;
+            }
+          } else {
+            this.postIfActive(conversationId, {
+              type: "error",
+              text: localize(
+                "The stalled Cursor run could not be stopped safely. Reload the VS Code window before starting another run.",
+                "停止したCursor Runを安全に終了できませんでした。次のRunを開始する前にVS Codeウィンドウを再読み込みしてください。",
+              ),
+            });
+            updateStartupStep(
+              localize("Cursor run requires reload", "Cursor Runの再読み込みが必要です"),
+              "error",
+            );
+            runningSound.dispose();
+            throw cancellationError;
+          }
+        } finally {
+          if (runtime.cancellation === cancellation) {
+            runtime.cancellation = undefined;
+          }
+        }
+      }
       runningSound.dispose();
       if (progressState === "completed") {
         this.runningSound.playCompletion();
@@ -5632,7 +6201,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         runtime.rootsKey = undefined;
         if (agent) {
           try {
-            await agent[Symbol.asyncDispose]();
+            await this.waitForRunCleanup(
+              agent[Symbol.asyncDispose](),
+              "closing the isolated Cursor agent",
+            );
           } catch (error) {
             this.output.appendLine(
               `[${new Date().toISOString()}] Failed to dispose isolated agent: ${
@@ -5714,6 +6286,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         progressState,
         assistantText,
       );
+      if (conversation.experimentGroupId) {
+        void this.maybeAutoSelectBestOfNWinner(conversation.experimentGroupId);
+      }
       this.notifyRunComplete(conversation, progressState);
       setTimeout(() => void this.drainMessageQueue(), 0);
     }
@@ -6962,6 +7537,24 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
   }
 
+  private async waitForRunCleanup(
+    operation: Promise<void>,
+    phase: string,
+  ): Promise<void> {
+    const configured = this.alertConfiguration()
+      .get<number>("runPreparationTimeoutSeconds", 120);
+    const configuredMs = Number.isFinite(configured)
+      ? Math.max(15_000, configured * 1_000)
+      : 120_000;
+    await waitForRunPreparation(() => operation, {
+      // Preparation cancellation is already signalled on this path. Cleanup
+      // needs its own live signal and a short independent deadline.
+      signal: new AbortController().signal,
+      timeoutMs: Math.min(30_000, configuredMs),
+      phase,
+    });
+  }
+
   private async cancelConversation(
     conversationId: string,
     clearQueue = true,
@@ -6975,6 +7568,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       this.postQueueState();
     }
     const runtime = this.chatRuntimes.get(conversationId);
+    if (runtime?.busy) {
+      runtime.preparationAbort?.abort();
+    }
     const run = runtime?.run;
     if (!run || !run.supports("cancel")) {
       if (runtime?.busy) {
@@ -6982,7 +7578,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }
       return;
     }
-    await run.cancel();
+    runtime.pendingCancel = false;
+    runtime.cancellation ??= run.cancel();
   }
 
   private async cancelAllChats(clearQueues = true): Promise<void> {
@@ -7022,8 +7619,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     workspaceName: string,
     conversation: Conversation,
     cwd: string,
-    rootsKey: string,
-  ): Promise<void> {
+  ): Promise<CursorAgent> {
     const agent = runtime.agent;
     const agentId = agent?.agentId ?? conversation.agentId;
     if (agent && agentId) {
@@ -7035,7 +7631,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         if (activeRun) {
           await Agent.cancelRun(activeRun.id, { runtime: "local", cwd });
           await agent.reload();
-          return;
+          return agent;
         }
       } catch (error) {
         this.output.appendLine(
@@ -7048,13 +7644,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
     await this.disposeAgent(conversation.id);
     conversation.agentId = undefined;
-    runtime.agent = await this.createOrResumeAgent(
+    return this.createOrResumeAgent(
       apiKey,
       agentRoots,
       workspaceName,
       conversation,
     );
-    runtime.rootsKey = rootsKey;
   }
 
   public async refreshIntegrationIndex(): Promise<void> {

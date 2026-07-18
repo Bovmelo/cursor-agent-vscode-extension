@@ -152,6 +152,7 @@ export class WebviewController {
           dropHelp: "ファイルはShiftを押しながらドラッグ＆ドロップできます",
           dropFailed: "ドロップしたファイルを読み取れませんでした。Shiftを押しながらドロップしてください。",
           pasteFailed: "クリップボードの画像を読み取れませんでした。",
+          attachmentResolveTimeout: "添付ファイルの準備に時間がかかっています。添付を保持したまま、もう一度送信してください。",
           attachedImagePrompt: "添付画像を確認してください。",
           approvalMode: "実行権限",
           safeWorktree: "安全worktree（推奨）",
@@ -325,6 +326,7 @@ export class WebviewController {
           dropHelp: "Hold Shift while dragging and dropping to attach files",
           dropFailed: "Could not read the dropped files. Hold Shift while dropping.",
           pasteFailed: "Could not read the image from the clipboard.",
+          attachmentResolveTimeout: "Attachment preparation is taking too long. Your draft and attachments are preserved; try sending again.",
           attachedImagePrompt: "Please look at the attached image(s).",
           approvalMode: "Execution permissions",
           safeWorktree: "Safe worktree (recommended)",
@@ -4523,16 +4525,16 @@ export class WebviewController {
     }
 
     function waitForPendingAttachments() {
-      if (pendingAttachmentResolves === 0) return Promise.resolve();
+      if (pendingAttachmentResolves === 0) return Promise.resolve(true);
       return new Promise((resolve) => {
         const timeout = setTimeout(() => {
           const index = attachmentResolveWaiters.indexOf(onReady);
           if (index >= 0) attachmentResolveWaiters.splice(index, 1);
-          resolve();
+          resolve(false);
         }, 15000);
         const onReady = () => {
           clearTimeout(timeout);
-          resolve();
+          resolve(true);
         };
         attachmentResolveWaiters.push(onReady);
       });
@@ -5218,7 +5220,14 @@ export class WebviewController {
     }, { passive: true });
 
     async function submitMessage(action = "send") {
-      await waitForPendingAttachments();
+      const attachmentsReady = await waitForPendingAttachments();
+      if (!attachmentsReady) {
+        // Do not clear the draft or enqueue a message without its pending attachments.
+        // A later host reply still updates selectedFiles, so the user can retry safely.
+        status.textContent = i18n.attachmentResolveTimeout;
+        prompt.focus();
+        return;
+      }
       const consumed = consumeLeadingSlashCommand(prompt.value.trim());
       if (consumed.profile) {
         runProfile = consumed.profile;
@@ -5557,19 +5566,23 @@ export class WebviewController {
     let restorePromptOnWindowFocus = false;
     let promptFocusRestoreGeneration = 0;
 
+    function restorePromptFocusNow() {
+      if (
+        !restorePromptOnWindowFocus
+        || !document.hasFocus()
+        || document.activeElement === prompt
+      ) {
+        return;
+      }
+      prompt.focus({ preventScroll: true });
+    }
+
     function schedulePromptFocusRestore() {
       restorePromptOnWindowFocus = true;
       const generation = ++promptFocusRestoreGeneration;
       const restore = () => {
-        if (
-          generation !== promptFocusRestoreGeneration
-          || !restorePromptOnWindowFocus
-          || !document.hasFocus()
-          || document.activeElement === prompt
-        ) {
-          return;
-        }
-        prompt.focus({ preventScroll: true });
+        if (generation !== promptFocusRestoreGeneration) return;
+        restorePromptFocusNow();
       };
       requestAnimationFrame(restore);
       // Typeless may return focus after its paste/input event has completed.
@@ -5607,10 +5620,17 @@ export class WebviewController {
       if (document.activeElement === prompt) restorePromptOnWindowFocus = true;
     });
     window.addEventListener("focus", () => {
-      if (restorePromptOnWindowFocus) schedulePromptFocusRestore();
+      if (!restorePromptOnWindowFocus) return;
+      // Restore synchronously before a dictation tool delivers its paste/input
+      // during the same native focus hand-off. The scheduled retries still
+      // cover tools that move focus again after the window focus event.
+      restorePromptFocusNow();
+      schedulePromptFocusRestore();
     });
     document.addEventListener("visibilitychange", () => {
-      if (!document.hidden && restorePromptOnWindowFocus) schedulePromptFocusRestore();
+      if (document.hidden || !restorePromptOnWindowFocus) return;
+      restorePromptFocusNow();
+      schedulePromptFocusRestore();
     });
     prompt.addEventListener("paste", (event) => {
       const clipboard = event.clipboardData;

@@ -13,6 +13,9 @@ export class ChatRuntime {
   public rootsKey?: string;
   public busy = false;
   public pendingCancel = false;
+  public preparationAbort?: AbortController;
+  public forceNextRun = false;
+  public cancellation?: Promise<void>;
   public mutating = false;
   public overlappedMutation = false;
   public changeSessionId?: string;

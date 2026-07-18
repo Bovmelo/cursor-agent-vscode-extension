@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  buildBestOfNJudgePrompt,
   createBestOfNExperiment,
   experimentCandidates,
+  parseBestOfNWinnerVerdict,
   pickWinner,
+  scoreBestOfNCandidate,
+  selectBestOfNWinner,
+  shouldAbortBestOfNAutoSelect,
 } from "../out/bestOfN.js";
+import { buildAutoRepairPrompt } from "../out/autoRepair.js";
 import {
   buildContextPreview,
   estimateTokens,
@@ -94,4 +100,143 @@ test("best-of-N pickWinner and candidate summaries", () => {
   assert.equal(candidates[0].running, true);
   assert.equal(candidates[1].isWinner, true);
   assert.equal(candidates[1].lastAssistant, "second answer");
+});
+
+test("best-of-N auto-select prefers verified candidates", () => {
+  const selection = selectBestOfNWinner([
+    {
+      conversationId: "a",
+      title: "A",
+      completed: true,
+      failed: false,
+      hasArtifact: true,
+      changedFileCount: 4,
+      verificationSuccess: false,
+      totalTokens: 1_000,
+      lastAssistant: "broad rewrite",
+    },
+    {
+      conversationId: "b",
+      title: "B",
+      completed: true,
+      failed: false,
+      hasArtifact: true,
+      changedFileCount: 2,
+      verificationSuccess: true,
+      totalTokens: 1_200,
+      lastAssistant: "focused fix",
+    },
+  ]);
+  assert.equal(selection?.winnerId, "b");
+  assert.equal(selection?.tied, false);
+  assert.ok(scoreBestOfNCandidate({
+    conversationId: "b",
+    title: "B",
+    completed: true,
+    failed: false,
+    hasArtifact: true,
+    changedFileCount: 2,
+    verificationSuccess: true,
+    totalTokens: 1_200,
+  }).score > 0);
+
+  const prompt = buildBestOfNJudgePrompt("fix flaky test", [{
+    conversationId: "a",
+    title: "A",
+    completed: true,
+    failed: false,
+    hasArtifact: true,
+    changedFileCount: 1,
+    verificationSuccess: true,
+    totalTokens: 10,
+    lastAssistant: "patched timeout",
+  }]);
+  assert.match(prompt, /BEST_OF_N_WINNER/);
+  assert.match(prompt, /patched timeout/);
+
+  const verdict = parseBestOfNWinnerVerdict(
+    '<BEST_OF_N_WINNER>{"winnerId":"a","reasons":["passes verify"]}</BEST_OF_N_WINNER>',
+    ["a", "b"],
+  );
+  assert.equal(verdict?.winnerId, "a");
+  assert.equal(verdict?.reasons[0], "passes verify");
+  assert.equal(
+    parseBestOfNWinnerVerdict(
+      '<BEST_OF_N_WINNER>{"winnerId":"missing","reasons":[]}</BEST_OF_N_WINNER>',
+      ["a"],
+    ),
+    undefined,
+  );
+});
+
+test("best-of-N auto-select aborts when a winner is already set after judge await", () => {
+  const open = createBestOfNExperiment("compare", ["a", "b"]);
+  assert.equal(
+    shouldAbortBestOfNAutoSelect(open, { autoSelectEnabled: true }),
+    false,
+  );
+  assert.equal(
+    shouldAbortBestOfNAutoSelect(pickWinner(open, "a"), { autoSelectEnabled: true }),
+    true,
+  );
+  assert.equal(
+    shouldAbortBestOfNAutoSelect(
+      { ...open, appliedWinnerId: "b" },
+      { autoSelectEnabled: true },
+    ),
+    true,
+  );
+  assert.equal(
+    shouldAbortBestOfNAutoSelect(open, { autoSelectEnabled: false }),
+    true,
+  );
+  assert.equal(
+    shouldAbortBestOfNAutoSelect(open, {
+      autoSelectEnabled: true,
+      requireAutoJudge: true,
+      autoJudgeEnabled: false,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldAbortBestOfNAutoSelect(undefined, { autoSelectEnabled: true }),
+    true,
+  );
+
+  assert.equal(
+    selectBestOfNWinner([
+      {
+        conversationId: "a",
+        title: "A",
+        completed: true,
+        failed: true,
+        hasArtifact: false,
+        changedFileCount: 0,
+        totalTokens: 10,
+      },
+      {
+        conversationId: "b",
+        title: "B",
+        completed: true,
+        failed: true,
+        hasArtifact: false,
+        changedFileCount: 0,
+        totalTokens: 10,
+      },
+    ]),
+    undefined,
+  );
+});
+
+test("auto-repair prompt stays scoped to verification failures", () => {
+  const prompt = buildAutoRepairPrompt({
+    attempt: 1,
+    maxAttempts: 2,
+    failures: "$ npm test\nAssertionError: expected 1",
+    editedFiles: ["src/foo.ts"],
+  });
+  assert.match(prompt, /repair attempt 1\/2/);
+  assert.match(prompt, /src\/foo\.ts/);
+  assert.match(prompt, /Do not expand scope/);
+  assert.match(prompt, /AssertionError/);
 });

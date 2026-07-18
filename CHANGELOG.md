@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Restore chat input focus synchronously when Typeless hands control back, preventing its text from arriving before the prompt caret is ready
+- Prevent chat runs from remaining on "Preparing the run" indefinitely by showing connection phases, allowing cancellation before a Run handle exists, and discarding stalled SDK runs after a configurable timeout
+- Feed `/orchestrate` subtask summaries and changed files into the synthesis prompt so the final pass reconciles real results instead of rediscovering work
+- Run `/compare` candidate verification inside each isolated worktree, auto-select a winner from verification and quality signals (`bestOfNAutoSelect`), and break ties with an optional plan-mode AI judge (`bestOfNAutoJudge`)
+- Scope automatic repair prompts to the failing verification output and the session's edited files
+
 ## 0.1.18 - 2026-07-18
 
 - Merge the five sidebar tree views into one **Workspace** tree (Sessions / Inbox / Rules / Background / Audit) so the Agent chat view can use more vertical space

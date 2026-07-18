@@ -125,8 +125,12 @@ implements vscode.TreeDataProvider<CatalogNode>, vscode.Disposable {
     if (!id) {
       return;
     }
+    const item = this.items.find((candidate) => candidate.id === id);
     const current = this.state.get<IntegrationToggleState>(INTEGRATION_TOGGLE_KEY);
-    await this.state.update(INTEGRATION_TOGGLE_KEY, toggleIntegration(current, id, enabled));
+    await this.state.update(
+      INTEGRATION_TOGGLE_KEY,
+      toggleIntegration(current, id, enabled, item?.legacyIds),
+    );
     await this.refresh();
   }
 

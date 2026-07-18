@@ -13,9 +13,11 @@ import {
   extractSubagentName,
   launchOrchestratorSubtasks,
   markSubtaskConversation,
+  markSubtaskLaunch,
   markSubtaskStatus,
   orchestratorSummaries,
   parseOrchestratorSubtasks,
+  prepareOrchestratorResume,
   resolveOrchestratorPlan,
 } from "../out/orchestrator.js";
 import {
@@ -89,11 +91,23 @@ test("orchestrator parses subtasks and advances through synthesis", () => {
 
   experiment = markSubtaskConversation(experiment, experiment.subtasks[0].id, "c1");
   experiment = markSubtaskConversation(experiment, experiment.subtasks[1].id, "c2");
-  experiment = markSubtaskStatus(experiment, "c1", "completed");
+  experiment = markSubtaskStatus(experiment, "c1", "completed", {
+    summary: "Implemented A with helper extractFoo.",
+    changedFiles: ["src/a.ts"],
+  });
   assert.equal(experiment.status, "running");
-  experiment = markSubtaskStatus(experiment, "c2", "completed");
+  experiment = markSubtaskStatus(experiment, "c2", "completed", {
+    summary: "Covered B with unit tests.",
+    changedFiles: ["test/b.test.ts"],
+  });
   assert.equal(experiment.status, "synthesizing");
-  assert.match(buildSynthesisPrompt(experiment), /Integrate the parallel subtask/);
+  assert.equal(experiment.subtasks[0].changedFiles?.[0], "src/a.ts");
+  const synthesis = buildSynthesisPrompt(experiment);
+  assert.match(synthesis, /Integrate the parallel subtask/);
+  assert.match(synthesis, /Subtask results:/);
+  assert.match(synthesis, /Implemented A with helper extractFoo/);
+  assert.match(synthesis, /src\/a\.ts/);
+  assert.match(synthesis, /Prefer reconciling/);
 
   const summaries = orchestratorSummaries([experiment]);
   assert.equal(summaries[0].subtaskCount, 2);
@@ -150,7 +164,7 @@ test("orchestrator accepts fenced and embedded JSON subtask lists", () => {
   assert.deepEqual(taggedBeatsIncidental, [{ title: "Right", prompt: "keep" }]);
 });
 
-test("launchOrchestratorSubtasks skips work when concurrency is zero", async () => {
+test("launchOrchestratorSubtasks queues work when concurrency is zero", async () => {
   const events = [];
   await launchOrchestratorSubtasks(
     ["a"],
@@ -162,7 +176,7 @@ test("launchOrchestratorSubtasks skips work when concurrency is zero", async () 
     },
     0,
   );
-  assert.deepEqual(events, ["persist"]);
+  assert.deepEqual(events, ["persist", "launch"]);
 });
 
 test("orchestrator retries malformed plans once then falls back to execution", () => {
@@ -206,6 +220,74 @@ test("orchestrator persists conversation ids before bounded parallel launches", 
   assert.equal(maximumActive, 2);
   assert.deepEqual(events.slice(0, 3), ["persist", "start:a", "start:b"]);
   assert.equal(events.indexOf("start:c") > events.indexOf("finish:a"), true);
+});
+
+test("orchestrator resume resets running subtasks to pending and re-enqueues", () => {
+  let experiment = createOrchestratorExperiment("resume me");
+  experiment = attachSubtasks(experiment, [
+    { title: "A", prompt: "do A" },
+    { title: "B", prompt: "do B" },
+    { title: "C", prompt: "do C" },
+  ]);
+  experiment = markSubtaskConversation(experiment, experiment.subtasks[0].id, "c1");
+  experiment = markSubtaskConversation(experiment, experiment.subtasks[1].id, "c2");
+  experiment = markSubtaskConversation(experiment, experiment.subtasks[2].id, "c3");
+  experiment = markSubtaskLaunch(experiment, "c1", "running");
+  experiment = markSubtaskStatus(experiment, "c3", "completed", {
+    summary: "done C",
+  });
+  assert.equal(experiment.subtasks[0].status, "running");
+  assert.equal(experiment.subtasks[1].status, "pending");
+  assert.equal(experiment.subtasks[2].status, "completed");
+
+  const prepared = prepareOrchestratorResume([experiment], {
+    conversationExists: (id) => id === "c1" || id === "c2" || id === "c3",
+    isBusy: () => false,
+    isQueued: () => false,
+  });
+  assert.equal(prepared.experiments[0].subtasks[0].status, "pending");
+  assert.equal(prepared.experiments[0].subtasks[1].status, "pending");
+  assert.equal(prepared.experiments[0].subtasks[2].status, "completed");
+  assert.deepEqual(
+    prepared.launches.map((launch) => launch.conversationId).sort(),
+    ["c1", "c2"],
+  );
+  assert.equal(prepared.needsSynthesisConversation.length, 0);
+});
+
+test("orchestrator resume re-queues synthesizing runs", () => {
+  let experiment = createOrchestratorExperiment("synthesize me");
+  experiment = attachSubtasks(experiment, [
+    { title: "A", prompt: "do A" },
+  ]);
+  experiment = markSubtaskConversation(experiment, experiment.subtasks[0].id, "c1");
+  experiment = markSubtaskStatus(experiment, "c1", "completed", {
+    summary: "Implemented A",
+    changedFiles: ["src/a.ts"],
+  });
+  assert.equal(experiment.status, "synthesizing");
+
+  const withConversation = {
+    ...experiment,
+    synthesisConversationId: "synth-1",
+  };
+  const prepared = prepareOrchestratorResume([withConversation], {
+    conversationExists: (id) => id === "c1" || id === "synth-1",
+    isBusy: () => false,
+    isQueued: () => false,
+  });
+  assert.equal(prepared.launches.length, 1);
+  assert.equal(prepared.launches[0].kind, "synthesis");
+  assert.equal(prepared.launches[0].conversationId, "synth-1");
+  assert.match(prepared.launches[0].prompt, /Integrate the parallel subtask/);
+
+  const needsConversation = prepareOrchestratorResume([experiment], {
+    conversationExists: () => true,
+    isBusy: () => false,
+    isQueued: () => false,
+  });
+  assert.deepEqual(needsConversation.needsSynthesisConversation, [experiment.id]);
+  assert.equal(needsConversation.launches.length, 0);
 });
 
 test("audit log appends and formats markdown", () => {

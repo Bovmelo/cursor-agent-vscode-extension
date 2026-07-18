@@ -2,7 +2,9 @@ import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
+  integrationToggleId,
   isIntegrationEnabled,
+  legacyIntegrationToggleId,
   type IntegrationToggleState,
 } from "./integrationToggles.js";
 
@@ -16,11 +18,15 @@ export interface IntegrationItem {
   uri?: string;
   enabled: boolean;
   folder?: string;
+  /** Legacy persisted toggle IDs which map to this location-scoped item. */
+  legacyIds?: string[];
 }
 
 export {
   INTEGRATION_TOGGLE_KEY,
+  integrationToggleId,
   isIntegrationEnabled,
+  legacyIntegrationToggleId,
   toggleIntegration,
   type IntegrationToggleState,
 } from "./integrationToggles.js";
@@ -39,15 +45,17 @@ export async function loadIntegrationCatalog(
     ] as const) {
       const uri = vscode.Uri.joinPath(root, ...relative.split("/"));
       if (await exists(uri)) {
-        const id = `${kind}:${folderName}:${relative}`;
+        const id = integrationToggleId(kind, root.toString(), uri.fsPath);
+        const legacyId = legacyIntegrationToggleId(kind, folderName, relative);
         items.push({
           id,
           kind,
           label: path.basename(relative),
           description: relative,
           uri: uri.toString(),
-          enabled: isIntegrationEnabled(state, id),
+          enabled: isIntegrationEnabled(state, id, [legacyId]),
           folder: folderName,
+          legacyIds: [legacyId],
         });
       }
     }
@@ -61,15 +69,17 @@ export async function loadIntegrationCatalog(
       for (const skillUri of skillFiles) {
         const relative = vscode.workspace.asRelativePath(skillUri, false);
         const name = path.basename(path.dirname(skillUri.fsPath));
-        const id = `skill:${folderName}:${name}`;
+        const id = integrationToggleId("skill", root.toString(), skillUri.fsPath);
+        const legacyId = legacyIntegrationToggleId("skill", folderName, name);
         items.push({
           id,
           kind: "skill",
           label: name,
           description: relative,
           uri: skillUri.toString(),
-          enabled: isIntegrationEnabled(state, id),
+          enabled: isIntegrationEnabled(state, id, [legacyId]),
           folder: folderName,
+          legacyIds: [legacyId],
         });
       }
     } catch {
@@ -78,15 +88,17 @@ export async function loadIntegrationCatalog(
 
     const mcpUri = vscode.Uri.joinPath(root, ".cursor", "mcp.json");
     if (await exists(mcpUri)) {
-      const id = `mcp:${folderName}:mcp.json`;
+      const id = integrationToggleId("mcp", root.toString(), mcpUri.fsPath);
+      const legacyId = legacyIntegrationToggleId("mcp", folderName, "mcp.json");
       items.push({
         id,
         kind: "mcp",
         label: "mcp.json",
         description: ".cursor/mcp.json",
         uri: mcpUri.toString(),
-        enabled: isIntegrationEnabled(state, id),
+        enabled: isIntegrationEnabled(state, id, [legacyId]),
         folder: folderName,
+        legacyIds: [legacyId],
       });
     }
 
@@ -99,15 +111,17 @@ export async function loadIntegrationCatalog(
       for (const commandUri of commandFiles) {
         const name = path.basename(commandUri.fsPath, ".md");
         const relative = vscode.workspace.asRelativePath(commandUri, false);
-        const id = `command:${folderName}:${name}`;
+        const id = integrationToggleId("command", root.toString(), commandUri.fsPath);
+        const legacyId = legacyIntegrationToggleId("command", folderName, name);
         items.push({
           id,
           kind: "command",
           label: `/${name}`,
           description: relative,
           uri: commandUri.toString(),
-          enabled: isIntegrationEnabled(state, id),
+          enabled: isIntegrationEnabled(state, id, [legacyId]),
           folder: folderName,
+          legacyIds: [legacyId],
         });
       }
     } catch {

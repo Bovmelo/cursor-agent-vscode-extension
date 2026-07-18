@@ -4,6 +4,10 @@ import { promisify } from "node:util";
 import * as vscode from "vscode";
 import { branchStartsAtBase, slugifyBranchTitle } from "./pureUtils.js";
 import { minimalShellEnv } from "./shellEnv.js";
+import {
+  pullRequestRecoveryMessage,
+  type PullRequestRecovery,
+} from "./gitWorkflowRecovery.js";
 
 const execFileAsync = promisify(execFileCallback);
 
@@ -22,6 +26,29 @@ async function run(
 }
 
 export { slugifyBranchTitle };
+export {
+  pullRequestRecoveryMessage,
+  type PullRequestFailureStage,
+  type PullRequestRecovery,
+} from "./gitWorkflowRecovery.js";
+
+/** A recoverable post-commit failure; callers can show the retained branch details. */
+export class PullRequestCreationError extends Error {
+  public readonly recovery: PullRequestRecovery;
+  public readonly originalError: unknown;
+
+  public constructor(
+    recovery: PullRequestRecovery,
+    cause: unknown,
+    japanese = false,
+  ) {
+    const causeMessage = cause instanceof Error ? cause.message : String(cause);
+    super(`${causeMessage}\n\n${pullRequestRecoveryMessage(recovery, japanese)}`);
+    this.name = "PullRequestCreationError";
+    this.recovery = recovery;
+    this.originalError = cause;
+  }
+}
 
 export async function createBranchCommitAndPullRequest(options: {
   root: string;
@@ -87,6 +114,9 @@ export async function createBranchCommitAndPullRequest(options: {
   }
   const originalIndexTree = (await run(root, "git", ["write-tree"])).stdout.trim();
   let commitCreated = false;
+  let commit = "";
+  let pushStatus: PullRequestRecovery["pushStatus"] = "not-attempted";
+  let failureStage: PullRequestRecovery["failureStage"] = "push";
 
   try {
     await run(root, "git", ["checkout", "-b", branch, baseBranch]);
@@ -103,8 +133,12 @@ export async function createBranchCommitAndPullRequest(options: {
     }
     await run(root, "git", ["commit", "-m", title.slice(0, 72)]);
     commitCreated = true;
+    commit = (await run(root, "git", ["rev-parse", "HEAD"])).stdout.trim();
+    pushStatus = "unconfirmed";
     await run(root, "git", ["push", "-u", "origin", "HEAD"]);
+    pushStatus = "confirmed";
 
+    failureStage = "create-pull-request";
     const pr = await run(root, "gh", [
       "pr",
       "create",
@@ -126,6 +160,16 @@ export async function createBranchCommitAndPullRequest(options: {
       await run(root, "git", ["read-tree", originalIndexTree]).catch(() => undefined);
       await run(root, "git", ["checkout", originalBranch]).catch(() => undefined);
       await run(root, "git", ["branch", "-D", branch]).catch(() => undefined);
+    }
+    const preservedCommit = commit || currentHead;
+    if (commitCreated && preservedCommit) {
+      throw new PullRequestCreationError({
+        branch,
+        commit: preservedCommit,
+        originalBranch,
+        failureStage,
+        pushStatus,
+      }, error, japanese);
     }
     throw error;
   }

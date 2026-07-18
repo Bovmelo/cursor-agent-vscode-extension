@@ -1,6 +1,10 @@
 .git/**
 .github/**
 .vscode/**
+.agents/**
+.codex/**
+.cursor/**
+AGENTS.md
 .pnpm-store/**
 src/**
 scripts/**

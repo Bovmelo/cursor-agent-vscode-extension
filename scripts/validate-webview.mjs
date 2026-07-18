@@ -49,4 +49,11 @@ for (const script of inlineScripts) {
   new Function(script);
 }
 
+const clientScript = inlineScripts.join("\n");
+if (!clientScript.includes("const attachmentsReady = await waitForPendingAttachments();")
+  || !clientScript.includes("if (!attachmentsReady) {")
+  || !clientScript.includes("i18n.attachmentResolveTimeout")) {
+  throw new Error("Attachment-resolution timeout must block sending and show a retryable error");
+}
+
 console.log(`Validated ${inlineScripts.length} inline webview script(s).`);

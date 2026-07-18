@@ -11,6 +11,10 @@ export interface OrchestratorSubtask {
   prompt: string;
   conversationId?: string;
   status: "pending" | "running" | "completed" | "failed";
+  /** Last assistant summary captured when the subtask finished. */
+  resultSummary?: string;
+  /** Relative paths reported as edited by the subtask run. */
+  changedFiles?: string[];
 }
 
 export interface OrchestratorExperiment {
@@ -229,10 +233,25 @@ export function markSubtaskStatus(
   experiment: OrchestratorExperiment,
   conversationId: string,
   status: "completed" | "failed",
+  result?: { summary?: string; changedFiles?: readonly string[] },
 ): OrchestratorExperiment {
+  const summary = result?.summary?.trim();
+  const changedFiles = result?.changedFiles
+    ?.map((file) => file.trim())
+    .filter((file) => file.length > 0)
+    .slice(0, 80);
   const subtasks = experiment.subtasks.map((subtask) =>
     subtask.conversationId === conversationId
-      ? { ...subtask, status }
+      ? {
+          ...subtask,
+          status,
+          resultSummary: summary
+            ? summary.slice(0, 6_000)
+            : subtask.resultSummary,
+          changedFiles: changedFiles && changedFiles.length > 0
+            ? [...changedFiles]
+            : subtask.changedFiles,
+        }
       : subtask
   );
   const allDone = subtasks.length > 0
@@ -260,13 +279,13 @@ export async function launchOrchestratorSubtasks<T>(
   await persistPreparedState();
 
   let nextIndex = 0;
+  // Launching means enqueueing work, not necessarily starting an SDK run.
+  // Keep one worker available at zero capacity so callers can hand work to a
+  // downstream queue that will wait for a slot instead of dropping it.
   const workerCount = Math.min(
     launches.length,
-    Math.max(0, Math.floor(maxConcurrency)),
+    Math.max(1, Math.floor(maxConcurrency)),
   );
-  if (workerCount === 0) {
-    return;
-  }
   await Promise.all(Array.from({ length: workerCount }, async () => {
     while (nextIndex < launches.length) {
       const index = nextIndex;
@@ -276,19 +295,130 @@ export async function launchOrchestratorSubtasks<T>(
   }));
 }
 
+function truncateForSynthesis(text: string, maxCharacters: number): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= maxCharacters) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, maxCharacters)}\n…(truncated)`;
+}
+
 export function buildSynthesisPrompt(experiment: OrchestratorExperiment): string {
-  const lines = experiment.subtasks.map((subtask, index) =>
-    `${index + 1}. [${subtask.status}] ${subtask.title}`
-  );
+  const lines = experiment.subtasks.flatMap((subtask, index) => {
+    const header = `${index + 1}. [${subtask.status}] ${subtask.title}`;
+    const detail: string[] = [header];
+    if (subtask.changedFiles && subtask.changedFiles.length > 0) {
+      detail.push(`   Changed files: ${subtask.changedFiles.slice(0, 40).join(", ")}`);
+    }
+    if (subtask.resultSummary?.trim()) {
+      const indented = truncateForSynthesis(subtask.resultSummary, 4_000)
+        .split("\n")
+        .map((line) => `   ${line}`)
+        .join("\n");
+      detail.push("   Result:");
+      detail.push(indented);
+    } else if (subtask.status === "failed") {
+      detail.push("   Result: (subtask failed with no usable summary)");
+    } else if (subtask.status === "completed") {
+      detail.push("   Result: (no assistant summary was captured)");
+    }
+    return detail;
+  });
   return [
     "Integrate the parallel subtask results into one coherent outcome.",
+    "You are given each subtask's status, changed files, and assistant summary below.",
+    "Prefer reconciling and completing those results over rediscovering the work from scratch.",
     "Resolve overlaps, keep the smallest coherent change set, and report remaining risks.",
+    "If a subtask failed, work around the gap or state explicitly what remains undone.",
     "Original request:",
     experiment.prompt,
     "",
-    "Subtasks:",
+    "Subtask results:",
     ...lines,
   ].join("\n");
+}
+
+export interface OrchestratorResumeLaunch {
+  prompt: string;
+  conversationId: string;
+  kind: "subtask" | "synthesis";
+}
+
+/**
+ * After an extension-host restart, chat queues are empty. Reset stuck
+ * `running` subtasks to `pending` and collect launches for pending subtasks
+ * plus mid-synthesis runs that already have a synthesis conversation.
+ * Experiments stuck in `synthesizing` without a conversation id are left for
+ * the caller to materialize (conversation creation is side-effectful).
+ */
+export function prepareOrchestratorResume(
+  experiments: readonly OrchestratorExperiment[],
+  options: {
+    conversationExists: (conversationId: string) => boolean;
+    isBusy: (conversationId: string) => boolean;
+    isQueued: (conversationId: string) => boolean;
+  },
+): {
+  experiments: OrchestratorExperiment[];
+  launches: OrchestratorResumeLaunch[];
+  needsSynthesisConversation: string[];
+} {
+  const launches: OrchestratorResumeLaunch[] = [];
+  const needsSynthesisConversation: string[] = [];
+  const updated = experiments.map((experiment) => {
+    if (experiment.status === "running") {
+      let changed = false;
+      const subtasks = experiment.subtasks.map((subtask) => {
+        if (!subtask.conversationId) {
+          return subtask;
+        }
+        if (subtask.status !== "pending" && subtask.status !== "running") {
+          return subtask;
+        }
+        if (subtask.status === "running") {
+          changed = true;
+        }
+        if (
+          options.conversationExists(subtask.conversationId)
+          && !options.isBusy(subtask.conversationId)
+          && !options.isQueued(subtask.conversationId)
+        ) {
+          launches.push({
+            prompt: subtask.prompt,
+            conversationId: subtask.conversationId,
+            kind: "subtask",
+          });
+        }
+        return subtask.status === "running"
+          ? { ...subtask, status: "pending" as const }
+          : subtask;
+      });
+      return changed ? { ...experiment, subtasks } : experiment;
+    }
+
+    if (experiment.status === "synthesizing") {
+      const synthesisId = experiment.synthesisConversationId;
+      if (!synthesisId) {
+        needsSynthesisConversation.push(experiment.id);
+        return experiment;
+      }
+      if (
+        options.conversationExists(synthesisId)
+        && !options.isBusy(synthesisId)
+        && !options.isQueued(synthesisId)
+      ) {
+        launches.push({
+          prompt: buildSynthesisPrompt(experiment),
+          conversationId: synthesisId,
+          kind: "synthesis",
+        });
+      }
+    }
+
+    return experiment;
+  });
+
+  return { experiments: updated, launches, needsSynthesisConversation };
 }
 
 export function orchestratorSummaries(

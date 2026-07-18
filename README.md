@@ -54,7 +54,7 @@ Change sessions distinguish your pre-existing uncommitted work from AI edits, so
 - Japanese / English UI (follows VS Code display language)
 - Token usage dashboard, conversation search / pin / export
 - Find in chat (Ctrl/Cmd+F) with match highlighting and prev/next navigation
-- Cursor-style slash templates from `.cursor/commands` and `~/.cursor/commands`, plus `/agent`, `/plan`, `/multitask`, `/compare` best-of-N, and `/orchestrate`
+- Cursor-style slash templates from `.cursor/commands` and `~/.cursor/commands`, plus `/agent`, `/plan`, `/multitask`, `/compare` best-of-N with isolated verification and auto-winner selection, and `/orchestrate` with result-aware synthesis
 - **Cursor: Run Task Pipeline** (GitHub Issue / `TODO(ai)` / free text → Autopilot → verify → optional PR)
 - Branch + PR creation via GitHub CLI after verified edits
 - Detached background agents that continue after VS Code closes and return isolated changes for review
@@ -73,8 +73,8 @@ Activity Bar **Cursor** container:
 Type `/` in the chat composer:
 
 - `/agent`, `/plan`, `/multitask` — switch the run profile for the next send
-- `/compare` — best-of-N parallel candidates in isolated worktrees; apply only the winner (or create a PR)
-- `/orchestrate` — plan the work, fan out parallel subtasks, then synthesize a final answer; the home view shows phase, each agent with open/status controls, and live tool/file activity for every stage
+- `/compare` — best-of-N parallel candidates in isolated worktrees; each candidate is verified in isolation, a winner is auto-selected when all finish (or pick one manually), then apply only the winner (or create a PR)
+- `/orchestrate` — plan the work, fan out parallel subtasks, then synthesize a final answer from each subtask's summary and changed files; the home view shows phase, each agent with open/status controls, and live tool/file activity for every stage
 - Project and user templates from `.cursor/commands/*.md` and `~/.cursor/commands/*.md`
 
 ## AI-native workflow
@@ -99,7 +99,7 @@ Run **Cursor: Run Task Pipeline** to drive a GitHub Issue, workspace `TODO(ai)` 
 
 At session start, the extension stores a private workspace checkpoint. This protects pre-existing uncommitted files as well as clean Git baselines, so an individual AI edit or the full session can be restored without discarding earlier work. After changes are accepted, the extension detects `validate`, `compile`, `lint`, or `test` npm scripts and runs the best available verification automatically. Configure `cursorSubscription.verificationCommands` to override detection. Automatic repair is available through `cursorSubscription.autoRepair` and is disabled by default because it can consume additional plan quota.
 
-Verification appears as build/lint/test/E2E gates under the Workspace Sessions and Inbox groups. Sessions also show the persisted automatic-repair budget and whether repair is active, successful, or exhausted. Sessions can be compared with the previous session at both the file-set and saved-content levels, and `cursorSubscription.changeSessionReviewPolicy` can prompt, keep all, or safely restore all pending edits. Plan-profile responses include an executable step artifact; **Cursor: Execute Last Plan with Checkpoints** runs those steps sequentially with a new change-session checkpoint for each. `/compare` keeps every candidate in its own worktree and applies only the selected winner, with an **Apply and create PR** action. `/orchestrate` plans the work, runs independent subtasks in parallel, then synthesizes a final answer, with live tool/file activity on each stage.
+Verification appears as build/lint/test/E2E gates under the Workspace Sessions and Inbox groups. Sessions also show the persisted automatic-repair budget and whether repair is active, successful, or exhausted. When `cursorSubscription.autoRepair` is enabled, repair prompts stay scoped to the failing command output and the files already edited in the session. Sessions can be compared with the previous session at both the file-set and saved-content levels, and `cursorSubscription.changeSessionReviewPolicy` can prompt, keep all, or safely restore all pending edits. Plan-profile responses include an executable step artifact; **Cursor: Execute Last Plan with Checkpoints** runs those steps sequentially with a new change-session checkpoint for each. `/compare` keeps every candidate in its own worktree, verifies each candidate there, and with `cursorSubscription.bestOfNAutoSelect` (default on) picks a winner from verification and change-quality signals when all runs finish; tied scores can call a short AI judge via `cursorSubscription.bestOfNAutoJudge`. Apply only the selected winner, with an **Apply and create PR** action. `/orchestrate` plans the work, runs independent subtasks in parallel, then synthesizes a final answer from each subtask's captured summary and changed files, with live tool/file activity on each stage.
 
 Use **Cursor: Start Background Agent** for long tasks. A detached local worker continues if the VS Code window or extension host closes, writes its durable status into extension-private storage, and restores the job under the **Background** group in the Workspace tree after restart. Its edits stay in a dedicated Git worktree until you apply or discard them. API-key material is passed to the worker only through its standard input and is not written into the job file.
 
@@ -199,7 +199,7 @@ Anysphere / Cursor 非提携の**非公式**拡張機能です。公式 TypeScri
 - VS Code の表示言語に連動した日英 UI
 - トークン使用量、会話検索 / ピン留め / 書き出し
 - 会話内テキスト検索（Ctrl/Cmd+F、ハイライトと前後移動）
-- `.cursor/commands` と `~/.cursor/commands` のスラッシュテンプレート、および `/agent`・`/plan`・`/multitask`・`/compare`・`/orchestrate`
+- `.cursor/commands` と `~/.cursor/commands` のスラッシュテンプレート、および `/agent`・`/plan`・`/multitask`・隔離検証と勝者自動選択付き `/compare`・結果反映合成の `/orchestrate`
 - **Cursor: タスクパイプラインを実行**（GitHub Issue / `TODO(ai)` / 自由文 → Autopilot → 検証 → 任意で PR）
 - 検証後の GitHub CLI によるブランチと PR 作成
 - VS Code 終了後も継続し、隔離された変更をレビューに戻すバックグラウンド Agent
@@ -218,8 +218,8 @@ Activity Bar の **Cursor** コンテナ:
 チャット入力で `/` を入力:
 
 - `/agent`、`/plan`、`/multitask` — 次の送信の実行プロファイルを切り替え
-- `/compare` — 隔離 worktree での best-of-N。勝者だけを適用（または PR 作成）
-- `/orchestrate` — 計画 → 並列サブタスク → 最終回答の合成。ホームにフェーズ、各エージェントの状態・開く操作、ステージごとのライブなツール/ファイル作業箇所を表示
+- `/compare` — 隔離 worktree での best-of-N。各候補を隔離検証し、全完了後に勝者を自動選択（手動選択も可）。勝者だけを適用（または PR 作成）
+- `/orchestrate` — 計画 → 並列サブタスク → 各サブタスクの要約と変更ファイルを踏まえた最終回答の合成。ホームにフェーズ、各エージェントの状態・開く操作、ステージごとのライブなツール/ファイル作業箇所を表示
 - `.cursor/commands/*.md` と `~/.cursor/commands/*.md` のテンプレート
 
 ### AIネイティブ機能
@@ -240,7 +240,7 @@ Activity Bar の **Cursor** コンテナ:
 
 セッション開始時にワークスペース専用のチェックポイントを保存するため、開始前から未コミットだったファイルも保護したまま、個別のAI編集またはセッション全体を復元できます。変更確定後、検証コマンドを npm の `validate`、`compile`、`lint`、`test` から自動検出します。`cursorSubscription.verificationCommands` で上書きできます。検証失敗時の自動修正は追加の利用枠を消費する場合があるため、初期状態では無効です。
 
-検証結果は変更セッションと Supervisor の Inbox で build / lint / test / E2E のゲートとして表示されます。変更セッションは直前のセッションと比較でき、`cursorSubscription.changeSessionReviewPolicy` でファイルごとの確認、すべて保持、安全なすべて復元を選べます。Planプロファイルの応答は実行可能なステップ成果物を含み、**Cursor: チェックポイント付きで直前のPlanを実行**から各ステップ前に別々の変更セッション・チェックポイントを作りながら順番に実行できます。`/compare` の各候補は別worktreeに保持され、選択した勝者だけを適用またはPR化します。`/orchestrate` は計画のあと独立したサブタスクを並列実行し、最終回答を合成します。各ステージでは作業中のツール/ファイルがライブ表示されます。
+検証結果は変更セッションと Supervisor の Inbox で build / lint / test / E2E のゲートとして表示されます。`cursorSubscription.autoRepair` を有効にすると、修復プロンプトは失敗した検証出力とセッション内の編集済みファイルに絞られます。変更セッションは直前のセッションと比較でき、`cursorSubscription.changeSessionReviewPolicy` でファイルごとの確認、すべて保持、安全なすべて復元を選べます。Planプロファイルの応答は実行可能なステップ成果物を含み、**Cursor: チェックポイント付きで直前のPlanを実行**から各ステップ前に別々の変更セッション・チェックポイントを作りながら順番に実行できます。`/compare` の各候補は別worktreeに保持され、そこで検証されます。`cursorSubscription.bestOfNAutoSelect`（既定オン）では全候補完了後に検証と変更品質シグナルから勝者を自動選択し、同点時は `cursorSubscription.bestOfNAutoJudge` で短いAI判定が使えます。選択した勝者だけを適用またはPR化します。`/orchestrate` は計画のあと独立したサブタスクを並列実行し、各サブタスクの要約と変更ファイルを踏まえて最終回答を合成します。各ステージでは作業中のツール/ファイルがライブ表示されます。
 
 通常の並列チャットでは対象ファイルの所有権を予約し、競合する実行を隔離worktreeへ移します。完了した変更はFIFO適用キューを通り、実際の変更ファイルの所有権を取得してから安全にマージされます。**Cursor: バックグラウンドAgentを開始**では、VS Code終了後も継続する分離ワーカーへ長時間タスクを渡せます。結果は再起動後に復元され、ワークスペースツリーの **Background** グループから適用・中止・破棄できます。
 

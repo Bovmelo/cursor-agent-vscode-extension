@@ -505,6 +505,14 @@
           "order": 2,
           "description": "%config.maxParallelChatAgents.description%"
         },
+        "cursorSubscription.runPreparationTimeoutSeconds": {
+          "type": "integer",
+          "default": 120,
+          "minimum": 15,
+          "maximum": 600,
+          "order": 2,
+          "description": "%config.runPreparationTimeoutSeconds.description%"
+        },
         "cursorSubscription.bestOfNCount": {
           "type": "integer",
           "default": 3,
@@ -512,6 +520,18 @@
           "maximum": 5,
           "order": 2,
           "description": "%config.bestOfNCount.description%"
+        },
+        "cursorSubscription.bestOfNAutoSelect": {
+          "type": "boolean",
+          "default": true,
+          "order": 2,
+          "description": "%config.bestOfNAutoSelect.description%"
+        },
+        "cursorSubscription.bestOfNAutoJudge": {
+          "type": "boolean",
+          "default": true,
+          "order": 2,
+          "description": "%config.bestOfNAutoJudge.description%"
         },
         "cursorSubscription.offerPullRequestAfterVerify": {
           "type": "boolean",
