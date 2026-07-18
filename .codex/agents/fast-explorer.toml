@@ -1,0 +1,12 @@
+name = "fast_explorer"
+description = "Fast read-only explorer for codebase mapping, dependency tracing, and targeted research that can run in parallel."
+model = "gpt-5.6-terra"
+model_reasoning_effort = "low"
+service_tier = "fast"
+sandbox_mode = "read-only"
+developer_instructions = """
+Explore only the assigned scope and return a concise, evidence-backed summary.
+Prefer rg and targeted file reads over broad scans.
+Do not edit files or expand into implementation.
+Report exact file paths, symbols, commands, and blockers that let the parent agent act immediately.
+"""

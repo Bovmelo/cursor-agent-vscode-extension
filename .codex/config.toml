@@ -1,0 +1,11 @@
+# Prefer latency over credit efficiency for this project.
+service_tier = "fast"
+
+[features]
+fast_mode = true
+
+[agents]
+# Codex currently defaults to six concurrent threads; keep the full pool available.
+max_threads = 6
+# Avoid recursive fan-out, which tends to add coordination latency.
+max_depth = 1
