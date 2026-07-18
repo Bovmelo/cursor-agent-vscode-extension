@@ -1232,6 +1232,19 @@ export async function runVerification(
     if (typeof command !== "string" || !command.trim()) {
       continue;
     }
+    if (!vscode.workspace.isTrusted) {
+      output.appendLine(
+        `[${new Date().toISOString()}] Stopping remaining verification commands because the workspace is no longer trusted.`,
+      );
+      steps.push({
+        command: "(workspace trust)",
+        stage: "other",
+        success: false,
+        output: "Verification stopped because the workspace is no longer trusted.",
+        durationMs: 0,
+      });
+      break;
+    }
     if (Date.now() - totalStartedAt > 15 * 60_000) {
       steps.push({
         command: "(budget)",

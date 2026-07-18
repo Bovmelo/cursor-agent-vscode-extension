@@ -59,7 +59,7 @@ test("workspace mutations that can execute or apply agent output require trust",
 
   assert.match(pullRequestPath, /!vscode\.workspace\.isTrusted/u);
   assert.match(backgroundApplyPath, /!vscode\.workspace\.isTrusted/u);
-  assert.match(backgroundApplyPath, /isAuthenticatedWorkerCancellation/u);
+  assert.match(backgroundApplyPath, /cancellationInvalidatesCompletedResult/u);
   assert.match(
     gitWorkflowSource.slice(gitWorkflowSource.indexOf("createBranchCommitAndPullRequest")),
     /!vscode\.workspace\.isTrusted/u,

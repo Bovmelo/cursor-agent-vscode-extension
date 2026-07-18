@@ -27,6 +27,8 @@ export interface CreateAgentRequest {
   conversation: Conversation;
   settingSources?: SettingSource[];
   mcpServers?: Record<string, McpServerConfig>;
+  /** Revalidates the trust/integration snapshot synchronously before each SDK connection. */
+  assertIntegrationBoundary: () => void;
 }
 
 /** Encapsulates Cursor SDK agent creation, resume, and sandbox fallback policy. */
@@ -43,6 +45,7 @@ export class AgentFactory {
       conversation,
       settingSources = ["all"],
       mcpServers,
+      assertIntegrationBoundary,
     } = request;
     const cwd = roots.length === 1 ? roots[0] : roots;
     const approvalMode = this.options.selectedApprovalMode();
@@ -62,6 +65,7 @@ export class AgentFactory {
     const connect = async (localOptions: LocalAgentOptions): Promise<CursorAgent> => {
       if (conversation.agentId) {
         try {
+          assertIntegrationBoundary();
           return await Agent.resume(conversation.agentId, {
             apiKey,
             local: localOptions,
@@ -76,6 +80,7 @@ export class AgentFactory {
         }
       }
 
+      assertIntegrationBoundary();
       const agent = await Agent.create({
         apiKey,
         model: this.options.selectedModel(),

@@ -35,6 +35,10 @@ export class WebviewController {
     return this.view?.visible === true;
   }
 
+  public get attached(): boolean {
+    return this.view !== undefined;
+  }
+
   public getHtml(webview: vscode.Webview): string {
     const nonce = randomBytes(16).toString("base64");
     const SUPPORTS_LOCAL_SANDBOX = this.supportsLocalSandbox;
@@ -2281,6 +2285,14 @@ export class WebviewController {
       animation: running-spin .8s linear infinite;
     }
     @keyframes running-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        scroll-behavior: auto !important;
+        transition-duration: 0.01ms !important;
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+      }
+    }
   </style>
 </head>
 <body>
@@ -2476,22 +2488,22 @@ export class WebviewController {
       <div id="queueRow" aria-label="${ui.queuedMessages}" hidden></div>
       <div id="filePicker" role="listbox" aria-label="${ui.workspaceFiles}" hidden></div>
       <div id="slashPicker" role="listbox" aria-label="${ui.slashCommands}" hidden></div>
-      <textarea id="prompt" placeholder="${ui.prompt}" aria-label="${ui.promptLabel}" rows="2"></textarea>
+      <textarea id="prompt" placeholder="${ui.prompt}" aria-label="${ui.promptLabel}" aria-autocomplete="list" aria-haspopup="listbox" aria-expanded="false" rows="2"></textarea>
       <div class="card-row">
         <div class="add-control">
-          <button id="attachButton" class="round-btn" type="button" title="${ui.addContextTools} · ${ui.dropHelp}" aria-expanded="false">
+          <button id="attachButton" class="round-btn" type="button" title="${ui.addContextTools} · ${ui.dropHelp}" aria-haspopup="menu" aria-controls="addMenu" aria-expanded="false">
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6">
               <path d="M8 3v10M3 8h10"/>
             </svg>
           </button>
-          <div id="addMenu" hidden>
+          <div id="addMenu" role="menu" aria-label="${ui.addContextTools}" hidden>
             <div id="addMenuContent"></div>
           </div>
         </div>
-        <button id="profileChip" type="button"></button>
+        <button id="profileChip" type="button" aria-haspopup="menu" aria-controls="addMenu" aria-expanded="false"></button>
         <button id="authChip" type="button" title="${ui.setApiKey}">${ui.apiKeyMissing}</button>
         <span class="spacer"></span>
-        <select id="approvalSelect" aria-label="${ui.approvalMode}" tabindex="-1">
+        <select id="approvalSelect" aria-label="${ui.approvalMode}" aria-hidden="true" tabindex="-1">
           ${SUPPORTS_LOCAL_SANDBOX ? "" : `<option value="safe-worktree">${ui.safeWorktree}</option>`}
           <option value="auto-review">${ui.autoReview}</option>
           <option value="full-access">${ui.fullAccess}</option>
@@ -2534,10 +2546,10 @@ export class WebviewController {
     </svg>
     <button type="button" id="workspaceLabel" disabled>${ui.localRun}</button>
     <span class="footer-sep" aria-hidden="true">·</span>
-    <span id="status">${ui.checkingConnection}</span>
+    <span id="status" role="status" aria-live="polite" aria-atomic="true">${ui.checkingConnection}</span>
     <span class="footer-sep footer-version-sep" aria-hidden="true">·</span>
     <span id="extensionVersion" title="Extension version">v${extensionVersion}</span>
-    <span id="runningIndicator" hidden>
+    <span id="runningIndicator" role="status" aria-live="polite" aria-atomic="true" hidden>
       <span class="running-spinner" aria-hidden="true"></span>
       <span>${ui.running}</span>
     </span>
@@ -2757,6 +2769,8 @@ export class WebviewController {
     function addMenuTitle(text) {
       const title = document.createElement("div");
       title.className = "add-menu-title";
+      title.setAttribute("role", "presentation");
+      title.setAttribute("aria-hidden", "true");
       title.textContent = text;
       addMenuContent.appendChild(title);
     }
@@ -2764,6 +2778,7 @@ export class WebviewController {
     function addMenuSeparator() {
       const separator = document.createElement("div");
       separator.className = "add-menu-separator";
+      separator.setAttribute("role", "separator");
       addMenuContent.appendChild(separator);
     }
 
@@ -2772,6 +2787,12 @@ export class WebviewController {
       row.type = "button";
       row.className = "add-menu-row" + (options.selected ? " selected" : "");
       row.disabled = options.disabled === true;
+      row.tabIndex = -1;
+      row.setAttribute("role", options.role || "menuitem");
+      if (options.checked !== undefined) {
+        row.setAttribute("aria-checked", String(options.checked));
+      }
+      if (row.disabled) row.setAttribute("aria-disabled", "true");
       if (options.title) row.title = options.title;
       const icon = document.createElement("span");
       icon.className = "add-menu-icon";
@@ -2787,8 +2808,33 @@ export class WebviewController {
         row.appendChild(meta);
       }
       if (options.onClick) row.addEventListener("click", options.onClick);
+      row.addEventListener("focus", () => {
+        for (const item of enabledAddMenuItems()) item.tabIndex = item === row ? 0 : -1;
+      });
       addMenuContent.appendChild(row);
       return row;
+    }
+
+    function enabledAddMenuItems() {
+      return Array.from(addMenuContent.querySelectorAll('[role^="menuitem"]:not(:disabled)'));
+    }
+
+    function focusAddMenuItem(index) {
+      const items = enabledAddMenuItems();
+      if (items.length === 0) return;
+      const targetIndex = Math.max(0, Math.min(index, items.length - 1));
+      items.forEach((item, itemIndex) => {
+        item.tabIndex = itemIndex === targetIndex ? 0 : -1;
+      });
+      items[targetIndex].focus({ preventScroll: true });
+    }
+
+    function currentAddMenuFocusIndex() {
+      return enabledAddMenuItems().indexOf(document.activeElement);
+    }
+
+    function restoreAddMenuFocus(index) {
+      if (!addMenu.hidden && index >= 0) focusAddMenuItem(index);
     }
 
     function selectRunProfile(profile) {
@@ -2911,10 +2957,14 @@ export class WebviewController {
     }
 
     function renderMainAddMenu() {
+      const focusIndex = currentAddMenuFocusIndex();
+      addMenu.setAttribute("aria-label", i18n.addContextTools);
       addMenuContent.innerHTML = "";
       addMenuTitle(i18n.addContextTools);
       addMenuRow("＋", i18n.attachActive, {
         selected: attach,
+        role: "menuitemcheckbox",
+        checked: attach,
         onClick: () => {
           setAttach(!attach);
           closeAddMenu();
@@ -2922,6 +2972,8 @@ export class WebviewController {
       });
       addMenuRow("◎", i18n.projectMemory, {
         selected: includeProjectMemory,
+        role: "menuitemcheckbox",
+        checked: includeProjectMemory,
         meta: includeProjectMemory ? "✓" : "",
         onClick: () => {
           setIncludeProjectMemory(!includeProjectMemory);
@@ -2934,6 +2986,8 @@ export class WebviewController {
         const icons = { agent: "A", plan: "☷", multitask: "⑂" };
         addMenuRow(icons[profile], profileLabel(profile), {
           selected: runProfile === profile,
+          role: "menuitemradio",
+          checked: runProfile === profile,
           meta: runProfile === profile ? "✓" : "",
           onClick: () => selectRunProfile(profile),
         });
@@ -2946,6 +3000,8 @@ export class WebviewController {
       for (const mode of approvalModes) {
         addMenuRow("⚙", approvalModeLabel(mode), {
           selected: approvalSelect.value === mode,
+          role: "menuitemradio",
+          checked: approvalSelect.value === mode,
           meta: approvalSelect.value === mode ? "✓" : "",
           onClick: () => {
             setApprovalMode(mode);
@@ -2965,17 +3021,31 @@ export class WebviewController {
       });
       addMenuRow("◇", i18n.skills, {
         meta: selectedSkills.length > 0 ? String(selectedSkills.length) + " ›" : "›",
-        onClick: renderSkillsMenu,
+        onClick: () => {
+          renderSkillsMenu();
+          focusAddMenuItem(0);
+        },
       });
       addMenuRow("⌁", i18n.mcpServers, {
         meta: availableMcpServers.length > 0 ? String(availableMcpServers.length) + " ›" : "›",
-        onClick: renderMcpMenu,
+        onClick: () => {
+          renderMcpMenu();
+          focusAddMenuItem(0);
+        },
       });
+      restoreAddMenuFocus(focusIndex);
     }
 
     function renderSkillsMenu() {
+      const focusIndex = currentAddMenuFocusIndex();
+      addMenu.setAttribute("aria-label", i18n.skills);
       addMenuContent.innerHTML = "";
-      addMenuRow("‹", i18n.back, { onClick: renderMainAddMenu });
+      addMenuRow("‹", i18n.back, {
+        onClick: () => {
+          renderMainAddMenu();
+          focusAddMenuItem(0);
+        },
+      });
       addMenuTitle(i18n.skills);
       if (availableSkills.length === 0) {
         addMenuRow("◇", i18n.noSkills, { disabled: true });
@@ -2984,6 +3054,8 @@ export class WebviewController {
           addMenuRow("◇", skill.name, {
             title: skill.description || skill.name,
             selected: selectedSkills.includes(skill.name),
+            role: "menuitemcheckbox",
+            checked: selectedSkills.includes(skill.name),
             meta: selectedSkills.includes(skill.name) ? "✓" : "",
             onClick: () => {
               if (selectedSkills.includes(skill.name)) {
@@ -3004,11 +3076,19 @@ export class WebviewController {
           closeAddMenu();
         },
       });
+      restoreAddMenuFocus(focusIndex);
     }
 
     function renderMcpMenu() {
+      const focusIndex = currentAddMenuFocusIndex();
+      addMenu.setAttribute("aria-label", i18n.mcpServers);
       addMenuContent.innerHTML = "";
-      addMenuRow("‹", i18n.back, { onClick: renderMainAddMenu });
+      addMenuRow("‹", i18n.back, {
+        onClick: () => {
+          renderMainAddMenu();
+          focusAddMenuItem(0);
+        },
+      });
       addMenuTitle(i18n.mcpServers);
       if (availableMcpServers.length === 0) {
         addMenuRow("⌁", i18n.noMcpServers, { disabled: true });
@@ -3024,18 +3104,34 @@ export class WebviewController {
           closeAddMenu();
         },
       });
+      restoreAddMenuFocus(focusIndex);
     }
 
-    function openAddMenu() {
+    let addMenuLauncher = attachButton;
+
+    function setAddMenuExpandedState(open) {
+      attachButton.setAttribute("aria-expanded", String(open && addMenuLauncher === attachButton));
+      profileChip.setAttribute("aria-expanded", String(open && addMenuLauncher === profileChip));
+    }
+
+    function openAddMenu(launcher = attachButton) {
       closeModelPicker();
+      addMenuLauncher = launcher;
       renderMainAddMenu();
       addMenu.hidden = false;
-      attachButton.setAttribute("aria-expanded", "true");
+      setAddMenuExpandedState(true);
+      focusAddMenuItem(0);
     }
 
-    function closeAddMenu() {
+    function closeAddMenu(options = {}) {
       addMenu.hidden = true;
-      attachButton.setAttribute("aria-expanded", "false");
+      setAddMenuExpandedState(false);
+      if (options.restoreFocus) {
+        const focusTarget = addMenuLauncher === profileChip && profileChip.style.display === "none"
+          ? attachButton
+          : addMenuLauncher;
+        if (focusTarget?.isConnected) focusTarget.focus({ preventScroll: true });
+      }
     }
 
     function selectedModelDefinition() {
@@ -4315,12 +4411,31 @@ export class WebviewController {
       };
     }
 
+    function syncPromptSuggestionAria() {
+      const activePicker = !filePicker.hidden
+        ? filePicker
+        : (!slashPicker.hidden ? slashPicker : undefined);
+      prompt.setAttribute("aria-expanded", String(Boolean(activePicker)));
+      if (activePicker) {
+        prompt.setAttribute("aria-controls", activePicker.id);
+      } else {
+        prompt.removeAttribute("aria-controls");
+      }
+      const activeOption = activePicker?.querySelector('[role="option"][aria-selected="true"]');
+      if (activeOption?.id) {
+        prompt.setAttribute("aria-activedescendant", activeOption.id);
+      } else {
+        prompt.removeAttribute("aria-activedescendant");
+      }
+    }
+
     function closeFilePicker() {
       filePicker.hidden = true;
       filePicker.innerHTML = "";
       fileResults = [];
       selectedFileIndex = 0;
       mentionRange = undefined;
+      syncPromptSuggestionAria();
     }
 
     function closeSlashPicker() {
@@ -4329,6 +4444,7 @@ export class WebviewController {
       slashResults = [];
       selectedSlashIndex = 0;
       slashRange = undefined;
+      syncPromptSuggestionAria();
     }
 
     function requestFileResults() {
@@ -4376,6 +4492,7 @@ export class WebviewController {
         empty.textContent = i18n.noMatchingCommands;
         slashPicker.appendChild(empty);
         slashPicker.hidden = false;
+        syncPromptSuggestionAria();
         return;
       }
 
@@ -4384,6 +4501,8 @@ export class WebviewController {
         const row = document.createElement("button");
         row.className = "file-result" + (index === selectedSlashIndex ? " selected" : "");
         row.type = "button";
+        row.tabIndex = -1;
+        row.id = "slash-picker-option-" + index;
         row.setAttribute("role", "option");
         row.setAttribute("aria-selected", index === selectedSlashIndex ? "true" : "false");
         row.title = "/" + command.id;
@@ -4402,6 +4521,7 @@ export class WebviewController {
         slashPicker.appendChild(row);
       });
       slashPicker.hidden = false;
+      syncPromptSuggestionAria();
       slashPicker.querySelector(".selected")?.scrollIntoView({ block: "nearest" });
     }
 
@@ -4466,6 +4586,7 @@ export class WebviewController {
         empty.textContent = i18n.noMatchingFiles;
         filePicker.appendChild(empty);
         filePicker.hidden = false;
+        syncPromptSuggestionAria();
         return;
       }
 
@@ -4474,6 +4595,8 @@ export class WebviewController {
         const row = document.createElement("button");
         row.className = "file-result" + (index === selectedFileIndex ? " selected" : "");
         row.type = "button";
+        row.tabIndex = -1;
+        row.id = "file-picker-option-" + index;
         row.setAttribute("role", "option");
         row.setAttribute("aria-selected", index === selectedFileIndex ? "true" : "false");
         row.title = file.path;
@@ -4492,6 +4615,7 @@ export class WebviewController {
         filePicker.appendChild(row);
       });
       filePicker.hidden = false;
+      syncPromptSuggestionAria();
       filePicker.querySelector(".selected")?.scrollIntoView({ block: "nearest" });
     }
 
@@ -5583,13 +5707,47 @@ export class WebviewController {
       }, 180);
     });
     attachButton.addEventListener("click", () => {
-      if (addMenu.hidden) {
-        openAddMenu();
+      if (addMenu.hidden || addMenuLauncher !== attachButton) {
+        openAddMenu(attachButton);
       } else {
         closeAddMenu();
       }
     });
-    profileChip.addEventListener("click", openAddMenu);
+    profileChip.addEventListener("click", () => {
+      if (addMenu.hidden || addMenuLauncher !== profileChip) {
+        openAddMenu(profileChip);
+      } else {
+        closeAddMenu();
+      }
+    });
+    addMenu.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        closeAddMenu({ restoreFocus: true });
+        return;
+      }
+      const items = enabledAddMenuItems();
+      if (items.length === 0) return;
+      const currentIndex = Math.max(0, items.indexOf(document.activeElement));
+      let nextIndex;
+      if (event.key === "ArrowDown") {
+        nextIndex = (currentIndex + 1) % items.length;
+      } else if (event.key === "ArrowUp") {
+        nextIndex = (currentIndex - 1 + items.length) % items.length;
+      } else if (event.key === "Home") {
+        nextIndex = 0;
+      } else if (event.key === "End") {
+        nextIndex = items.length - 1;
+      } else if (event.key === "Tab") {
+        closeAddMenu({ restoreFocus: true });
+        return;
+      } else {
+        return;
+      }
+      event.preventDefault();
+      focusAddMenuItem(nextIndex);
+    });
     ctxRemove.addEventListener("click", () => setAttach(false));
     compareClose.addEventListener("click", () => {
       renderCompare(null);
@@ -5688,8 +5846,7 @@ export class WebviewController {
         modelButton.focus();
       } else if (event.key === "Escape" && !addMenu.hidden) {
         event.preventDefault();
-        closeAddMenu();
-        attachButton.focus();
+        closeAddMenu({ restoreFocus: true });
       } else if (event.key === "Escape" && !soundMenu.hidden) {
         event.preventDefault();
         setSoundMenuOpen(false);

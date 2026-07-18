@@ -955,7 +955,19 @@ vscode.CodeLensProvider, vscode.Disposable {
     this.refresh();
 
     try {
+      if (!vscode.workspace.isTrusted) {
+        throw new Error(this.text(
+          "AI Supervisor stopped because the workspace is no longer trusted.",
+          "ワークスペースが信頼されていないため、AI Supervisorを停止しました。",
+        ));
+      }
       const worktree = await this.prepareWorktree(task);
+      if (!vscode.workspace.isTrusted) {
+        throw new Error(this.text(
+          "AI Supervisor stopped because the workspace is no longer trusted.",
+          "ワークスペースが信頼されていないため、AI Supervisorを停止しました。",
+        ));
+      }
       const outcome = await this.executor(task, worktree, this.taskPrompt(task));
       if (!outcome) {
         task.status = "queued";
@@ -1016,6 +1028,12 @@ vscode.CodeLensProvider, vscode.Disposable {
         && this.configuration().get<boolean>("supervisorReviewGate", false)
         && this.executor
       ) {
+        if (!vscode.workspace.isTrusted) {
+          throw new Error(this.text(
+            "AI Supervisor review stopped because the workspace is no longer trusted.",
+            "ワークスペースが信頼されていないため、AI Supervisorレビューを停止しました。",
+          ));
+        }
         const review = await this.executor(task, worktree, this.reviewPrompt(task));
         const verdict = parseSupervisorReviewVerdict(
           review?.assistantText ?? review?.summary ?? "",

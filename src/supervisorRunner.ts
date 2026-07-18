@@ -29,6 +29,7 @@ interface ActiveSupervisorRun {
 
 class SupervisorCancelledError extends Error {}
 class SupervisorDeadlineError extends Error {}
+class SupervisorWorkspaceTrustError extends Error {}
 
 export class SupervisorAgentRunner implements vscode.Disposable {
   private readonly activeRuns = new Map<string, ActiveSupervisorRun>();
@@ -101,6 +102,12 @@ export class SupervisorAgentRunner implements vscode.Disposable {
     worktreePath: string,
     prompt: string,
   ): Promise<SupervisorExecutionResult | undefined> {
+    if (!vscode.workspace.isTrusted) {
+      return {
+        status: "error",
+        error: this.workspaceTrustError().message,
+      };
+    }
     const apiKey = await this.context.secrets.get(API_KEY_SECRET);
     if (!apiKey) {
       return {
@@ -152,6 +159,7 @@ export class SupervisorAgentRunner implements vscode.Disposable {
     const withinBudget = <T>(operation: PromiseLike<T>): Promise<T> =>
       Promise.race([Promise.resolve(operation), interrupt]);
     try {
+      this.assertWorkspaceTrusted();
       const agentPromise = this.createAgent(apiKey, worktreePath, task.title);
       void agentPromise.then((agent) => {
         if (active.cancelRequested && active.agent !== agent) {
@@ -159,10 +167,16 @@ export class SupervisorAgentRunner implements vscode.Disposable {
         }
       }).catch(() => {});
       active.agent = await withinBudget(agentPromise);
-      const run = await withinBudget(active.agent.send(prompt, {
-        model: this.selectedModelSelection(),
-        mode: "agent",
-      }));
+      this.assertWorkspaceTrusted();
+      const run = await withinBudget((() => {
+        // Keep this check synchronous with the SDK call so a trusted agent can
+        // never receive another request after the workspace boundary changes.
+        this.assertWorkspaceTrusted();
+        return active.agent!.send(prompt, {
+          model: this.selectedModelSelection(),
+          mode: "agent",
+        });
+      })());
       active.run = run;
       if (active.cancelRequested && run.supports("cancel")) {
         void run.cancel().catch(() => {});
@@ -286,13 +300,18 @@ export class SupervisorAgentRunner implements vscode.Disposable {
       },
       settingSources: ["all"],
     };
-    const connect = (options: LocalAgentOptions) => Agent.create({
-      apiKey,
-      model: this.selectedModelSelection(),
-      local: options,
-      agents: this.builtInSubagents(),
-      name: `AI Supervisor: ${title}`,
-    });
+    const connect = (options: LocalAgentOptions) => {
+      // Agent.create begins loading settingSources synchronously with this
+      // call, so the trust check must be in the same turn.
+      this.assertWorkspaceTrusted();
+      return Agent.create({
+        apiKey,
+        model: this.selectedModelSelection(),
+        local: options,
+        agents: this.builtInSubagents(),
+        name: `AI Supervisor: ${title}`,
+      });
+    };
     try {
       return await connect(local);
     } catch (error) {
@@ -315,6 +334,19 @@ export class SupervisorAgentRunner implements vscode.Disposable {
         ));
       }
       return connect({ ...local, sandboxOptions: { enabled: false } });
+    }
+  }
+
+  private workspaceTrustError(): SupervisorWorkspaceTrustError {
+    return new SupervisorWorkspaceTrustError(this.text(
+      "AI Supervisor stopped because the workspace is no longer trusted.",
+      "ワークスペースが信頼されていないため、AI Supervisorを停止しました。",
+    ));
+  }
+
+  private assertWorkspaceTrusted(): void {
+    if (!vscode.workspace.isTrusted) {
+      throw this.workspaceTrustError();
     }
   }
 

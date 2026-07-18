@@ -7,21 +7,44 @@ import test from "node:test";
 import { saveTerminalJob } from "../out/backgroundWorker.js";
 import {
   backgroundWorkerProtocolPaths,
+  cancellationInvalidatesCompletedResult,
+  decideBackgroundWorkerRecovery,
   isAuthenticatedWorkerCancellation,
   isAuthenticatedWorkerHeartbeat,
+  isAuthenticatedWorkerInstance,
+  isBackgroundJobDocument,
+  WORKER_HARD_STOP_GRACE_MS,
   WORKER_HEARTBEAT_MAX_AGE_MS,
 } from "../out/backgroundWorkerProtocol.js";
+
+const backgroundJobsSource = await readFile(
+  new URL("../src/backgroundJobs.ts", import.meta.url),
+  "utf8",
+);
+const backgroundWorkerSource = await readFile(
+  new URL("../src/backgroundWorker.ts", import.meta.url),
+  "utf8",
+);
 
 test("background worker protocol uses sidecar files per job", () => {
   assert.deepEqual(backgroundWorkerProtocolPaths("job.json"), {
     heartbeat: "job.json.heartbeat.json",
     cancellation: "job.json.cancel.json",
   });
+  assert.equal(isBackgroundJobDocument("job.json"), true);
+  assert.equal(isBackgroundJobDocument("job.json.heartbeat.json"), false);
+  assert.equal(isBackgroundJobDocument("job.json.cancel.json"), false);
 });
 
 test("worker heartbeat requires token, pid, and freshness", () => {
   const now = 100_000;
-  const heartbeat = { token: "secret", pid: 42, updatedAt: now - 1_000 };
+  const heartbeat = {
+    token: "secret",
+    pid: 42,
+    startedAt: 50_000,
+    processStartId: "linux:123",
+    updatedAt: now - 1_000,
+  };
   assert.equal(isAuthenticatedWorkerHeartbeat("secret", 42, heartbeat, now), true);
   assert.equal(isAuthenticatedWorkerHeartbeat("other", 42, heartbeat, now), false);
   assert.equal(isAuthenticatedWorkerHeartbeat("secret", 43, heartbeat, now), false);
@@ -38,12 +61,104 @@ test("worker heartbeat requires token, pid, and freshness", () => {
     isAuthenticatedWorkerHeartbeat("secret", 42, { ...heartbeat, updatedAt: now + 1 }, now),
     false,
   );
+  assert.equal(isAuthenticatedWorkerInstance("secret", 42, 50_000, heartbeat), true);
+  assert.equal(isAuthenticatedWorkerInstance("secret", 42, 50_001, heartbeat), false);
 });
 
 test("worker cancellation requires the unguessable job token", () => {
-  const cancellation = { token: "secret", requestedAt: Date.now() };
+  const cancellation = { token: "secret", requestedAt: Date.now(), reason: "user" };
   assert.equal(isAuthenticatedWorkerCancellation("secret", cancellation), true);
   assert.equal(isAuthenticatedWorkerCancellation("other", cancellation), false);
+  assert.equal(
+    isAuthenticatedWorkerCancellation("secret", { ...cancellation, reason: "invalid" }),
+    false,
+  );
+  assert.equal(cancellationInvalidatesCompletedResult("secret", cancellation), true);
+  assert.equal(
+    cancellationInvalidatesCompletedResult("secret", { ...cancellation, reason: "orphan" }),
+    false,
+  );
+});
+
+test("worker recovery requests cooperative stop before hard stop", () => {
+  const now = 1_000_000;
+  const base = {
+    active: true,
+    createdAt: now - 1_000,
+    updatedAt: now - 1_000,
+    workerStartedAt: now - 1_000,
+    maxMinutes: 60,
+    hasFreshHeartbeat: true,
+    hasRecoverableWorker: true,
+    now,
+  };
+  assert.deepEqual(decideBackgroundWorkerRecovery(base), { action: "none" });
+  assert.deepEqual(decideBackgroundWorkerRecovery({
+    ...base,
+    workerStartedAt: now - 60_001,
+    maxMinutes: 1,
+  }), { action: "request-stop", reason: "deadline" });
+  assert.deepEqual(decideBackgroundWorkerRecovery({
+    ...base,
+    workerStartedAt: now - 30_001,
+    hasFreshHeartbeat: false,
+  }), { action: "request-stop", reason: "unresponsive" });
+  assert.deepEqual(decideBackgroundWorkerRecovery({
+    ...base,
+    active: false,
+  }), { action: "none" });
+  assert.deepEqual(decideBackgroundWorkerRecovery({
+    ...base,
+    active: false,
+    updatedAt: now - WORKER_HARD_STOP_GRACE_MS,
+  }), { action: "request-stop", reason: "orphan" });
+
+  const cancellation = { token: "secret", requestedAt: now - 1, reason: "user" };
+  assert.deepEqual(decideBackgroundWorkerRecovery({
+    ...base,
+    cancellation,
+  }), { action: "await-grace", reason: "user" });
+  assert.deepEqual(decideBackgroundWorkerRecovery({
+    ...base,
+    cancellation: {
+      ...cancellation,
+      requestedAt: now - WORKER_HARD_STOP_GRACE_MS,
+    },
+  }), { action: "hard-stop", reason: "user" });
+});
+
+test("background launch, restored trust, and discard boundaries fail closed", () => {
+  const createSource = backgroundJobsSource.slice(
+    backgroundJobsSource.indexOf("public async create("),
+    backgroundJobsSource.indexOf("public async apply("),
+  );
+  const launchSource = backgroundJobsSource.slice(
+    backgroundJobsSource.indexOf("private launch("),
+    backgroundJobsSource.indexOf("private workerFile("),
+  );
+  const initializeSource = backgroundJobsSource.slice(
+    backgroundJobsSource.indexOf("private async initialize("),
+    backgroundJobsSource.indexOf("private async poll("),
+  );
+  const discardSource = backgroundJobsSource.slice(
+    backgroundJobsSource.indexOf("public async discard("),
+    backgroundJobsSource.indexOf("public getTreeItem("),
+  );
+  const applySource = backgroundJobsSource.slice(
+    backgroundJobsSource.indexOf("public async apply("),
+    backgroundJobsSource.indexOf("public async cancel("),
+  );
+
+  assert.match(createSource, /workspaceTrustedAtLaunch = vscode\.workspace\.isTrusted[\s\S]*?this\.launch/u);
+  assert.match(createSource, /beforeCaptureBaseline[\s\S]*?!vscode\.workspace\.isTrusted[\s\S]*?runConfiguredHooks/u);
+  assert.match(launchSource, /!input\.workspaceTrustedAtLaunch \|\| !vscode\.workspace\.isTrusted[\s\S]*?spawn\(/u);
+  assert.match(initializeSource, /!vscode\.workspace\.isTrusted[\s\S]*?requestWorkerStop\(job, "orphan"\)/u);
+  assert.match(discardSource, /recoverWorker\(job\)[\s\S]*?isWorkerExitConfirmed\(job\)[\s\S]*?cleanupIsolatedWorktree/u);
+  assert.match(applySource, /recoverWorker\(job\)[\s\S]*?isWorkerExitConfirmed\(job\)[\s\S]*?collectIsolatedChanges/u);
+  assert.match(applySource, /recoverWorker\(job\)[\s\S]*?job\.status !== "completed"[\s\S]*?isWorkerExitConfirmed/u);
+  assert.match(backgroundJobsSource, /job\.status !== "completed" \|\| reason === "orphan"[\s\S]*?await this\.save\(job\)/u);
+  assert.match(backgroundWorkerSource, /input\.workspaceTrustedAtLaunch !== true[\s\S]*?saveTerminalJob/u);
+  assert.match(backgroundWorkerSource, /settingSources: input\.workspaceTrustedAtLaunch \? \["all"\] : \[\]/u);
 });
 
 async function createJob(t, status) {
@@ -91,6 +206,22 @@ test("authenticated cancellation sidecar wins over a worker completion", async (
   const saved = await readJob(jobFile);
   assert.equal(saved.status, "cancelled");
   assert.equal(saved.assistantText, undefined);
+});
+
+test("deadline cancellation is preserved as an execution-budget error", async (t) => {
+  const jobFile = await createJob(t, "running");
+  const cancellationFile = backgroundWorkerProtocolPaths(jobFile).cancellation;
+  await writeFile(cancellationFile, JSON.stringify({
+    token: "secret",
+    requestedAt: Date.now(),
+    reason: "deadline",
+  }), "utf8");
+
+  await saveTerminalJob(jobFile, "secret", "cancelled");
+
+  const saved = await readJob(jobFile);
+  assert.equal(saved.status, "error");
+  assert.match(saved.error, /execution-time budget/u);
 });
 
 test("cancellation arriving during a worker terminal save wins the race", async (t) => {

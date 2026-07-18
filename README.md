@@ -59,7 +59,7 @@ Change sessions distinguish your pre-existing uncommitted work from AI edits, so
 - Branch + PR creation via GitHub CLI after verified edits
 - Detached background agents that continue after VS Code closes and return isolated changes for review
 - Interactive audit timeline with optional team-shared JSONL logging and **Cursor: Export AI Audit Log**
-- Workspace Trust limits on autonomous Supervisor, auto-repair, keep-all review, and background agents
+- Workspace Trust prevents loading project Rules / Skills / MCP and limits autonomous Supervisor, auto-repair, keep-all review, and background agents
 
 ## Sidebar views
 
@@ -101,7 +101,7 @@ At session start, the extension stores a private workspace checkpoint. This prot
 
 Verification appears as build/lint/test/E2E gates under the Workspace Sessions and Inbox groups. Sessions also show the persisted automatic-repair budget and whether repair is active, successful, or exhausted. When `cursorSubscription.autoRepair` is enabled, repair prompts stay scoped to the failing command output and the files already edited in the session. Sessions can be compared with the previous session at both the file-set and saved-content levels, and `cursorSubscription.changeSessionReviewPolicy` can prompt, keep all, or safely restore all pending edits. Plan-profile responses include an executable step artifact; **Cursor: Execute Last Plan with Checkpoints** runs those steps sequentially with a new change-session checkpoint for each. `/compare` keeps every candidate in its own worktree, verifies each candidate there, and with `cursorSubscription.bestOfNAutoSelect` (default on) picks a winner from verification and change-quality signals when all runs finish; tied scores can call an optional short AI judge via `cursorSubscription.bestOfNAutoJudge` (default off; uses extra plan quota). Auto-select only chooses candidates that produced isolated change artifacts. Apply only the selected winner, with an **Apply and create PR** action. `/orchestrate` plans the work, runs independent subtasks in parallel, then synthesizes a final answer from each subtask's captured summary and changed files, with live tool/file activity on each stage. With `cursorSubscription.orchestrateHandoffConversation` (default on), a truncated prior chat transcript is included in the planning prompt only; subtasks and synthesis still do not receive the original conversation.
 
-Use **Cursor: Start Background Agent** for long tasks. A detached local worker continues if the VS Code window or extension host closes, writes its durable status into extension-private storage, and restores the job under the **Background** group in the Workspace tree after restart. Its edits stay in a dedicated Git worktree until you apply or discard them. API-key material is passed to the worker only through its standard input and is not written into the job file.
+Use **Cursor: Start Background Agent** for long tasks. A detached local worker continues if the VS Code window or extension host closes, writes its durable status into extension-private storage, and restores the job under the **Background** group in the Workspace tree after restart. Its edits stay in a dedicated Git worktree until you apply or discard them. Stopping first requests cooperative cancellation; after a grace period, the extension force-stops only a safely validated managed process, and startup cleanup reclaims orphaned workers. Reopening the workspace as Restricted also cancels a restored worker before its worktree can be discarded. API-key material is passed to the worker only through its standard input and is not written into the job file.
 
 The **Audit** group in the Workspace tree makes apply, restore, PR, and plan actions inspectable without exporting Markdown. Enable `cursorSubscription.auditSharedLogEnabled` to append JSONL events to `.cursor/ai-audit-log.jsonl` (or another safe workspace-relative path) for team review. Run **Cursor: Export AI Audit Log** to export the current audit history.
 
@@ -130,12 +130,12 @@ Safe worktree mode requires the workspace to be a Git repository. Plan mode is r
 - Prompts and the context you explicitly include—such as selected code, referenced files, images, diagnostics, debug metadata, project memory, Skills, and MCP results—are sent to Cursor through the public Cursor SDK under your account and plan. Agent tools may read additional workspace files when needed for the task.
 - The Cursor API key is stored in VS Code SecretStorage. This extension does not read the Cursor desktop login session and does not add its own telemetry or analytics.
 - Conversation transcripts and aggregate token usage are stored in VS Code workspace state. Copies of external attachments, dirty-file checkpoints, isolated-run baselines, and Supervisor task data are stored in VS Code extension-private storage. Deleting a conversation removes its transcript and managed external-attachment copies; change-session history and checkpoint data are limited to the latest 20 sessions, while Supervisor data remains until its task is dismissed or extension storage is removed.
-- Project MCP servers, detached background agents, and configured pre-edit, post-edit, and verification commands run locally with the permissions of the VS Code extension host or spawned process. In an untrusted (Restricted) workspace, autonomous Supervisor execution, auto-repair, keep-all review policy, and background agents stay limited until you trust the folder.
+- Project MCP servers, detached background agents, and configured pre-edit, post-edit, and verification commands run locally with the permissions of the VS Code extension host or spawned process. In an untrusted (Restricted) workspace, project rules, project Skills, and project MCP configuration are not loaded; autonomous Supervisor execution, auto-repair, keep-all review policy, and background agents stay limited until you trust the folder.
 - Uninstalling the extension does not guarantee immediate deletion of VS Code extension storage. Use VS Code's profile/application-data controls when you need to remove all retained local data.
 
 ## Requirements
 
-- VS Code 1.100 or later
+- VS Code 1.101 or later
 - Node.js 22.13 or later (local agent runtime used by the SDK)
 - A Cursor account and [user API key](https://cursor.com/dashboard)
 - A Git repository for Safe worktree mode, Supervisor, background agents, checkpoints, and PR / Task Pipeline flows
@@ -204,7 +204,7 @@ Anysphere / Cursor 非提携の**非公式**拡張機能です。公式 TypeScri
 - 検証後の GitHub CLI によるブランチと PR 作成
 - VS Code 終了後も継続し、隔離された変更をレビューに戻すバックグラウンド Agent
 - 対話的な AI 監査タイムライン、共有 JSONL ログ、**Cursor: AI監査ログをエクスポート**
-- Workspace Trust による自律 Supervisor・自動修復・すべて保持・バックグラウンド Agent の制限
+- Workspace Trust によりプロジェクトの Rules / Skills / MCP を読み込まず、自律 Supervisor・自動修復・すべて保持・バックグラウンド Agent を制限
 
 ### サイドバービュー
 
@@ -242,7 +242,7 @@ Activity Bar の **Cursor** コンテナ:
 
 検証結果は変更セッションと Supervisor の Inbox で build / lint / test / E2E のゲートとして表示されます。`cursorSubscription.autoRepair` を有効にすると、修復プロンプトは失敗した検証出力とセッション内の編集済みファイルに絞られます。変更セッションは直前のセッションと比較でき、`cursorSubscription.changeSessionReviewPolicy` でファイルごとの確認、すべて保持、安全なすべて復元を選べます。Planプロファイルの応答は実行可能なステップ成果物を含み、**Cursor: チェックポイント付きで直前のPlanを実行**から各ステップ前に別々の変更セッション・チェックポイントを作りながら順番に実行できます。`/compare` の各候補は別worktreeに保持され、そこで検証されます。`cursorSubscription.bestOfNAutoSelect`（既定オン）では全候補完了後に検証と変更品質シグナルから勝者を自動選択し、同点時は `cursorSubscription.bestOfNAutoJudge`（既定オフ・追加の利用枠を消費）で短いAI判定をオプトインできます。自動選択は変更成果物がある候補のみを対象にします。選択した勝者だけを適用またはPR化します。`/orchestrate` は計画のあと独立したサブタスクを並列実行し、各サブタスクの要約と変更ファイルを踏まえて最終回答を合成します。`cursorSubscription.orchestrateHandoffConversation`（既定オン）では、切り詰めた元チャット履歴を計画プロンプトだけへ渡します（サブタスクと合成には元会話は渡りません）。各ステージでは作業中のツール/ファイルがライブ表示されます。
 
-通常の並列チャットでは対象ファイルの所有権を予約し、競合する実行を隔離worktreeへ移します。完了した変更はFIFO適用キューを通り、実際の変更ファイルの所有権を取得してから安全にマージされます。**Cursor: バックグラウンドAgentを開始**では、VS Code終了後も継続する分離ワーカーへ長時間タスクを渡せます。結果は再起動後に復元され、ワークスペースツリーの **Background** グループから適用・中止・破棄できます。
+通常の並列チャットでは対象ファイルの所有権を予約し、競合する実行を隔離worktreeへ移します。完了した変更はFIFO適用キューを通り、実際の変更ファイルの所有権を取得してから安全にマージされます。**Cursor: バックグラウンドAgentを開始**では、VS Code終了後も継続する分離ワーカーへ長時間タスクを渡せます。結果は再起動後に復元され、ワークスペースツリーの **Background** グループから適用・中止・破棄できます。中止時はまず協調キャンセルを要求し、猶予期間後も実行中の場合は管理対象プロセスであることを安全確認してから強制停止します。起動時には孤児ワーカーも回収し、Restrictedとして再度開いた場合は復元ワーカーを中止してからworktreeの破棄を許可します。
 
 変更セッションには修復バジェットの状態と、セッション間の実ファイル内容差分が表示されます。ワークスペースツリーの **Audit** グループでは操作履歴を対話的に確認でき、`cursorSubscription.auditSharedLogEnabled` を有効にするとチーム向けJSONLログも残せます。**Cursor: AI監査ログをエクスポート** で現在の監査履歴を書き出せます。**Rules / Skills / MCP** グループでは、プロジェクトルール、Skills、MCP、スラッシュコマンドを一覧し、JSONを手編集せずに開く・有効/無効を切り替えられます。インライン補完はデバウンス、重複排除、LRU、予算ガード、プロジェクトルール、採用率表示に対応しています。
 
@@ -261,12 +261,12 @@ WindowsではCursorローカルSDKのサンドボックスを利用できませ�
 - プロンプト、および選択コード、参照ファイル、画像、診断、デバッグ情報、プロジェクトメモリ、Skills、MCP結果など明示的に含めたコンテキストは、ご自身のアカウントとプランで公開Cursor SDKを通じてCursorへ送信されます。タスクの実行に必要な場合、Agentツールが追加のワークスペースファイルを読み取ることがあります。
 - Cursor APIキーは VS Code SecretStorageへ保存します。この拡張機能はCursorデスクトップのログイン情報を読み取らず、独自のテレメトリやアクセス解析も追加しません。
 - 会話本文と集計トークン使用量は VS Codeのworkspace stateへ保存します。外部添付ファイルのコピー、未コミットファイルのチェックポイント、隔離実行のbaseline、Supervisorタスク情報は VS Codeの拡張機能専用ストレージへ保存します。会話を削除すると本文と管理対象の外部添付コピーを削除します。変更セッションとチェックポイントは最新20件に制限され、Supervisorデータはタスクを破棄するか拡張機能ストレージを削除するまで残ります。
-- プロジェクトMCPサーバー、バックグラウンドAgent、および設定した編集前・編集後・検証コマンドは、VS Code拡張ホストまたは起動したプロセスの権限でローカル実行されます。信頼されていない（Restricted）ワークスペースでは、自律 Supervisor、自動修復、すべて保持ポリシー、バックグラウンド Agent は、フォルダを信頼するまで制限されます。
+- プロジェクトMCPサーバー、バックグラウンドAgent、および設定した編集前・編集後・検証コマンドは、VS Code拡張ホストまたは起動したプロセスの権限でローカル実行されます。信頼されていない（Restricted）ワークスペースでは、プロジェクトルール、プロジェクトSkills、プロジェクトMCP設定を読み込まず、自律 Supervisor、自動修復、すべて保持ポリシー、バックグラウンド Agent は、フォルダを信頼するまで制限されます。
 - 拡張機能をアンインストールしても、VS Codeの拡張機能ストレージが即時削除されるとは限りません。ローカル保存データをすべて削除する必要がある場合は、VS Codeのプロファイルまたはアプリケーションデータ管理を使用してください。
 
 ### 必要なもの
 
-- VS Code 1.100 以降
+- VS Code 1.101 以降
 - Node.js 22.13 以降
 - [Cursor Dashboard](https://cursor.com/dashboard) のユーザー API キー
 - 安全worktree、Supervisor、バックグラウンドAgent、チェックポイント、PR / タスクパイプライン向けの Git リポジトリ

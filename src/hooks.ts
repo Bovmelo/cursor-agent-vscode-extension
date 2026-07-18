@@ -44,6 +44,12 @@ export async function runConfiguredHooks(
     if (Date.now() - startedAt > MAX_HOOK_TOTAL_MS) {
       throw new Error(`${phase} hook rejected: total time budget exceeded`);
     }
+    if (!vscode.workspace.isTrusted) {
+      output.appendLine(
+        `[${new Date().toISOString()}] Stopping remaining ${phase} hooks because the workspace is no longer trusted.`,
+      );
+      return;
+    }
     ran += 1;
     output.appendLine(
       `[${new Date().toISOString()}] Running ${phase} hook: ${trimmed}`,

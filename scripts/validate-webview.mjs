@@ -69,6 +69,90 @@ for (const script of inlineScripts) {
 }
 
 const clientScript = inlineScripts.join("\n");
+
+const promptMarkup = html.match(/<textarea id="prompt"[^>]*>/u)?.[0];
+if (!promptMarkup
+  || !promptMarkup.includes('aria-autocomplete="list"')
+  || !promptMarkup.includes('aria-haspopup="listbox"')
+  || !promptMarkup.includes('aria-expanded="false"')) {
+  throw new Error("The prompt must expose its listbox autocomplete state");
+}
+if (!html.includes('<div id="filePicker" role="listbox"')
+  || !html.includes('<div id="slashPicker" role="listbox"')) {
+  throw new Error("Composer suggestion listboxes must have stable IDs");
+}
+
+const suggestionAriaSource = clientScript.match(
+  /function syncPromptSuggestionAria\(\) \{[\s\S]*?\n    \}/u,
+)?.[0];
+if (!suggestionAriaSource
+  || !clientScript.includes('row.id = "file-picker-option-" + index;')
+  || !clientScript.includes('row.id = "slash-picker-option-" + index;')) {
+  throw new Error("Composer suggestions must expose stable option IDs and synchronized ARIA state");
+}
+const suggestionAttributes = new Map();
+const promptAriaHarness = {
+  setAttribute: (name, value) => suggestionAttributes.set(name, value),
+  removeAttribute: (name) => suggestionAttributes.delete(name),
+};
+const filePickerAriaHarness = {
+  hidden: false,
+  id: "filePicker",
+  querySelector: () => ({ id: "file-picker-option-1" }),
+};
+const slashPickerAriaHarness = {
+  hidden: true,
+  id: "slashPicker",
+  querySelector: () => ({ id: "slash-picker-option-2" }),
+};
+const syncPromptSuggestionAria = new Function(
+  "prompt",
+  "filePicker",
+  "slashPicker",
+  `${suggestionAriaSource}; return syncPromptSuggestionAria;`,
+)(promptAriaHarness, filePickerAriaHarness, slashPickerAriaHarness);
+syncPromptSuggestionAria();
+if (suggestionAttributes.get("aria-expanded") !== "true"
+  || suggestionAttributes.get("aria-controls") !== "filePicker"
+  || suggestionAttributes.get("aria-activedescendant") !== "file-picker-option-1") {
+  throw new Error("File suggestions must own the prompt's active descendant state");
+}
+filePickerAriaHarness.hidden = true;
+slashPickerAriaHarness.hidden = false;
+syncPromptSuggestionAria();
+if (suggestionAttributes.get("aria-controls") !== "slashPicker"
+  || suggestionAttributes.get("aria-activedescendant") !== "slash-picker-option-2") {
+  throw new Error("Slash suggestions must own the prompt's active descendant state");
+}
+slashPickerAriaHarness.hidden = true;
+syncPromptSuggestionAria();
+if (suggestionAttributes.get("aria-expanded") !== "false"
+  || suggestionAttributes.has("aria-controls")
+  || suggestionAttributes.has("aria-activedescendant")) {
+  throw new Error("Closing suggestions must clear the prompt's popup ARIA references");
+}
+
+if (!html.includes('<div id="addMenu" role="menu"')
+  || !html.match(/id="attachButton"[^>]*aria-haspopup="menu"[^>]*aria-controls="addMenu"/u)
+  || !html.match(/id="profileChip"[^>]*aria-haspopup="menu"[^>]*aria-controls="addMenu"/u)
+  || !clientScript.includes('row.setAttribute("role", options.role || "menuitem");')
+  || !clientScript.includes('separator.setAttribute("role", "separator");')
+  || !clientScript.includes('openAddMenu(profileChip);')
+  || !clientScript.includes('closeAddMenu({ restoreFocus: true });')
+  || !clientScript.includes('event.key === "ArrowDown"')
+  || !clientScript.includes('event.key === "ArrowUp"')
+  || !clientScript.includes('event.key === "Home"')
+  || !clientScript.includes('event.key === "End"')) {
+  throw new Error("The add menu must track its launcher and support menu semantics and keyboard navigation");
+}
+if (!html.match(/id="status" role="status" aria-live="polite" aria-atomic="true"/u)
+  || !html.match(/id="runningIndicator" role="status" aria-live="polite" aria-atomic="true"/u)) {
+  throw new Error("Connection and execution status must be announced as atomic live regions");
+}
+if (!html.includes("@media (prefers-reduced-motion: reduce)")) {
+  throw new Error("The webview must honor reduced-motion preferences");
+}
+
 const imageSourceValidatorSource = clientScript.match(
   /function isAllowedMarkdownImageSource\(value\) \{[\s\S]*?\n    \}/,
 )?.[0];

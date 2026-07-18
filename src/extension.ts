@@ -112,6 +112,17 @@ import {
   type IntegrationToggleState,
 } from "./integrationCatalog.js";
 import {
+  agentSendBoundaryMatches,
+  filterRequestedSkillsForWorkspaceTrust,
+  isPromptCommandAllowedForWorkspaceTrust,
+  projectSettingSourcesForWorkspaceTrust,
+  resumableAgentIdForWorkspaceTrust,
+  resolveAgentIntegrationPolicy,
+  shouldUseWorkspacePromptIntegrations,
+  workspaceTrustSnapshotMatches,
+  workspaceTrustIntegrationKey,
+} from "./integrationPolicy.js";
+import {
   buildOrchestratorDetail,
   buildOrchestratorPlanPrompt,
   buildSynthesisPrompt,
@@ -201,6 +212,8 @@ const BUDGET_WARNED_KEY_PREFIX = "cursorSubscription.budgetWarned";
 const MAX_INLINE_COMPLETION_CACHE = 32;
 const INLINE_COMPLETION_STATS_KEY = "cursorSubscription.inlineCompletionStats";
 const VIEW_ID = "cursorSubscription.chatView";
+const E2E_MARKER = "CURSOR_SUBSCRIPTION_E2E";
+const E2E_WEBVIEW_STATE_COMMAND = "cursorSubscription.__e2e.webviewState";
 const DEFAULT_MODEL = "auto";
 const IS_JAPANESE = vscode.env.language.toLowerCase().startsWith("ja");
 const MAX_DROPPED_FILE_BYTES = 20 * 1024 * 1024;
@@ -612,6 +625,18 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("cursorSubscription.scanSupervisorGitHub", () =>
       supervisor.scanGitHubSignals()),
   );
+
+  if (
+    process.env[E2E_MARKER] === "1"
+    && context.extensionMode !== vscode.ExtensionMode.Production
+  ) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(
+        E2E_WEBVIEW_STATE_COMMAND,
+        () => provider.e2eWebviewState(),
+      ),
+    );
+  }
 }
 
 export function deactivate(): void {
@@ -744,6 +769,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     cancelSupervisor: () => Promise<void>;
   }): void {
     this.credentialRevocation = handlers;
+  }
+
+  public e2eWebviewState(): { attached: boolean; ready: boolean } {
+    return {
+      attached: this.webviewController.attached,
+      ready: this.webviewReady,
+    };
   }
 
   private async withOrchestratorLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -1191,6 +1223,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }),
       vscode.window.onDidChangeTextEditorSelection(() => this.postContextInfo()),
       vscode.workspace.onDidChangeWorkspaceFolders(() => invalidateWorkspaceFiles()),
+      vscode.workspace.onDidGrantWorkspaceTrust(() => invalidateWorkspaceFiles()),
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (
           event.affectsConfiguration("cursorSubscription.notifyOnComplete")
@@ -2925,9 +2958,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               mode: "plan",
               local: {
                 cwd: workspace.uri.fsPath,
-                settingSources: configuration.get<boolean>("inlineCompletionIncludeProjectRules", true)
-                  ? ["project"]
-                  : [],
+                settingSources: projectSettingSourcesForWorkspaceTrust(
+                  vscode.workspace.isTrusted,
+                  configuration.get<boolean>("inlineCompletionIncludeProjectRules", true),
+                ),
               },
             },
           );
@@ -5113,8 +5147,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     includeProjectMemory = true,
     queue?: { fromQueue: true; queueKind: "queued" | "interrupt" },
   ): Promise<boolean> {
-    const projectCommand = commandId
+    const commandCandidate = commandId
       ? this.projectCommands.find((command) => command.id === commandId)
+      : undefined;
+    const projectCommand = commandCandidate
+      && isPromptCommandAllowedForWorkspaceTrust(
+        vscode.workspace.isTrusted,
+        commandCandidate.source,
+      )
+      ? commandCandidate
       : undefined;
     const effectivePrompt = projectCommand
       ? expandProjectCommand(projectCommand, prompt)
@@ -5492,7 +5533,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       const agentRoots = [cwd, conversation.attachmentRoot].filter(
         (root): root is string => typeof root === "string",
       );
-      const rootsKey = [
+      const currentRootsKey = (): string => [
         ...agentRoots.map((root) => path.resolve(root).toLowerCase()),
         this.integrationStateKey(conversation),
       ].join("\n");
@@ -5524,54 +5565,106 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           }
         }
       };
-      if (
-        !runtime.agent
-        || runtime.rootsKey !== rootsKey
-      ) {
-        if (runtime.agent) {
-          updateStartupStep(localize("Resetting Cursor agent", "Cursor Agentを再初期化中"));
-          await waitForRunPreparation(() => this.disposeAgent(conversationId), {
-            signal: preparationAbort.signal,
-            timeoutMs: preparationTimeoutMs,
-            phase: "resetting the Cursor agent",
-          });
+      const ensureAgentForCurrentTrust = async (): Promise<string> => {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          const desiredRootsKey = currentRootsKey();
+          if (!runtime.agent || runtime.rootsKey !== desiredRootsKey) {
+            if (runtime.agent) {
+              updateStartupStep(localize("Resetting Cursor agent", "Cursor Agentを再初期化中"));
+              await waitForRunPreparation(() => this.disposeAgent(conversationId), {
+                signal: preparationAbort.signal,
+                timeoutMs: preparationTimeoutMs,
+                phase: "resetting the Cursor agent",
+              });
+            }
+            updateStartupStep(localize("Connecting to Cursor", "Cursorへ接続中"));
+            runtime.agent = await waitForRunPreparation(() => this.createOrResumeAgent(
+              apiKey,
+              agentRoots,
+              workspace.name,
+              conversation,
+            ), {
+              signal: preparationAbort.signal,
+              timeoutMs: preparationTimeoutMs,
+              phase: "connecting to Cursor",
+              onLateResolve: disposeLateAgent,
+            });
+            runtime.rootsKey = desiredRootsKey;
+          }
+          if (runtime.agent && runtime.rootsKey === currentRootsKey()) {
+            return runtime.rootsKey;
+          }
         }
-        updateStartupStep(localize("Connecting to Cursor", "Cursorへ接続中"));
-        runtime.agent = await waitForRunPreparation(() => this.createOrResumeAgent(
-          apiKey,
-          agentRoots,
-          workspace.name,
-          conversation,
-        ), {
-          signal: preparationAbort.signal,
-          timeoutMs: preparationTimeoutMs,
-          phase: "connecting to Cursor",
-          onLateResolve: disposeLateAgent,
-        });
-        runtime.rootsKey = rootsKey;
-      }
+        throw new Error(localize(
+          "Workspace trust changed repeatedly while preparing the Cursor agent. Try again.",
+          "Cursor Agentの準備中にワークスペースの信頼状態が繰り返し変更されました。再試行してください。",
+        ));
+      };
 
       updateStartupStep(localize("Starting Cursor run", "Cursor Runを開始中"));
-      const runMessage = images.length > 0 ? { text: composed, images } : composed;
-      const runOptions = {
-        model: modelSelection ?? this.selectedModelSelection(),
-        mode: profile === "plan" ? "plan" as const : "agent" as const,
-        ...(runtime.forceNextRun ? { local: { force: true } } : {}),
-      };
+      const runModel = modelSelection ?? this.selectedModelSelection();
       let run: CursorRun;
-      const sendRun = (): Promise<CursorRun> => waitForRunPreparation(
-        () => runtime.agent!.send(runMessage, runOptions),
-        {
-          signal: preparationAbort.signal,
-          timeoutMs: preparationTimeoutMs,
-          phase: "starting the Cursor run",
-          onLateResolve: async (lateRun) => {
-            if (lateRun.supports("cancel")) {
-              await lateRun.cancel();
+      const sendRun = async (): Promise<CursorRun> => {
+        const preparedRootsKey = await ensureAgentForCurrentTrust();
+        const trustSnapshot = vscode.workspace.isTrusted;
+        const currentProjectCommand = commandCandidate
+          && isPromptCommandAllowedForWorkspaceTrust(
+            trustSnapshot,
+            commandCandidate.source,
+          )
+          ? commandCandidate
+          : undefined;
+        const currentEffectivePrompt = currentProjectCommand
+          ? expandProjectCommand(currentProjectCommand, prompt)
+          : prompt;
+        if (!currentEffectivePrompt) {
+          throw new Error(localize(
+            "The selected project command is unavailable while the workspace is untrusted.",
+            "選択したプロジェクトコマンドは、ワークスペースが未信頼の間は使用できません。",
+          ));
+        }
+        ({ composed } = this.composePrompt(
+          currentEffectivePrompt,
+          attachContext,
+          attachmentReferences,
+          profile,
+          requestedSkills,
+          editorContext,
+          includeProjectMemory,
+          workspace,
+        ));
+        const runMessage = images.length > 0 ? { text: composed, images } : composed;
+        const runOptions = {
+          model: runModel,
+          mode: profile === "plan" ? "plan" as const : "agent" as const,
+          ...(runtime.forceNextRun ? { local: { force: true } } : {}),
+        };
+        return waitForRunPreparation(
+          () => {
+            if (
+              !workspaceTrustSnapshotMatches(trustSnapshot, vscode.workspace.isTrusted)
+              || runtime.rootsKey !== preparedRootsKey
+              || preparedRootsKey !== currentRootsKey()
+            ) {
+              throw new Error(localize(
+                "Workspace trust changed before the Cursor run started. Try again.",
+                "Cursor Runの開始前にワークスペースの信頼状態が変更されました。再試行してください。",
+              ));
             }
+            return runtime.agent!.send(runMessage, runOptions);
           },
-        },
-      );
+          {
+            signal: preparationAbort.signal,
+            timeoutMs: preparationTimeoutMs,
+            phase: "starting the Cursor run",
+            onLateResolve: async (lateRun) => {
+              if (lateRun.supports("cancel")) {
+                await lateRun.cancel();
+              }
+            },
+          },
+        );
+      };
       try {
         run = await sendRun();
       } catch (error) {
@@ -5579,9 +5672,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           throw error;
         }
         this.output.appendLine(
-          `[${new Date().toISOString()}] Recovering stale active run for agent ${runtime.agent.agentId}.`,
+          `[${new Date().toISOString()}] Recovering stale active run for agent ${
+            runtime.agent?.agentId ?? conversation.agentId ?? "unknown"
+          }.`,
         );
         updateStartupStep(localize("Recovering stalled Cursor run", "停止したCursor Runを復旧中"));
+        const recoveryRootsKey = currentRootsKey();
         runtime.agent = await waitForRunPreparation(
           () => this.recoverBusyAgent(
             runtime,
@@ -5598,7 +5694,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             onLateResolve: disposeLateAgent,
           },
         );
-        runtime.rootsKey = rootsKey;
+        runtime.rootsKey = recoveryRootsKey === currentRootsKey()
+          ? recoveryRootsKey
+          : undefined;
         run = await sendRun();
       }
       runtime.run = run;
@@ -5863,9 +5961,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             session,
             storageRoot,
             conflicts,
-            originalPrompt: effectivePrompt,
+            rawPrompt: prompt,
+            commandCandidate,
+            agentRoots,
             priorAssistantText: assistantText,
-            model: runOptions.model,
+            model: runModel,
             pathEscapeLabel: isolationPathLabel,
             missingBaselineMessage: (relative) => localize(
               `The ${baselineLabel} baseline for ${relative} is unavailable.`,
@@ -6692,7 +6792,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     workspace: vscode.WorkspaceFolder | undefined,
     includeProjectMemory: boolean,
   ): string | undefined {
-    if (!workspace) {
+    if (
+      !workspace
+      || !shouldUseWorkspacePromptIntegrations(vscode.workspace.isTrusted)
+    ) {
       return undefined;
     }
     const disabled = this.disabledIntegrationIds();
@@ -6759,7 +6862,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       ].join("\n"),
       multitask: "Split independent work into parallel workstreams and delegate them to the available specialist subagents when useful. Integrate and verify their results.",
     };
-    const skills = [...new Set(requestedSkills)]
+    const trustFilteredSkills = filterRequestedSkillsForWorkspaceTrust(
+      vscode.workspace.isTrusted,
+      requestedSkills,
+    );
+    const skills = [...new Set(trustFilteredSkills)]
       .filter((skill) => skill.length > 0 && skill.length <= 80)
       .filter((skill) => this.isRequestedSkillEnabled(skill, workspace))
       .slice(0, 10);
@@ -7073,15 +7180,16 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private integrationStateKey(conversation: Conversation): string {
+    const trustKey = workspaceTrustIntegrationKey(vscode.workspace.isTrusted);
     const workspace = this.resolveChatWorkspace(conversation);
     if (!workspace) {
-      return "integrations:none";
+      return `integrations:${trustKey}:none`;
     }
     const folderMarker = `:${workspace.name}:`;
     const disabled = [...this.disabledIntegrationIds()]
       .filter((id) => id.includes(folderMarker))
       .sort();
-    return `integrations:${disabled.join(",")}`;
+    return `integrations:${trustKey}:${disabled.join(",")}`;
   }
 
   private async agentIntegrationOptions(
@@ -7091,13 +7199,24 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     mcpServers?: Record<string, McpServerConfig>;
   }> {
     const workspace = this.resolveChatWorkspace(conversation);
-    if (!workspace) {
-      return { settingSources: ["all"] };
+    const isWorkspaceTrusted = vscode.workspace.isTrusted;
+    if (!isWorkspaceTrusted || !workspace) {
+      return resolveAgentIntegrationPolicy({
+        isWorkspaceTrusted,
+        hasWorkspace: workspace !== undefined,
+        hasDisabledWorkspaceIntegrations: false,
+      });
     }
     const disabled = this.disabledIntegrationIds();
     const folderMarker = `:${workspace.name}:`;
-    if (![...disabled].some((id) => id.includes(folderMarker))) {
-      return { settingSources: ["all"] };
+    const hasDisabledWorkspaceIntegrations = [...disabled]
+      .some((id) => id.includes(folderMarker));
+    if (!hasDisabledWorkspaceIntegrations) {
+      return resolveAgentIntegrationPolicy({
+        isWorkspaceTrusted,
+        hasWorkspace: true,
+        hasDisabledWorkspaceIntegrations,
+      });
     }
     const mcpIntegrationId = `mcp:${workspace.name}:mcp.json`;
     let mcpServers: Record<string, McpServerConfig> | undefined;
@@ -7118,12 +7237,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         // Invalid or missing MCP configuration remains visible in the editor.
       }
     }
-    return {
-      // Project settings are supplied selectively below so disabled project
-      // rules, skills, and MCP files are not auto-loaded by the SDK.
-      settingSources: ["user", "team", "mdm", "plugins"],
-      mcpServers,
-    };
+    return resolveAgentIntegrationPolicy({
+      // Re-read trust after the MCP file I/O so a trust transition cannot
+      // expose the parsed workspace configuration to the SDK.
+      isWorkspaceTrusted: vscode.workspace.isTrusted,
+      hasWorkspace: true,
+      hasDisabledWorkspaceIntegrations,
+      workspaceMcpServers: mcpServers,
+    });
   }
 
   private async createOrResumeAgent(
@@ -7132,13 +7253,44 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     workspaceName: string,
     conversation: Conversation,
   ): Promise<CursorAgent> {
-    const integrations = await this.agentIntegrationOptions(conversation);
+    let integrations = await this.agentIntegrationOptions(conversation);
+    const isWorkspaceTrusted = vscode.workspace.isTrusted;
+    if (!isWorkspaceTrusted) {
+      // Apply the trust boundary again immediately before the SDK call in case
+      // trust changed while a workspace MCP file was being read.
+      integrations = resolveAgentIntegrationPolicy({
+        isWorkspaceTrusted: false,
+        hasWorkspace: roots.length > 0,
+        hasDisabledWorkspaceIntegrations: false,
+      });
+    }
+    const resumableAgentId = resumableAgentIdForWorkspaceTrust(
+      isWorkspaceTrusted,
+      conversation.agentId,
+    );
+    if (conversation.agentId !== resumableAgentId) {
+      conversation.agentId = resumableAgentId;
+      await this.saveConversations();
+    }
+    const integrationBoundaryKey = this.integrationStateKey(conversation);
+    const assertIntegrationBoundary = (): void => {
+      if (
+        !workspaceTrustSnapshotMatches(isWorkspaceTrusted, vscode.workspace.isTrusted)
+        || integrationBoundaryKey !== this.integrationStateKey(conversation)
+      ) {
+        throw new Error(localize(
+          "Workspace trust or project integrations changed while connecting to Cursor. Try again.",
+          "Cursorへの接続中にワークスペースの信頼状態またはプロジェクト統合が変更されました。再試行してください。",
+        ));
+      }
+    };
     return this.agentFactory.createOrResume({
       apiKey,
       roots,
       workspaceName,
       conversation,
       ...integrations,
+      assertIntegrationBoundary,
     });
   }
 
@@ -7163,7 +7315,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     session: IsolatedWorktreeSession;
     storageRoot: vscode.Uri;
     conflicts: Array<{ relative: string; error: string }>;
-    originalPrompt: string;
+    rawPrompt: string;
+    commandCandidate?: ProjectCommand;
+    agentRoots: string[];
     priorAssistantText: string;
     model?: ModelSelection;
     pathEscapeLabel: string;
@@ -7248,25 +7402,69 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     syncLiveText();
     this.postIfActive(input.conversationId, { type: "chunk", text: `\n\n${text}` });
     const listedFiles = prepared.map((candidate) => `- ${candidate.relative}`).join("\n");
-    const prompt = [
-      "Resolve the overlapping three-way merge conflicts in the files listed below.",
-      "Each file contains standard conflict markers. `workspace` is the other agent or user's current edit; `parallel-agent` is your proposed edit.",
-      "Infer the intent of both sides, preserve compatible behavior from both, and remove every conflict marker.",
-      "Edit only the listed conflicted files. Do not commit, delete files, or modify unrelated files.",
-      "After editing, re-read each listed file and ensure no conflict markers remain.",
-      "",
-      "Original request for this agent:",
-      input.originalPrompt,
-      "",
-      "Conflicted files:",
-      listedFiles,
-    ].join("\n");
 
     try {
-      const resolutionRun = await input.runtime.agent.send(prompt, {
-        model: input.model,
-        mode: "agent",
+      const trustSnapshot = vscode.workspace.isTrusted;
+      const desiredRootsKey = [
+        ...input.agentRoots.map((root) => path.resolve(root).toLowerCase()),
+        this.integrationStateKey(input.conversation),
+      ].join("\n");
+      const expectedBoundary = {
+        isWorkspaceTrusted: trustSnapshot,
+        rootsKey: desiredRootsKey,
+        agentId: input.conversation.agentId,
+      };
+      const currentBoundary = () => ({
+        isWorkspaceTrusted: vscode.workspace.isTrusted,
+        rootsKey: input.runtime.rootsKey,
+        agentId: input.runtime.agent?.agentId,
       });
+      if (!agentSendBoundaryMatches(expectedBoundary, currentBoundary())) {
+        throw new Error(localize(
+          "Workspace trust or the Cursor agent changed before AI conflict resolution. The conflicts were left unresolved.",
+          "AI競合解決の前にワークスペースの信頼状態またはCursor Agentが変更されました。競合は未解決のまま残しました。",
+        ));
+      }
+      if (
+        input.commandCandidate?.source === "project"
+        && !isPromptCommandAllowedForWorkspaceTrust(
+          trustSnapshot,
+          input.commandCandidate.source,
+        )
+      ) {
+        throw new Error(localize(
+          "AI conflict resolution cannot reuse a project command while the workspace is untrusted.",
+          "ワークスペースが未信頼の間は、AI競合解決でプロジェクトコマンドを再利用できません。",
+        ));
+      }
+      const currentOriginalPrompt = input.commandCandidate
+        ? expandProjectCommand(input.commandCandidate, input.rawPrompt)
+        : input.rawPrompt;
+      const prompt = [
+        "Resolve the overlapping three-way merge conflicts in the files listed below.",
+        "Each file contains standard conflict markers. `workspace` is the other agent or user's current edit; `parallel-agent` is your proposed edit.",
+        "Infer the intent of both sides, preserve compatible behavior from both, and remove every conflict marker.",
+        "Edit only the listed conflicted files. Do not commit, delete files, or modify unrelated files.",
+        "After editing, re-read each listed file and ensure no conflict markers remain.",
+        "",
+        "Original request for this agent:",
+        currentOriginalPrompt,
+        "",
+        "Conflicted files:",
+        listedFiles,
+      ].join("\n");
+      const resolutionRun = await (() => {
+        if (!agentSendBoundaryMatches(expectedBoundary, currentBoundary())) {
+          throw new Error(localize(
+            "Workspace trust or the Cursor agent changed before AI conflict resolution started.",
+            "AI競合解決の開始前にワークスペースの信頼状態またはCursor Agentが変更されました。",
+          ));
+        }
+        return input.runtime.agent!.send(prompt, {
+          model: input.model,
+          mode: "agent",
+        });
+      })();
       input.runtime.run = resolutionRun;
       const resolutionEditedFiles = new Set<string>();
       const eventStream = resolutionRun.stream();
@@ -7808,6 +8006,29 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       || scopedIds.some((id) => !this.disabledIntegrationIds().has(id));
   }
 
+  private async publishUserPromptIntegrations(generation: number): Promise<void> {
+    const userCommands = await loadProjectCommands([]);
+    if (generation !== this.workspaceIndexGeneration) {
+      return;
+    }
+    this.skillIntegrationIdsByName.clear();
+    this.projectCommands = filterEnabledProjectCommands(
+      userCommands,
+      this.disabledIntegrationIds(),
+    );
+    this.post({
+      type: "integrations",
+      skills: [],
+      mcpServers: [],
+      commands: this.projectCommands.map(({ id, label, description, source }) => ({
+        id,
+        label,
+        description,
+        source,
+      })),
+    });
+  }
+
   private async publishIntegrationIndex(
     generation = this.workspaceIndexGeneration,
   ): Promise<void> {
@@ -7815,30 +8036,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return;
     }
     const folders = vscode.workspace.workspaceFolders ?? [];
-    const disabledIntegrationIds = this.disabledIntegrationIds();
-    if (folders.length === 0) {
-      const projectCommands = await loadProjectCommands();
-      if (generation !== this.workspaceIndexGeneration) {
-        return;
-      }
-      this.skillIntegrationIdsByName.clear();
-      this.projectCommands = filterEnabledProjectCommands(
-        projectCommands,
-        disabledIntegrationIds,
-      );
-      this.post({
-        type: "integrations",
-        skills: [],
-        mcpServers: [],
-        commands: this.projectCommands.map(({ id, label, description, source }) => ({
-          id,
-          label,
-          description,
-          source,
-        })),
-      });
+    if (
+      folders.length === 0
+      || !shouldUseWorkspacePromptIntegrations(vscode.workspace.isTrusted)
+    ) {
+      await this.publishUserPromptIntegrations(generation);
       return;
     }
+    const disabledIntegrationIds = this.disabledIntegrationIds();
 
     const skillsByName = new Map<string, { name: string; description?: string }>();
     const skillIdsByName = new Map<string, string[]>();
@@ -7903,6 +8108,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
     const projectCommands = await loadProjectCommands(folders);
     if (generation !== this.workspaceIndexGeneration) {
+      return;
+    }
+    if (!shouldUseWorkspacePromptIntegrations(vscode.workspace.isTrusted)) {
+      await this.publishUserPromptIntegrations(generation);
       return;
     }
     this.skillIntegrationIdsByName.clear();
