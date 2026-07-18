@@ -74,7 +74,7 @@ Type `/` in the chat composer:
 
 - `/agent`, `/plan`, `/multitask` — switch the run profile for the next send
 - `/compare` — best-of-N parallel candidates in isolated worktrees; each candidate is verified in isolation, a winner is auto-selected when all finish (or pick one manually), then apply only the winner (or create a PR)
-- `/orchestrate` — plan the work, fan out parallel subtasks, then synthesize a final answer from each subtask's summary and changed files; when started from a normal chat with history, `cursorSubscription.orchestrateHandoffConversation` (default on) passes a truncated transcript to planning only so the planner can embed needed context into each subtask; the home view shows phase, each agent with open/status controls, and live tool/file activity for every stage
+- `/orchestrate` — plan the work, fan out parallel subtasks, then synthesize a final answer from each subtask's summary and changed files; when started from a normal chat with history, `cursorSubscription.orchestrateHandoffConversation` (default on) passes a truncated transcript to planning only so the planner can embed needed context into each subtask; the home view shows phase, each agent with open/status controls, and live tool/file activity for every stage; the detail view shows Plan → parallel subtasks → Synthesis as a visual flow
 - Project and user templates from `.cursor/commands/*.md` and `~/.cursor/commands/*.md`
 
 ## AI-native workflow
@@ -219,7 +219,7 @@ Activity Bar の **Cursor** コンテナ:
 
 - `/agent`、`/plan`、`/multitask` — 次の送信の実行プロファイルを切り替え
 - `/compare` — 隔離 worktree での best-of-N。各候補を隔離検証し、全完了後に勝者を自動選択（手動選択も可）。勝者だけを適用（または PR 作成）
-- `/orchestrate` — 計画 → 並列サブタスク → 各サブタスクの要約と変更ファイルを踏まえた最終回答の合成。履歴のある通常チャットから開始した場合、`cursorSubscription.orchestrateHandoffConversation`（既定オン）が切り詰めた会話履歴を計画プロンプトだけへ渡し、プランナーが各サブタスクへ必要な文脈を埋め込めるようにします。ホームにフェーズ、各エージェントの状態・開く操作、ステージごとのライブなツール/ファイル作業箇所を表示
+- `/orchestrate` — 計画 → 並列サブタスク → 各サブタスクの要約と変更ファイルを踏まえた最終回答の合成。履歴のある通常チャットから開始した場合、`cursorSubscription.orchestrateHandoffConversation`（既定オン）が切り詰めた会話履歴を計画プロンプトだけへ渡し、プランナーが各サブタスクへ必要な文脈を埋め込めるようにします。ホームにフェーズ、各エージェントの状態・開く操作、ステージごとのライブなツール/ファイル作業箇所を表示。詳細ビューでは Plan → 並列サブタスク → Synthesis を視覚的なフローとして表示します
 - `.cursor/commands/*.md` と `~/.cursor/commands/*.md` のテンプレート
 
 ### AIネイティブ機能

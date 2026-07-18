@@ -384,6 +384,15 @@ function truncateForSynthesis(text: string, maxCharacters: number): string {
   return `${trimmed.slice(0, maxCharacters)}\n…(truncated)`;
 }
 
+/** Short clip for orchestrator detail payloads shown in the flow UI. */
+function truncateForDetailSummary(text: string, maxCharacters = 120): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= maxCharacters) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, Math.max(0, maxCharacters - 1))}…`;
+}
+
 export function buildSynthesisPrompt(experiment: OrchestratorExperiment): string {
   const lines = experiment.subtasks.flatMap((subtask, index) => {
     const header = `${index + 1}. [${subtask.status}] ${subtask.title}`;
@@ -549,6 +558,8 @@ export function buildOrchestratorDetail(
     conversationId?: string;
     running: boolean;
     activity?: OrchestratorActivity;
+    resultSummary?: string;
+    changedFileCount?: number;
   }>;
 } {
   const activityFor = (conversationId?: string): OrchestratorActivity | undefined =>
@@ -574,14 +585,21 @@ export function buildOrchestratorDetail(
         : false,
       activity: activityFor(experiment.synthesisConversationId),
     },
-    subtasks: experiment.subtasks.map((subtask) => ({
-      id: subtask.id,
-      title: subtask.title,
-      status: subtask.status,
-      conversationId: subtask.conversationId,
-      running: subtask.conversationId ? busyIds.has(subtask.conversationId) : false,
-      activity: activityFor(subtask.conversationId),
-    })),
+    subtasks: experiment.subtasks.map((subtask) => {
+      const summary = subtask.resultSummary?.trim();
+      return {
+        id: subtask.id,
+        title: subtask.title,
+        status: subtask.status,
+        conversationId: subtask.conversationId,
+        running: subtask.conversationId ? busyIds.has(subtask.conversationId) : false,
+        activity: activityFor(subtask.conversationId),
+        ...(summary ? { resultSummary: truncateForDetailSummary(summary) } : {}),
+        ...(subtask.changedFiles
+          ? { changedFileCount: subtask.changedFiles.length }
+          : {}),
+      };
+    }),
   };
 }
 

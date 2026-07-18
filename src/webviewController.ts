@@ -226,6 +226,8 @@ export class WebviewController {
           orchestratorPlanAgent: "計画",
           orchestratorSynthesisAgent: "統合",
           orchestratorOpenAgent: "開く",
+          orchestratorFlowSubtasks: "サブタスク",
+          orchestratorFlowWaiting: "待機中",
           orchestratorGroup: "Orchestrate",
           budgetLabel: "予算",
           monthlyBudgetLabel: "月間予算",
@@ -400,6 +402,8 @@ export class WebviewController {
           orchestratorPlanAgent: "Plan",
           orchestratorSynthesisAgent: "Synthesis",
           orchestratorOpenAgent: "Open",
+          orchestratorFlowSubtasks: "Subtasks",
+          orchestratorFlowWaiting: "Waiting",
           orchestratorGroup: "Orchestrate",
           budgetLabel: "Budget",
           monthlyBudgetLabel: "Monthly budget",
@@ -1035,6 +1039,78 @@ export class WebviewController {
       font-size: 10px;
       margin-top: 2px;
     }
+    .orchestrator-flow {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      align-items: stretch;
+    }
+    .orchestrator-flow-connector {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.2;
+      padding: 2px 0;
+      user-select: none;
+    }
+    .orchestrator-flow-subtasks {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      min-width: 0;
+      padding: 6px 8px;
+      border: 1px solid var(--vscode-widget-border, transparent);
+      border-radius: 8px;
+      background: color-mix(in srgb, var(--vscode-sideBar-background) 92%, var(--vscode-foreground) 8%);
+    }
+    .orchestrator-flow-subtasks-header {
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: .03em;
+      white-space: nowrap;
+    }
+    .orchestrator-flow-subtasks-row {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      padding-bottom: 2px;
+      scrollbar-width: thin;
+    }
+    .orchestrator-flow-subtask {
+      display: flex;
+      flex: 0 0 auto;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 128px;
+      max-width: 200px;
+      padding: 6px 8px;
+      border: 1px solid var(--vscode-widget-border, transparent);
+      border-radius: 8px;
+      background: var(--vscode-editor-background);
+    }
+    .orchestrator-flow-subtask-top {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+    }
+    .orchestrator-flow-subtask-body {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .orchestrator-flow-subtask-summary {
+      min-width: 0;
+      color: var(--muted);
+      font-size: 10px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .orchestrator-error {
       margin: 0 0 8px;
       color: var(--vscode-errorForeground, #f44);
@@ -1057,6 +1133,15 @@ export class WebviewController {
       font-weight: 600;
       letter-spacing: .03em;
       white-space: nowrap;
+      cursor: pointer;
+      border: none;
+      background: transparent;
+      padding: 0;
+      text-align: left;
+      font: inherit;
+    }
+    .parallel-group-header:hover {
+      color: var(--vscode-foreground);
     }
     .parallel-group-tasks {
       display: flex;
@@ -2349,7 +2434,7 @@ export class WebviewController {
         <div id="orchestratorPrompt" class="compare-prompt"></div>
         <div id="orchestratorPhaseStrip" class="orchestrator-phase-strip"></div>
         <div id="orchestratorError" class="orchestrator-error" hidden></div>
-        <div id="orchestratorAgents" class="compare-grid"></div>
+        <div id="orchestratorAgents" class="orchestrator-flow"></div>
       </div>
       <div id="tasks" hidden>
         <div class="tasks-title">${ui.tasks}</div>
@@ -3383,17 +3468,8 @@ export class WebviewController {
       }
     }
 
-    function appendOrchestratorAgentRow(label, status, conversationId, running, activity, subtaskId) {
-      const row = document.createElement("div");
-      row.className = "orchestrator-agent-row";
-      if (conversationId) {
-        row.dataset.conversationId = conversationId;
-      }
-      if (subtaskId) {
-        row.dataset.subtaskId = subtaskId;
-      }
-      const statusEl = document.createElement("span");
-      statusEl.className = "orchestrator-agent-status";
+    function fillOrchestratorStatusGlyph(statusEl, status, running) {
+      statusEl.replaceChildren();
       if (running || status === "running" || status === "planning" || status === "synthesizing") {
         const spinner = document.createElement("span");
         spinner.className = "running-spinner";
@@ -3407,6 +3483,42 @@ export class WebviewController {
       } else {
         statusEl.textContent = "·";
       }
+    }
+
+    function orchestratorStatusMeta(status, running, waiting) {
+      if (running) {
+        return i18n.running;
+      }
+      if (status === "completed") {
+        return i18n.completedTask;
+      }
+      if (status === "failed") {
+        return i18n.failedTask;
+      }
+      if (status === "pending") {
+        return waiting ? i18n.orchestratorFlowWaiting : i18n.queuedTask;
+      }
+      return orchestratorPhaseLabel(status);
+    }
+
+    function appendOrchestratorFlowConnector() {
+      const connector = document.createElement("div");
+      connector.className = "orchestrator-flow-connector";
+      connector.setAttribute("aria-hidden", "true");
+      connector.textContent = "↓";
+      orchestratorAgents.appendChild(connector);
+    }
+
+    function appendOrchestratorAgentRow(label, status, conversationId, running, activity, options) {
+      const waiting = options && options.waiting === true;
+      const row = document.createElement("div");
+      row.className = "orchestrator-agent-row";
+      if (conversationId) {
+        row.dataset.conversationId = conversationId;
+      }
+      const statusEl = document.createElement("span");
+      statusEl.className = "orchestrator-agent-status";
+      fillOrchestratorStatusGlyph(statusEl, status, running);
       const body = document.createElement("div");
       body.className = "orchestrator-agent-body";
       const title = document.createElement("span");
@@ -3418,15 +3530,7 @@ export class WebviewController {
       body.append(title, activityEl);
       const meta = document.createElement("span");
       meta.className = "orchestrator-agent-meta";
-      meta.textContent = running
-        ? i18n.running
-        : status === "completed"
-          ? i18n.completedTask
-          : status === "failed"
-            ? i18n.failedTask
-            : status === "pending"
-              ? i18n.queuedTask
-              : orchestratorPhaseLabel(status);
+      meta.textContent = orchestratorStatusMeta(status, running, waiting);
       row.append(statusEl, body, meta);
       if (conversationId) {
         const open = document.createElement("button");
@@ -3441,11 +3545,63 @@ export class WebviewController {
       orchestratorAgents.appendChild(row);
     }
 
+    function createOrchestratorFlowSubtask(subtask) {
+      const node = document.createElement("div");
+      node.className = "orchestrator-flow-subtask";
+      if (subtask.conversationId) {
+        node.dataset.conversationId = subtask.conversationId;
+      }
+      if (subtask.id) {
+        node.dataset.subtaskId = subtask.id;
+      }
+      const top = document.createElement("div");
+      top.className = "orchestrator-flow-subtask-top";
+      const statusEl = document.createElement("span");
+      statusEl.className = "orchestrator-agent-status";
+      fillOrchestratorStatusGlyph(statusEl, subtask.status, subtask.running === true);
+      const body = document.createElement("div");
+      body.className = "orchestrator-flow-subtask-body";
+      const title = document.createElement("span");
+      title.className = "orchestrator-agent-title";
+      title.textContent = subtask.title;
+      const activityEl = document.createElement("div");
+      activityEl.className = "orchestrator-agent-activity";
+      fillOrchestratorActivity(activityEl, subtask.running === true ? subtask.activity : null);
+      body.append(title, activityEl);
+      if (subtask.status === "completed") {
+        const summaryText = typeof subtask.resultSummary === "string"
+          ? subtask.resultSummary.trim().replace(/\s+/g, " ")
+          : "";
+        if (summaryText) {
+          const summaryEl = document.createElement("div");
+          summaryEl.className = "orchestrator-flow-subtask-summary";
+          summaryEl.textContent = summaryText;
+          summaryEl.title = summaryText;
+          body.appendChild(summaryEl);
+        }
+      }
+      top.append(statusEl, body);
+      node.appendChild(top);
+      if (subtask.conversationId) {
+        const open = document.createElement("button");
+        open.className = "task-action";
+        open.type = "button";
+        open.textContent = i18n.orchestratorOpenAgent;
+        open.addEventListener("click", () => {
+          vscode.postMessage({ type: "openConversation", id: subtask.conversationId });
+        });
+        node.appendChild(open);
+      }
+      return node;
+    }
+
     function patchOrchestratorActivity(message) {
       if (!message || !openOrchestratorId || message.experimentId !== openOrchestratorId) {
         return;
       }
-      const rows = orchestratorAgents.querySelectorAll(".orchestrator-agent-row");
+      const rows = orchestratorAgents.querySelectorAll(
+        ".orchestrator-agent-row, .orchestrator-flow-subtask",
+      );
       for (const row of rows) {
         if (message.conversationId && row.dataset.conversationId === message.conversationId) {
           const activityEl = row.querySelector(".orchestrator-agent-activity");
@@ -3544,6 +3700,7 @@ export class WebviewController {
         orchestratorPhaseStrip.appendChild(chip);
       }
       orchestratorAgents.innerHTML = "";
+      orchestratorAgents.className = "orchestrator-flow";
       const planStatus = experiment.status === "planning"
         ? "planning"
         : experiment.plan?.running
@@ -3556,33 +3713,37 @@ export class WebviewController {
         experiment.plan?.running === true,
         experiment.plan?.activity,
       );
-      for (const subtask of experiment.subtasks || []) {
-        appendOrchestratorAgentRow(
-          subtask.title,
-          subtask.status,
-          subtask.conversationId,
-          subtask.running === true,
-          subtask.activity,
-          subtask.id,
-        );
+      appendOrchestratorFlowConnector();
+      const subtasksBand = document.createElement("div");
+      subtasksBand.className = "orchestrator-flow-subtasks";
+      const subtasksHeader = document.createElement("div");
+      subtasksHeader.className = "orchestrator-flow-subtasks-header";
+      const subtasks = experiment.subtasks || [];
+      subtasksHeader.textContent = i18n.orchestratorFlowSubtasks
+        + (subtasks.length > 0 ? " · " + subtasks.length : "");
+      const subtasksRow = document.createElement("div");
+      subtasksRow.className = "orchestrator-flow-subtasks-row";
+      for (const subtask of subtasks) {
+        subtasksRow.appendChild(createOrchestratorFlowSubtask(subtask));
       }
-      if (experiment.synthesis?.conversationId || experiment.status === "synthesizing"
-        || experiment.status === "completed" || experiment.status === "failed") {
-        const synthesisStatus = experiment.status === "synthesizing"
-          ? "synthesizing"
-          : experiment.status === "completed"
-            ? "completed"
-            : experiment.status === "failed" && experiment.synthesis?.conversationId
-              ? "failed"
-              : "pending";
-        appendOrchestratorAgentRow(
-          i18n.orchestratorSynthesisAgent,
-          synthesisStatus,
-          experiment.synthesis?.conversationId,
-          experiment.synthesis?.running === true,
-          experiment.synthesis?.activity,
-        );
-      }
+      subtasksBand.append(subtasksHeader, subtasksRow);
+      orchestratorAgents.appendChild(subtasksBand);
+      appendOrchestratorFlowConnector();
+      const synthesisStatus = experiment.status === "synthesizing"
+        ? "synthesizing"
+        : experiment.status === "completed"
+          ? "completed"
+          : experiment.status === "failed" && experiment.synthesis?.conversationId
+            ? "failed"
+            : "pending";
+      appendOrchestratorAgentRow(
+        i18n.orchestratorSynthesisAgent,
+        synthesisStatus,
+        experiment.synthesis?.conversationId,
+        experiment.synthesis?.running === true,
+        experiment.synthesis?.activity,
+        { waiting: synthesisStatus === "pending" },
+      );
     }
 
     function requestContextPreview() {
@@ -3814,16 +3975,40 @@ export class WebviewController {
           ungrouped.push(task);
         }
       }
-      for (const [, tasks] of groups) {
+      for (const [experimentId, tasks] of groups) {
         const group = document.createElement("div");
         group.className = "parallel-group";
-        const header = document.createElement("div");
+        const header = document.createElement("button");
         header.className = "parallel-group-header";
+        header.type = "button";
+        header.title = i18n.orchestratorDetailTitle;
         const runningCount = tasks.filter((task) => task.status === "running").length;
         header.textContent = i18n.orchestratorGroup + " · " + runningCount + "/" + tasks.length;
+        header.addEventListener("click", () => {
+          vscode.postMessage({ type: "openOrchestrator", id: experimentId });
+        });
         const chips = document.createElement("div");
         chips.className = "parallel-group-tasks";
-        for (const task of tasks) {
+        const ordered = [...tasks].sort((a, b) => {
+          const roleOrder = (role) => (
+            role === "plan" ? 0 : role === "subtask" ? 1 : role === "synthesis" ? 2 : 3
+          );
+          const byRole = roleOrder(a.orchestratorRole) - roleOrder(b.orchestratorRole);
+          if (byRole !== 0) {
+            return byRole;
+          }
+          if (a.orchestratorRole === "subtask" && b.orchestratorRole === "subtask") {
+            const aIndex = Number.isFinite(a.orchestratorSubtaskIndex)
+              ? a.orchestratorSubtaskIndex
+              : Number.MAX_SAFE_INTEGER;
+            const bIndex = Number.isFinite(b.orchestratorSubtaskIndex)
+              ? b.orchestratorSubtaskIndex
+              : Number.MAX_SAFE_INTEGER;
+            return aIndex - bIndex;
+          }
+          return 0;
+        });
+        for (const task of ordered) {
           chips.appendChild(createParallelTaskChip(task));
         }
         group.append(header, chips);

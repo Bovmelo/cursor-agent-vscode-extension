@@ -119,6 +119,44 @@ test("orchestrator parses subtasks and advances through synthesis", () => {
   assert.equal(detail.subtasks[0].running, true);
   assert.equal(detail.subtasks[1].running, false);
   assert.equal(detail.subtasks[0].activity, undefined);
+  assert.equal(detail.subtasks[0].resultSummary, "Implemented A with helper extractFoo.");
+  assert.equal(detail.subtasks[0].changedFileCount, 1);
+  assert.equal(detail.subtasks[1].resultSummary, "Covered B with unit tests.");
+  assert.equal(detail.subtasks[1].changedFileCount, 1);
+  assert.equal("changedFiles" in detail.subtasks[0], false);
+
+  const longSummary = `${"x".repeat(130)} leftover`;
+  const withLongSummary = buildOrchestratorDetail(
+    {
+      ...experiment,
+      subtasks: [
+        {
+          ...experiment.subtasks[0],
+          resultSummary: longSummary,
+          changedFiles: ["src/a.ts", "src/b.ts"],
+        },
+        {
+          id: "pending-only",
+          title: "Pending",
+          prompt: "do pending",
+          status: "pending",
+        },
+        {
+          ...experiment.subtasks[1],
+          resultSummary: "   ",
+          changedFiles: [],
+        },
+      ],
+    },
+    new Set(),
+  );
+  assert.equal(withLongSummary.subtasks[0].resultSummary?.length, 120);
+  assert.match(withLongSummary.subtasks[0].resultSummary ?? "", /…$/);
+  assert.equal(withLongSummary.subtasks[0].changedFileCount, 2);
+  assert.equal("resultSummary" in withLongSummary.subtasks[1], false);
+  assert.equal("changedFileCount" in withLongSummary.subtasks[1], false);
+  assert.equal("resultSummary" in withLongSummary.subtasks[2], false);
+  assert.equal(withLongSummary.subtasks[2].changedFileCount, 0);
 
   const withActivity = buildOrchestratorDetail(
     experiment,

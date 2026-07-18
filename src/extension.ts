@@ -4704,6 +4704,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         this.parallelTaskParticipants.add(conversationId);
       }
     }
+    const orchestratorSubtaskIndexByConversationId = new Map<string, number>();
+    for (const experiment of this.orchestratorExperiments) {
+      experiment.subtasks.forEach((subtask, index) => {
+        if (subtask.conversationId) {
+          orchestratorSubtaskIndexByConversationId.set(subtask.conversationId, index);
+        }
+      });
+    }
     const tasks = this.conversations
       .map((conversation) => {
         const running = this.isConversationBusy(conversation.id);
@@ -4729,6 +4737,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               ? (conversation.title.match(/^\[([^\]]+)\]/)?.[1] || conversation.title)
               : conversation.title;
         const activity = this.orchestratorActivityByConversationId.get(conversation.id);
+        const orchestratorSubtaskIndex = orchestratorRole === "subtask"
+          ? orchestratorSubtaskIndexByConversationId.get(conversation.id)
+          : undefined;
         return {
           id: conversation.id,
           title: shortTitle,
@@ -4739,6 +4750,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           visible: status !== undefined,
           orchestratorExperimentId: conversation.orchestratorExperimentId,
           orchestratorRole,
+          ...(orchestratorSubtaskIndex !== undefined ? { orchestratorSubtaskIndex } : {}),
           activity: status === "running" ? activity : undefined,
         };
       })
