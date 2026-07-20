@@ -1,15 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  canStartAnotherParallelAgent,
+  conversationRunState,
+  enqueueChatMessage,
+  removeQueuedMessages,
+  requeueUnstartedMessage,
+  shouldCancelOnInterrupt,
+  takeNextQueuedMessage,
+} from "../out/chatSendQueue.js";
+import {
   baselineKey,
   canApplyAgainstBaseline,
   canQueueOrRunSupervisorTask,
-  canStartAnotherParallelAgent,
   computeOverlappedMutationFlags,
-  conversationRunState,
   defaultSafetyApprovalMode,
   decideBaselineRestoreAction,
-  enqueueChatMessage,
   findConflictingFiles,
   hashBytes,
   isPathInside,
@@ -18,13 +24,9 @@ import {
   nextSupervisorStatusAfterDecisions,
   nextSupervisorStatusAfterRun,
   parseWebviewMessage,
-  removeQueuedMessages,
-  requeueUnstartedMessage,
   safeResolvePath,
   shouldMigrateToSafeWorktree,
   shouldUseIsolatedWorktree,
-  shouldCancelOnInterrupt,
-  takeNextQueuedMessage,
   worktreeMatchesProposed,
 } from "../out/safety.js";
 import { hasConflictMarkers, threeWayMergeBytes } from "../out/threeWayMerge.js";
@@ -377,6 +379,55 @@ test("webview message schema validation accepts known shapes and rejects junk", 
 
   const pickWorkspace = parseWebviewMessage({ type: "pickWorkspaceFolder" });
   assert.equal(pickWorkspace?.type, "pickWorkspaceFolder");
+
+  assert.equal(parseWebviewMessage({ type: "confirmSetupChecklistStep" }), undefined);
+  assert.equal(parseWebviewMessage({ type: "setupChecklistAction" }), undefined);
+  assert.equal(
+    parseWebviewMessage({ type: "confirmSetupChecklistStep", id: "apiKey" }),
+    undefined,
+  );
+  assert.equal(
+    parseWebviewMessage({ type: "confirmSetupChecklistStep", id: "workspaceTrust" }),
+    undefined,
+  );
+  assert.equal(
+    parseWebviewMessage({ type: "setupChecklistAction", id: "unknown" }),
+    undefined,
+  );
+  const confirmSetup = parseWebviewMessage({
+    type: "confirmSetupChecklistStep",
+    id: "permissions",
+  });
+  assert.equal(confirmSetup?.type, "confirmSetupChecklistStep");
+  assert.equal(confirmSetup?.id, "permissions");
+  const confirmGh = parseWebviewMessage({
+    type: "confirmSetupChecklistStep",
+    id: "gh",
+  });
+  assert.equal(confirmGh?.type, "confirmSetupChecklistStep");
+  assert.equal(confirmGh?.id, "gh");
+  const setupAction = parseWebviewMessage({
+    type: "setupChecklistAction",
+    id: "apiKey",
+  });
+  assert.equal(setupAction?.type, "setupChecklistAction");
+  assert.equal(setupAction?.id, "apiKey");
+  for (const id of [
+    "gitWorkspace",
+    "permissions",
+    "gh",
+    "openGhSettings",
+    "openDashboard",
+    "workspaceTrust",
+  ]) {
+    const action = parseWebviewMessage({ type: "setupChecklistAction", id });
+    assert.equal(action?.type, "setupChecklistAction");
+    assert.equal(action?.id, id);
+  }
+  const dismissSetup = parseWebviewMessage({ type: "dismissSetupChecklist" });
+  assert.equal(dismissSetup?.type, "dismissSetupChecklist");
+  const showSetup = parseWebviewMessage({ type: "showSetupChecklist" });
+  assert.equal(showSetup?.type, "showSetupChecklist");
 
   assert.equal(parseWebviewMessage({ type: "startOrchestrate" }), undefined);
   const orchestrate = parseWebviewMessage({

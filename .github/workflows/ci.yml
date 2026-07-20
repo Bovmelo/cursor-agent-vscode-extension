@@ -18,6 +18,7 @@ jobs:
         os:
           - ubuntu-latest
           - windows-latest
+          - macos-latest
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -35,6 +36,10 @@ jobs:
       - name: Compile, validate webview, and run tests
         run: npm run validate
 
+  # Extension Host e2e stays on Ubuntu/Windows only. macOS GitHub-hosted runners are
+  # headless without a reliable non-interactive display for Electron/VS Code
+  # (@vscode/test-electron); Linux uses xvfb-run, and Windows is reliable enough
+  # without a virtual framebuffer. Adding macos-latest here would be flaky.
   e2e:
     strategy:
       fail-fast: false

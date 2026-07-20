@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+Planned toward 0.2.x (see [ROADMAP.md](./ROADMAP.md)); stabilize before net-new Supervisor / automation features:
+
+- Harden Extension Host E2E coverage, Workspace Trust gates, and API-key handling paths (SecretStorage / stdin-only workers; no key material in jobs, logs, or docs)
+- Expand CI to include macOS and make Marketplace publish more predictable
+- Fix release workflow Marketplace publish: always run `publish-marketplace` after release; skip the publish step when `VSCE_PAT` is unset (env-only; no invalid job-level `secrets` `if`)
+- Extracted chat send / queue helpers into `chatSendQueue.ts` (wired from `extension.ts`; batch requeue preserves order)
+- Added a first-run setup checklist in the Agent sidebar (API key, workspace trust, Git workspace, permission mode, optional `gh`), with dismiss/completion persisted in workspace state and reopen from the Agent More menu or Command Palette
+- Hardened GitHub trigger unit tests (`gh pr view --json` contract, fingerprint key material, graceful API edge cases)
+- Hardened untrusted-workspace E2E trust-gate assertions and suite-child credential scrubbing
+- Add mocked integration tests for GitHub / Task Pipeline (and related Supervisor GitHub-scan) paths
+
 ## 0.1.19 - 2026-07-18
 
 - Enforce Workspace Trust at every privileged execution boundary, including hooks, verification, Supervisor/background agents, and SDK sandbox fallback paths

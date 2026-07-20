@@ -53,6 +53,7 @@ import {
 } from "./bestOfN.js";
 import { buildContextPreview } from "./contextEstimate.js";
 import { generateCommitMessage, resolveRootUri } from "./generateCommitMessage.js";
+import { getGitApi } from "./gitApi.js";
 import {
   checkoutPreservedPullRequestBranch,
   createBranchCommitAndPullRequest,
@@ -177,20 +178,28 @@ import {
   type InlineCompletionStats,
 } from "./inlineCompletion.js";
 import {
+  availableParallelSlots,
   canStartAnotherParallelAgent,
-  computeOverlappedMutationFlags,
   conversationRunState,
-  defaultSafetyApprovalMode,
   enqueueChatMessage,
-  isSafeRelativePath,
-  parseWebviewMessage,
+  normalizeMaxParallelAgents,
+  queuedConversationIds,
   removeQueuedMessages,
   requeueUnstartedMessage,
+  requeueUnstartedMessages,
+  selectParallelLaunchCandidates,
+  shouldCancelOnInterrupt,
+  takeNextQueuedMessage,
+  takeParallelLaunchBatch,
+} from "./chatSendQueue.js";
+import {
+  computeOverlappedMutationFlags,
+  defaultSafetyApprovalMode,
+  isSafeRelativePath,
+  parseWebviewMessage,
   shouldMigrateToSafeWorktree,
   shouldUseIsolatedWorktree,
-  shouldCancelOnInterrupt,
   safeResolvePathResolved,
-  takeNextQueuedMessage,
   type SafetyApprovalMode,
 } from "./safety.js";
 import { runExecutableCommand } from "./shellCommand.js";
@@ -208,6 +217,9 @@ const BEST_OF_N_KEY = "cursorSubscription.bestOfNExperiments";
 const ORCHESTRATOR_KEY = "cursorSubscription.orchestratorExperiments";
 const EXECUTION_PLANS_KEY = "cursorSubscription.executionPlans";
 const UNTRUSTED_WORKSPACE_WARNING_KEY = "cursorSubscription.untrustedWorkspaceWarningShown";
+const SETUP_CHECKLIST_DISMISSED_KEY = "cursorSubscription.setupChecklistDismissed";
+const SETUP_CHECKLIST_PERMISSIONS_CONFIRMED_KEY = "cursorSubscription.setupChecklistPermissionsConfirmed";
+const SETUP_CHECKLIST_GH_SKIPPED_KEY = "cursorSubscription.setupChecklistGhSkipped";
 const BUDGET_WARNED_KEY_PREFIX = "cursorSubscription.budgetWarned";
 const MAX_INLINE_COMPLETION_CACHE = 32;
 const INLINE_COMPLETION_STATS_KEY = "cursorSubscription.inlineCompletionStats";
@@ -451,6 +463,9 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand("cursorSubscription.clearApiKey", () =>
       provider.clearApiKey(),
+    ),
+    vscode.commands.registerCommand("cursorSubscription.showSetupChecklist", () =>
+      provider.showSetupChecklist(),
     ),
     vscode.commands.registerCommand("cursorSubscription.newChat", () => provider.newChat()),
     vscode.commands.registerCommand("cursorSubscription.findInChat", () => provider.findInChat()),
@@ -708,6 +723,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     | undefined;
   /** Workspace folder chosen for a new chat before the conversation is created. */
   private draftWorkspaceFolderUri: string | undefined;
+  private ghCliAvailabilityCache: { value: boolean; at: number } | undefined;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -834,6 +850,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               await this.publishIntegrationIndex(generation);
             }
             await this.publishAuthState();
+            await this.publishSetupChecklistState();
             await this.flushPendingChatFiles();
             // Chat queues are in-memory. Rebuild pending orchestration launches
             // from persisted experiment state after an extension-host restart.
@@ -1156,9 +1173,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
                 }
               }
               await this.context.globalState.update(APPROVAL_MODE_KEY, message.approvalMode);
+              await this.context.workspaceState.update(
+                SETUP_CHECKLIST_PERMISSIONS_CONFIRMED_KEY,
+                true,
+              );
               await this.cancelAllChats();
               await this.disposeAgent();
               this.post({ type: "approvalModeSelected", mode: message.approvalMode });
+              await this.publishSetupChecklistState();
             }
             break;
           case "setAlertSetting":
@@ -1203,6 +1225,23 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           case "pickWorkspaceFolder":
             await this.pickChatWorkspaceFolder();
             break;
+          case "dismissSetupChecklist":
+            await this.context.workspaceState.update(SETUP_CHECKLIST_DISMISSED_KEY, true);
+            await this.publishSetupChecklistState();
+            break;
+          case "showSetupChecklist":
+            await this.showSetupChecklist();
+            break;
+          case "confirmSetupChecklistStep":
+            if (typeof message.id === "string") {
+              await this.confirmSetupChecklistStep(message.id);
+            }
+            break;
+          case "setupChecklistAction":
+            if (typeof message.id === "string") {
+              await this.runSetupChecklistAction(message.id);
+            }
+            break;
         }
       },
       undefined,
@@ -1222,8 +1261,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         }
       }),
       vscode.window.onDidChangeTextEditorSelection(() => this.postContextInfo()),
-      vscode.workspace.onDidChangeWorkspaceFolders(() => invalidateWorkspaceFiles()),
-      vscode.workspace.onDidGrantWorkspaceTrust(() => invalidateWorkspaceFiles()),
+      vscode.workspace.onDidChangeWorkspaceFolders(() => {
+        invalidateWorkspaceFiles();
+        void this.publishSetupChecklistState();
+      }),
+      vscode.workspace.onDidGrantWorkspaceTrust(() => {
+        invalidateWorkspaceFiles();
+        void this.publishSetupChecklistState();
+      }),
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (
           event.affectsConfiguration("cursorSubscription.notifyOnComplete")
@@ -1270,6 +1315,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     await this.context.secrets.store(API_KEY_SECRET, apiKey.trim());
     await this.revokeStoredCredentials();
     await this.publishAuthState();
+    await this.publishSetupChecklistState();
     void vscode.window.showInformationMessage(localize(
       "The Cursor API key was stored securely.",
       "Cursor APIキーを安全に保存しました。",
@@ -1297,6 +1343,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     await this.context.secrets.delete(API_KEY_SECRET);
     await this.revokeStoredCredentials();
     await this.publishAuthState();
+    await this.publishSetupChecklistState();
   }
 
   private async revokeStoredCredentials(): Promise<void> {
@@ -4703,6 +4750,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       this.draftWorkspaceFolderUri = picked.uri.toString();
     }
     this.postWorkspaceLabel();
+    await this.publishSetupChecklistState();
   }
 
   private postIfActive(conversationId: string, message: Record<string, unknown>): void {
@@ -4954,26 +5002,23 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
    * parallel agents without leaving the active chat.
    */
   private async launchQueuedMessagesParallel(ids: string[]): Promise<void> {
-    const wanted = new Set(ids.filter((id) => id.length > 0));
-    if (wanted.size === 0) {
-      return;
-    }
-
-    const items = this.messageQueue.filter(
-      (item) =>
-        wanted.has(item.id)
-        && item.kind !== "interrupt"
-        && (!this.activeId || item.conversationId === this.activeId),
+    const items = selectParallelLaunchCandidates(
+      this.messageQueue,
+      ids,
+      this.activeId,
     );
     if (items.length === 0) {
       return;
     }
 
-    const maximumParallelAgents = Math.max(
-      1,
+    const maximumParallelAgents = normalizeMaxParallelAgents(
       this.alertConfiguration().get<number>("maxParallelChatAgents", 3),
     );
-    if (!canStartAnotherParallelAgent(this.activeRunCount(), maximumParallelAgents)) {
+    const available = availableParallelSlots(
+      this.activeRunCount(),
+      maximumParallelAgents,
+    );
+    if (available === 0) {
       this.post({
         type: "error",
         text: localize(
@@ -4984,9 +5029,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return;
     }
 
-    const available = Math.max(0, maximumParallelAgents - this.activeRunCount());
-    const launchable = items.slice(0, available);
-    const skippedForLimit = items.length - launchable.length;
+    const { launchable, skippedForLimit } = takeParallelLaunchBatch(items, available);
     const launchIds = new Set(launchable.map((item) => item.id));
     this.messageQueue.splice(
       0,
@@ -5043,11 +5086,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
 
     if (pending.length > 0) {
-      let queue: QueuedMessage[] = this.messageQueue;
-      for (const item of pending) {
-        queue = requeueUnstartedMessage(queue, item);
-      }
-      this.messageQueue.splice(0, this.messageQueue.length, ...queue);
+      this.messageQueue.splice(
+        0,
+        this.messageQueue.length,
+        ...requeueUnstartedMessages(this.messageQueue, pending),
+      );
       this.postQueueState();
     }
 
@@ -5067,7 +5110,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
   private async drainMessageQueue(conversationId?: string): Promise<void> {
     if (!conversationId) {
-      const conversationIds = [...new Set(this.messageQueue.map((item) => item.conversationId))];
+      const conversationIds = queuedConversationIds(this.messageQueue);
       await Promise.all(conversationIds.map((id) => this.drainMessageQueue(id)));
       return;
     }
@@ -5080,16 +5123,20 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.drainingConversations.add(conversationId);
     try {
       while (!this.isConversationBusy(conversationId)) {
-        const maximumParallelAgents = this.alertConfiguration()
-          .get<number>("maxParallelChatAgents", 3);
-        if (this.activeRunCount() >= Math.max(1, maximumParallelAgents)) {
+        const maximumParallelAgents = normalizeMaxParallelAgents(
+          this.alertConfiguration().get<number>("maxParallelChatAgents", 3),
+        );
+        if (!canStartAnotherParallelAgent(this.activeRunCount(), maximumParallelAgents)) {
           break;
         }
-        const index = this.messageQueue.findIndex((item) => item.conversationId === conversationId);
-        if (index < 0) {
+        const { next: item, remaining } = takeNextQueuedMessage(
+          this.messageQueue,
+          conversationId,
+        );
+        if (!item) {
           break;
         }
-        const [item] = this.messageQueue.splice(index, 1);
+        this.messageQueue.splice(0, this.messageQueue.length, ...remaining);
         const conversation = this.conversations.find(
           (candidate) => candidate.id === item.conversationId,
         );
@@ -5228,9 +5275,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (runtime.busy) {
       return false;
     }
-    const maximumParallelAgents = this.alertConfiguration()
-      .get<number>("maxParallelChatAgents", 3);
-    if (this.activeRunCount() >= Math.max(1, maximumParallelAgents)) {
+    const maximumParallelAgents = normalizeMaxParallelAgents(
+      this.alertConfiguration().get<number>("maxParallelChatAgents", 3),
+    );
+    if (!canStartAnotherParallelAgent(this.activeRunCount(), maximumParallelAgents)) {
       if (!queue?.fromQueue) {
         this.postIfActive(conversationId, {
           type: "error",
@@ -8183,6 +8231,170 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (apiKey) {
       void this.publishModels(apiKey);
     }
+  }
+
+  public async showSetupChecklist(): Promise<void> {
+    await this.context.workspaceState.update(SETUP_CHECKLIST_DISMISSED_KEY, false);
+    await vscode.commands.executeCommand(`${VIEW_ID}.focus`);
+    await this.publishSetupChecklistState();
+  }
+
+  private async confirmSetupChecklistStep(stepId: string): Promise<void> {
+    if (stepId === "permissions") {
+      await this.context.workspaceState.update(
+        SETUP_CHECKLIST_PERMISSIONS_CONFIRMED_KEY,
+        true,
+      );
+    } else if (stepId === "gh") {
+      await this.context.workspaceState.update(SETUP_CHECKLIST_GH_SKIPPED_KEY, true);
+    }
+    await this.publishSetupChecklistState();
+  }
+
+  private async runSetupChecklistAction(actionId: string): Promise<void> {
+    switch (actionId) {
+      case "apiKey":
+        await this.promptForApiKey();
+        break;
+      case "gitWorkspace": {
+        const folders = vscode.workspace.workspaceFolders ?? [];
+        if (folders.length === 0) {
+          await vscode.commands.executeCommand("workbench.action.files.openFolder");
+        } else if (folders.length > 1) {
+          await this.pickChatWorkspaceFolder();
+        } else {
+          const ready = await this.hasGitWorkspace();
+          if (!ready) {
+            void vscode.window.showInformationMessage(localize(
+              "Open a Git repository folder for Safe worktree, Supervisor, and checkpoint features. This unofficial extension is not affiliated with Anysphere / Cursor.",
+              "安全worktree・Supervisor・チェックポイント機能のため、Gitリポジトリのフォルダーを開いてください。この非公式拡張機能は Anysphere / Cursor 非提携です。",
+            ));
+          }
+        }
+        await this.publishSetupChecklistState();
+        break;
+      }
+      case "permissions":
+        this.post({ type: "focusApprovalModeMenu" });
+        break;
+      case "workspaceTrust":
+        if (!vscode.workspace.isTrusted) {
+          try {
+            await vscode.commands.executeCommand("workbench.trust.manage");
+          } catch {
+            try {
+              await vscode.commands.executeCommand("workbench.action.manageTrust");
+            } catch {
+              void vscode.window.showInformationMessage(localize(
+                "Trust this workspace from the Restricted Mode banner or status bar to enable autonomous automation.",
+                "自律自動化を使うには、Restricted Mode のバナーまたはステータスバーからこのワークスペースを信頼してください。",
+              ));
+            }
+          }
+        }
+        await this.publishSetupChecklistState();
+        break;
+      case "gh":
+        await this.publishSetupChecklistState({ forceGhProbe: true });
+        break;
+      case "openGhSettings":
+        await vscode.commands.executeCommand(
+          "workbench.action.openSettings",
+          "cursorSubscription.supervisorGitHubTrigger",
+        );
+        break;
+      case "openDashboard":
+        await vscode.env.openExternal(vscode.Uri.parse("https://cursor.com/dashboard"));
+        break;
+      default:
+        break;
+    }
+  }
+
+  private async hasGitWorkspace(): Promise<boolean> {
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    if (folders.length === 0) {
+      return false;
+    }
+    try {
+      const git = await getGitApi();
+      if (!git) {
+        return false;
+      }
+      return folders.some((folder) => Boolean(git.getRepository(folder.uri)));
+    } catch {
+      return false;
+    }
+  }
+
+  private async detectGhCli(force = false): Promise<boolean> {
+    const now = Date.now();
+    if (
+      !force
+      && this.ghCliAvailabilityCache
+      && now - this.ghCliAvailabilityCache.at < 60_000
+    ) {
+      return this.ghCliAvailabilityCache.value;
+    }
+    const cwd = resolveWorkspaceFolder()?.uri.fsPath
+      ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+      ?? process.cwd();
+    let available = false;
+    try {
+      await runExecutableCommand("gh", ["--version"], {
+        cwd,
+        timeout: 5_000,
+        maxBuffer: 64 * 1024,
+        env: githubCliEnv(),
+      });
+      available = true;
+    } catch {
+      available = false;
+    }
+    this.ghCliAvailabilityCache = { value: available, at: now };
+    return available;
+  }
+
+  private async publishSetupChecklistState(options?: {
+    forceGhProbe?: boolean;
+  }): Promise<void> {
+    if (!this.webviewReady) {
+      return;
+    }
+    const dismissed = this.context.workspaceState.get<boolean>(
+      SETUP_CHECKLIST_DISMISSED_KEY,
+      false,
+    );
+    const apiKeyConfigured = Boolean(await this.context.secrets.get(API_KEY_SECRET));
+    const hasWorkspace = (vscode.workspace.workspaceFolders?.length ?? 0) > 0;
+    const gitReady = await this.hasGitWorkspace();
+    const permissionsConfirmed = this.context.workspaceState.get<boolean>(
+      SETUP_CHECKLIST_PERMISSIONS_CONFIRMED_KEY,
+      false,
+    );
+    const approvalMode = this.selectedApprovalMode();
+    // Require an explicit confirm (or mode change, which sets the flag) so the
+    // Windows default alone does not auto-complete the permissions step.
+    const ghSkipped = this.context.workspaceState.get<boolean>(
+      SETUP_CHECKLIST_GH_SKIPPED_KEY,
+      false,
+    );
+    const ghAvailable = await this.detectGhCli(options?.forceGhProbe === true);
+    const ghDone = ghAvailable || ghSkipped;
+    this.post({
+      type: "setupChecklistState",
+      visible: !dismissed,
+      dismissed,
+      sandboxSupported: SUPPORTS_LOCAL_SANDBOX,
+      approvalMode,
+      steps: {
+        apiKey: { complete: apiKeyConfigured },
+        workspaceTrust: { complete: vscode.workspace.isTrusted },
+        gitWorkspace: { complete: hasWorkspace && gitReady, hasWorkspace, gitReady },
+        permissions: { complete: permissionsConfirmed, mode: approvalMode },
+        gh: { complete: ghDone, available: ghAvailable, optional: true },
+      },
+    });
   }
 
   private async publishModels(apiKey: string): Promise<void> {

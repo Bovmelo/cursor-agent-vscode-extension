@@ -83,3 +83,47 @@ jobs:
           files: '*.vsix'
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  # Marketplace publish is optional: set repo secret VSCE_PAT (Azure DevOps PAT with
+  # Marketplace publish scope). This job always runs after the GitHub Release; the
+  # publish step is skipped when VSCE_PAT is unset so multi-platform VSIX artifacts
+  # still succeed. vsce reads VSCE_PAT from the environment (do not pass --pat).
+  # Do not commit PATs.
+  publish-marketplace:
+    needs: release
+    runs-on: ubuntu-latest
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.13'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download platform VSIX files
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vsix-*
+          merge-multiple: true
+
+      - name: Publish to Visual Studio Marketplace
+        if: env.VSCE_PAT != ''
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          vsixes=(*.vsix)
+          if [ "${#vsixes[@]}" -eq 0 ]; then
+            echo "::error::No VSIX artifacts found to publish"
+            exit 1
+          fi
+          for vsix in "${vsixes[@]}"; do
+            echo "Publishing ${vsix}"
+            npm run publish -- --packagePath "$vsix"
+          done

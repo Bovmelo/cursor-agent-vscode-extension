@@ -5,6 +5,7 @@
   "command.openSettings": "Cursor: AI機能の設定を開く",
   "command.setApiKey": "Cursor: APIキーを設定",
   "command.clearApiKey": "Cursor: APIキーを削除",
+  "command.showSetupChecklist": "Cursor: セットアップチェックリストを表示",
   "command.newChat": "Cursor: 新規チャット",
   "command.findInChat": "Cursor: 会話内を検索",
   "command.generateCommitMessage": "Cursor: コミットメッセージを生成",

@@ -5,7 +5,7 @@ Evidence-based notes for agents. No secrets. Refresh with **Cursor: Refresh Proj
 ## What this is
 
 - Marketplace id: `ark4ez.cursor-subscription-for-vscode`
-- VS Code extension (`engines.vscode`: `^1.100.0`) that runs **local Cursor agents** with a user API key via `@cursor/sdk` (beta)
+- VS Code extension (`engines.vscode`: `^1.101.0`) that runs **local Cursor agents** with a user API key via `@cursor/sdk` (beta)
 - Depends on built-in `vscode.git`; GitHub CLI (`gh`) for PR / Task Pipeline / Supervisor GitHub scans
 - Node runtime expectation: **22.13+** (SDK local agent)
 
@@ -17,9 +17,10 @@ Evidence-based notes for agents. No secrets. Refresh with **Cursor: Refresh Proj
 | `src/webviewController.ts` | Agent sidebar webview: HTML/CSS/client JS template (~6k lines) |
 | `src/agentFactory.ts` | SDK `Agent.create` / `resume`, sandbox fallback, built-in subagents |
 | `src/chatRuntime.ts` | Per-conversation mutable run state |
+| `src/chatSendQueue.ts` | Pure chat enqueue / interrupt / parallel-slot helpers (wired from `extension.ts`; re-exported via `safety.ts` where needed) |
 | `src/chatTypes.ts` | Conversation / queue / profile types |
 | `src/conversationStore.ts` | Persist/restore transcripts in workspace state |
-| `src/safety.ts` | Approval modes, queue helpers, path/baseline apply guards, webview message parse |
+| `src/safety.ts` | Approval modes, path/baseline apply guards, webview message parse (queue helpers re-exported from `chatSendQueue.ts`) |
 | `src/isolatedWorktree.ts` | Prepare/collect/apply/cleanup isolated edits + AI conflict resolution |
 | `src/worktreeLifecycle.ts` | Managed worktree create/remove, node_modules link, orphan cleanup |
 | `src/parallelOwnership.ts` | File ownership leases + FIFO apply queue |
@@ -99,8 +100,8 @@ Default verification discovery (change sessions): npm scripts named `validate`, 
 
 | Task | Start here |
 | --- | --- |
-| New chat command / send behavior | `extension.ts` (`enqueueMessage` / `send`), `safety.ts` queue helpers |
-| Chat UI control | `webviewController.ts` |
+| New chat command / send behavior | `extension.ts` (`enqueueMessage` / `send`), `chatSendQueue.ts` |
+| Chat UI / setup checklist | `webviewController.ts` (sidebar checklist + host `setupChecklistState`) |
 | Approval / safe worktree policy | `safety.ts` (`shouldUseIsolatedWorktree`, modes) |
 | Worktree apply | `isolatedWorktree.ts`, `parallelOwnership.ts` |
 | Supervisor inbox | `supervisor.ts`, `supervisorScheduling.ts` |

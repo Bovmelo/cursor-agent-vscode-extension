@@ -240,6 +240,31 @@ export class WebviewController {
           openCandidate: "開く",
           experimentsTitle: "比較実験",
           noAssistantYet: "まだ応答がありません",
+          setupChecklistTitle: "セットアップ",
+          setupChecklistDismiss: "閉じる",
+          setupChecklistReopen: "セットアップチェックリストを表示",
+          setupChecklistComplete: "完了",
+          setupChecklistOptional: "任意",
+          setupStepApiKey: "APIキー",
+          setupStepApiKeyDesc: "Cursor Dashboard のユーザーAPIキーを VS Code に設定します。",
+          setupStepWorkspaceTrust: "ワークスペースの信頼",
+          setupStepWorkspaceTrustDesc: "Restricted Mode のままでは自律自動化が制限されます。信頼して続行してください。",
+          setupStepGitWorkspace: "Git ワークスペース",
+          setupStepGitWorkspaceDesc: "安全worktree・Supervisor・チェックポイントのため、Git リポジトリを開きます。",
+          setupStepPermissions: "実行権限",
+          setupStepPermissionsDesc: "＋メニューで実行権限モードを確認し、内容を把握したうえで確定してください。",
+          setupStepGh: "GitHub CLI（任意）",
+          setupStepGhDesc: "PR 作成と Supervisor の GitHub トリガーに gh が必要です。後でスキップもできます。",
+          setupActionSetApiKey: "APIキーを設定",
+          setupActionTrustWorkspace: "ワークスペースを信頼",
+          setupActionOpenFolder: "フォルダーを開く",
+          setupActionRefreshGit: "Git を再確認",
+          setupActionReviewPermissions: "実行権限を確認",
+          setupActionConfirmPermissions: "確認済みにする",
+          setupActionCheckGh: "gh を確認",
+          setupActionSkipGh: "スキップ",
+          setupActionOpenGhSettings: "GitHub トリガー設定を開く",
+          setupActionOpenDashboard: "Dashboardを開く",
         }
       : {
           history: "Conversation history",
@@ -416,6 +441,31 @@ export class WebviewController {
           openCandidate: "Open",
           experimentsTitle: "Compare experiments",
           noAssistantYet: "No assistant reply yet",
+          setupChecklistTitle: "Setup",
+          setupChecklistDismiss: "Dismiss",
+          setupChecklistReopen: "Show setup checklist",
+          setupChecklistComplete: "Done",
+          setupChecklistOptional: "Optional",
+          setupStepApiKey: "API key",
+          setupStepApiKeyDesc: "Generate a user API key in Cursor Dashboard and set it in VS Code.",
+          setupStepWorkspaceTrust: "Workspace trust",
+          setupStepWorkspaceTrustDesc: "Restricted Mode limits autonomous automation. Trust the workspace when you intend to use it.",
+          setupStepGitWorkspace: "Git workspace",
+          setupStepGitWorkspaceDesc: "Open a Git repository folder for Safe worktree, Supervisor, and checkpoints.",
+          setupStepPermissions: "Execution permissions",
+          setupStepPermissionsDesc: "Review the permission mode in the + menu, then confirm you have checked it.",
+          setupStepGh: "GitHub CLI (optional)",
+          setupStepGhDesc: "Needed for PR creation and Supervisor GitHub triggers. You can skip for now.",
+          setupActionSetApiKey: "Set API key",
+          setupActionTrustWorkspace: "Trust workspace",
+          setupActionOpenFolder: "Open folder",
+          setupActionRefreshGit: "Refresh Git",
+          setupActionReviewPermissions: "Review permissions",
+          setupActionConfirmPermissions: "I've reviewed",
+          setupActionCheckGh: "Check gh",
+          setupActionSkipGh: "Skip",
+          setupActionOpenGhSettings: "Open GitHub trigger settings",
+          setupActionOpenDashboard: "Open Dashboard",
         };
 
     return /* html */ `<!doctype html>
@@ -1512,6 +1562,117 @@ export class WebviewController {
       background: var(--vscode-button-secondaryBackground);
     }
 
+    /* ---- Setup checklist ---- */
+    #setupChecklist {
+      margin: 4px 14px;
+      padding: 10px 12px;
+      background: var(--vscode-editor-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: var(--radius-card);
+    }
+    #setupChecklist[hidden] { display: none; }
+    #setupChecklistHeader {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    #setupChecklistTitle {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--vscode-foreground);
+    }
+    #setupChecklistDismiss {
+      padding: 2px 8px;
+      border: 0;
+      border-radius: 6px;
+      font: inherit;
+      font-size: 11px;
+      cursor: pointer;
+      color: var(--vscode-foreground);
+      background: transparent;
+      opacity: 0.85;
+    }
+    #setupChecklistDismiss:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground); }
+    #setupChecklistSteps {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .setup-step {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 6px 0;
+      border-top: 1px solid color-mix(in srgb, var(--vscode-panel-border) 70%, transparent);
+    }
+    .setup-step:first-child { border-top: 0; padding-top: 0; }
+    .setup-step-head {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+    }
+    .setup-step-mark {
+      flex: 0 0 auto;
+      width: 16px;
+      height: 16px;
+      margin-top: 1px;
+      border-radius: 50%;
+      border: 1.5px solid var(--vscode-descriptionForeground);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 10px;
+      line-height: 1;
+      color: var(--vscode-descriptionForeground);
+    }
+    .setup-step.complete .setup-step-mark {
+      border-color: var(--vscode-testing-iconPassed, var(--vscode-charts-green, #89d185));
+      color: var(--vscode-testing-iconPassed, var(--vscode-charts-green, #89d185));
+      background: color-mix(in srgb, var(--vscode-testing-iconPassed, #89d185) 18%, transparent);
+    }
+    .setup-step-title {
+      font-size: 12px;
+      font-weight: 600;
+      line-height: 1.35;
+    }
+    .setup-step-badge {
+      margin-left: 6px;
+      font-size: 10px;
+      font-weight: 500;
+      color: var(--vscode-descriptionForeground);
+    }
+    .setup-step.complete .setup-step-badge {
+      color: var(--vscode-testing-iconPassed, var(--vscode-charts-green, #89d185));
+    }
+    .setup-step-desc {
+      margin: 0 0 0 24px;
+      font-size: 11px;
+      line-height: 1.4;
+      color: var(--vscode-descriptionForeground);
+    }
+    .setup-step-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 2px 0 0 24px;
+    }
+    .setup-step-actions button {
+      padding: 4px 10px;
+      border: 0;
+      border-radius: 7px;
+      font: inherit;
+      font-size: 11px;
+      cursor: pointer;
+      color: var(--vscode-button-foreground);
+      background: var(--vscode-button-background);
+    }
+    .setup-step-actions button.secondary {
+      color: var(--vscode-foreground);
+      background: var(--vscode-button-secondaryBackground);
+    }
+
     /* ---- Composer card ---- */
     .composer-wrap {
       display: flex;
@@ -2098,6 +2259,8 @@ export class WebviewController {
       #scroller { padding: 4px 6px; }
       #auth { margin: 4px 8px; padding: 10px; }
       #auth .row { flex-wrap: wrap; }
+      #setupChecklist { margin: 4px 8px; padding: 8px 10px; }
+      .setup-step-actions button { width: auto; }
       .composer-wrap { padding: 4px 6px 2px; }
       .card {
         padding: 6px 8px 5px;
@@ -2362,6 +2525,13 @@ export class WebviewController {
           </div>
         </div>
         <div class="more-menu-separator"></div>
+        <button id="showSetupChecklistButton" class="more-menu-item" type="button" role="menuitem">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3.5 3.5h9v9h-9z"/>
+            <path d="M5.5 7l1.5 1.5L10.5 5"/>
+          </svg>
+          <span>${ui.setupChecklistReopen}</span>
+        </button>
         <button id="keyButton" class="more-menu-item" type="button" role="menuitem">
           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="5" cy="8" r="3"/>
@@ -2394,6 +2564,14 @@ export class WebviewController {
       <button id="connectButton" type="button">${ui.setApiKey}</button>
       <button id="dashboardButton" class="secondary" type="button">${ui.openDashboard}</button>
     </div>
+  </div>
+
+  <div id="setupChecklist" hidden>
+    <div id="setupChecklistHeader">
+      <span id="setupChecklistTitle">${ui.setupChecklistTitle}</span>
+      <button id="setupChecklistDismiss" type="button">${ui.setupChecklistDismiss}</button>
+    </div>
+    <div id="setupChecklistSteps"></div>
   </div>
 
   <div id="chatFindBar" hidden>
@@ -2632,6 +2810,12 @@ export class WebviewController {
     const workspaceLabel = document.getElementById("workspaceLabel");
     const auth = document.getElementById("auth");
     const authChip = document.getElementById("authChip");
+    const setupChecklist = document.getElementById("setupChecklist");
+    const setupChecklistSteps = document.getElementById("setupChecklistSteps");
+    const setupChecklistDismiss = document.getElementById("setupChecklistDismiss");
+    const showSetupChecklistButton = document.getElementById("showSetupChecklistButton");
+    let lastChecklistVisible = false;
+    let checklistForcedOpen = false;
     const sandboxBanner = document.getElementById("sandboxBanner");
     const sandboxBannerToggle = document.getElementById("sandboxBannerToggle");
     const sandboxBannerText = document.getElementById("sandboxBannerText");
@@ -3121,6 +3305,174 @@ export class WebviewController {
       addMenu.hidden = false;
       setAddMenuExpandedState(true);
       focusAddMenuItem(0);
+    }
+
+    function focusApprovalModeMenu() {
+      setMoreMenuOpen(false);
+      openAddMenu(attachButton);
+    }
+
+    function setupChecklistRequiredComplete(steps) {
+      if (!steps) return false;
+      return steps.apiKey?.complete === true
+        && steps.workspaceTrust?.complete === true
+        && steps.gitWorkspace?.complete === true
+        && steps.permissions?.complete === true;
+    }
+
+    function appendSetupAction(row, label, options) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      if (options.secondary) button.className = "secondary";
+      button.addEventListener("click", options.onClick);
+      row.appendChild(button);
+    }
+
+    function renderSetupChecklist(state) {
+      const steps = state?.steps || {};
+      const becameVisible = state?.visible === true && !lastChecklistVisible;
+      lastChecklistVisible = state?.visible === true;
+      if (!state?.visible) {
+        checklistForcedOpen = false;
+      } else if (becameVisible) {
+        checklistForcedOpen = true;
+      }
+      const allRequired = setupChecklistRequiredComplete(steps);
+      if (allRequired && !becameVisible) {
+        checklistForcedOpen = false;
+      }
+      const show = state?.visible === true && (!allRequired || checklistForcedOpen);
+      setupChecklist.hidden = !show;
+      if (!show) {
+        setupChecklistSteps.innerHTML = "";
+        return;
+      }
+
+      const defs = [
+        {
+          id: "apiKey",
+          title: i18n.setupStepApiKey,
+          desc: i18n.setupStepApiKeyDesc,
+          complete: steps.apiKey?.complete === true,
+          renderActions(row) {
+            if (steps.apiKey?.complete) return;
+            appendSetupAction(row, i18n.setupActionSetApiKey, {
+              onClick: () => vscode.postMessage({ type: "setupChecklistAction", id: "apiKey" }),
+            });
+            appendSetupAction(row, i18n.setupActionOpenDashboard, {
+              secondary: true,
+              onClick: () => vscode.postMessage({ type: "setupChecklistAction", id: "openDashboard" }),
+            });
+          },
+        },
+        {
+          id: "workspaceTrust",
+          title: i18n.setupStepWorkspaceTrust,
+          desc: i18n.setupStepWorkspaceTrustDesc,
+          complete: steps.workspaceTrust?.complete === true,
+          renderActions(row) {
+            if (steps.workspaceTrust?.complete) return;
+            appendSetupAction(row, i18n.setupActionTrustWorkspace, {
+              onClick: () => vscode.postMessage({ type: "setupChecklistAction", id: "workspaceTrust" }),
+            });
+          },
+        },
+        {
+          id: "gitWorkspace",
+          title: i18n.setupStepGitWorkspace,
+          desc: i18n.setupStepGitWorkspaceDesc,
+          complete: steps.gitWorkspace?.complete === true,
+          renderActions(row) {
+            if (steps.gitWorkspace?.complete) return;
+            const label = steps.gitWorkspace?.hasWorkspace
+              ? i18n.setupActionRefreshGit
+              : i18n.setupActionOpenFolder;
+            appendSetupAction(row, label, {
+              onClick: () => vscode.postMessage({ type: "setupChecklistAction", id: "gitWorkspace" }),
+            });
+          },
+        },
+        {
+          id: "permissions",
+          title: i18n.setupStepPermissions,
+          desc: i18n.setupStepPermissionsDesc,
+          complete: steps.permissions?.complete === true,
+          renderActions(row) {
+            if (steps.permissions?.complete) return;
+            appendSetupAction(row, i18n.setupActionReviewPermissions, {
+              onClick: () => vscode.postMessage({ type: "setupChecklistAction", id: "permissions" }),
+            });
+            appendSetupAction(row, i18n.setupActionConfirmPermissions, {
+              secondary: true,
+              onClick: () => vscode.postMessage({ type: "confirmSetupChecklistStep", id: "permissions" }),
+            });
+          },
+        },
+        {
+          id: "gh",
+          title: i18n.setupStepGh,
+          desc: i18n.setupStepGhDesc,
+          complete: steps.gh?.complete === true,
+          optional: true,
+          renderActions(row) {
+            if (steps.gh?.complete) return;
+            appendSetupAction(row, i18n.setupActionCheckGh, {
+              onClick: () => vscode.postMessage({ type: "setupChecklistAction", id: "gh" }),
+            });
+            appendSetupAction(row, i18n.setupActionSkipGh, {
+              secondary: true,
+              onClick: () => vscode.postMessage({ type: "confirmSetupChecklistStep", id: "gh" }),
+            });
+            appendSetupAction(row, i18n.setupActionOpenGhSettings, {
+              secondary: true,
+              onClick: () => vscode.postMessage({ type: "setupChecklistAction", id: "openGhSettings" }),
+            });
+          },
+        },
+      ];
+
+      setupChecklistSteps.innerHTML = "";
+      for (const def of defs) {
+        const step = document.createElement("div");
+        step.className = "setup-step" + (def.complete ? " complete" : "");
+        const head = document.createElement("div");
+        head.className = "setup-step-head";
+        const mark = document.createElement("span");
+        mark.className = "setup-step-mark";
+        mark.textContent = def.complete ? "✓" : "";
+        mark.setAttribute("aria-hidden", "true");
+        const titleWrap = document.createElement("div");
+        const title = document.createElement("span");
+        title.className = "setup-step-title";
+        title.textContent = def.title;
+        titleWrap.appendChild(title);
+        if (def.complete) {
+          const badge = document.createElement("span");
+          badge.className = "setup-step-badge";
+          badge.textContent = i18n.setupChecklistComplete;
+          titleWrap.appendChild(badge);
+        } else if (def.optional) {
+          const badge = document.createElement("span");
+          badge.className = "setup-step-badge";
+          badge.textContent = i18n.setupChecklistOptional;
+          titleWrap.appendChild(badge);
+        }
+        head.appendChild(mark);
+        head.appendChild(titleWrap);
+        step.appendChild(head);
+        const desc = document.createElement("p");
+        desc.className = "setup-step-desc";
+        desc.textContent = def.desc;
+        step.appendChild(desc);
+        const actions = document.createElement("div");
+        actions.className = "setup-step-actions";
+        def.renderActions(actions);
+        if (actions.childElementCount > 0) {
+          step.appendChild(actions);
+        }
+        setupChecklistSteps.appendChild(step);
+      }
     }
 
     function closeAddMenu(options = {}) {
@@ -5861,6 +6213,14 @@ export class WebviewController {
       setMoreMenuOpen(false);
       vscode.postMessage({ type: "setApiKey" });
     });
+    showSetupChecklistButton.addEventListener("click", () => {
+      setMoreMenuOpen(false);
+      checklistForcedOpen = true;
+      vscode.postMessage({ type: "showSetupChecklist" });
+    });
+    setupChecklistDismiss.addEventListener("click", () => {
+      vscode.postMessage({ type: "dismissSetupChecklist" });
+    });
     authChip.addEventListener("click", () => vscode.postMessage({ type: "setApiKey" }));
     document.getElementById("connectButton").addEventListener("click", () => vscode.postMessage({ type: "setApiKey" }));
     document.getElementById("dashboardButton").addEventListener("click", () => vscode.postMessage({ type: "openDashboard" }));
@@ -6121,6 +6481,12 @@ export class WebviewController {
         case "authRequired":
           auth.style.display = "block";
           authChip.style.display = "inline-flex";
+          break;
+        case "setupChecklistState":
+          renderSetupChecklist(data);
+          break;
+        case "focusApprovalModeMenu":
+          focusApprovalModeMenu();
           break;
         case "notificationAndSoundSettings":
           notificationToggle.checked = data.notification === true;

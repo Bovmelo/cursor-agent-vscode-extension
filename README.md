@@ -149,12 +149,12 @@ Usage follows **your** Cursor plan. This extension does not read the Cursor desk
 
 1. Install this extension from the Marketplace (`ark4ez.cursor-subscription-for-vscode`).
 2. Open the **Cursor** view in the Activity Bar (start with **Agent**).
-3. Run **Cursor: Set API Key** and paste your key from the [Cursor Dashboard](https://cursor.com/dashboard).
-4. If VS Code opened the folder as Restricted, trust the workspace when you intend to use autonomous automation.
+3. Follow the Agent sidebar setup checklist (API key, workspace trust, Git workspace, permission mode, optional `gh`), or run **Cursor: Set API Key** from the Command Palette and paste your key from the [Cursor Dashboard](https://cursor.com/dashboard).
+4. If VS Code opened the folder as Restricted Mode, use the checklist **Trust workspace** step (or the Restricted Mode banner / status bar) when you intend to use autonomous automation.
 5. Confirm the workspace is a Git repository for worktree-based safety features; optionally run `gh auth login` for PR and GitHub Supervisor triggers.
-6. Pick a permission mode in the chat footer (Windows defaults to Safe worktree).
+6. Confirm the permission mode in the Agent + menu (Windows defaults to Safe worktree). Reopen the checklist anytime from the Agent **More** menu (**Show setup checklist**) or **Cursor: Show Setup Checklist** in the Command Palette.
 
-The API key is stored in VS Code SecretStorage (not in settings or the workspace). Search settings for `cursorSubscription`, or open **Cursor: Open AI Feature Settings**, for feature toggles.
+The API key is stored in VS Code SecretStorage (not in settings, workspace state, or logs). Search settings for `cursorSubscription`, or open **Cursor: Open AI Feature Settings**, for feature toggles.
 
 ## Notes
 
@@ -163,6 +163,7 @@ The API key is stored in VS Code SecretStorage (not in settings or the workspace
 
 ## Links
 
+- [Roadmap (0.2.x direction)](./ROADMAP.md)
 - [Source code](https://github.com/ark4ez/cursor-agent-vscode-extension)
 - [Issues](https://github.com/ark4ez/cursor-agent-vscode-extension/issues)
 - [Changelog](https://github.com/ark4ez/cursor-agent-vscode-extension/blob/master/CHANGELOG.md)
@@ -280,9 +281,17 @@ WindowsではCursorローカルSDKのサンドボックスを利用できませ�
 
 1. Marketplace からインストール（`ark4ez.cursor-subscription-for-vscode`）
 2. Activity Bar の **Cursor** を開く（最初は **エージェント**）
-3. **Cursor: APIキーを設定** でキーを入力（SecretStorage に保存）
-4. Restricted で開いている場合、自律自動化を使うならワークスペースを信頼する
+3. Agent サイドバーのセットアップチェックリスト（APIキー、ワークスペースの信頼、Git、実行権限、任意の `gh`）に従うか、コマンドパレットから **Cursor: APIキーを設定** を実行し、[Cursor Dashboard](https://cursor.com/dashboard) のキーを貼り付ける（SecretStorage に保存）
+4. Restricted Mode で開いている場合、自律自動化を使うならチェックリストの **ワークスペースを信頼**（またはバナー / ステータスバー）から信頼する
 5. worktree 系の安全機能のため Git リポジトリであることを確認し、必要なら `gh auth login` を実行
-6. チャットフッタで実行権限モードを選ぶ（Windows の既定は安全worktree）
+6. Agent の＋メニューで実行権限モードを確認する（Windows の既定は安全worktree）。チェックリストは Agent の **その他** メニュー（**セットアップチェックリストを表示**）またはコマンドパレットの **Cursor: セットアップチェックリストを表示** からいつでも再開できる
 
-設定は `cursorSubscription` で検索するか、**Cursor: AI機能の設定を開く** から変更できます。
+APIキーは設定・workspace state・ログには保存しません。設定は `cursorSubscription` で検索するか、**Cursor: AI機能の設定を開く** から変更できます。
+
+### リンク
+
+- [ロードマップ（0.2.x 方針）](./ROADMAP.md)
+- [ソースコード](https://github.com/ark4ez/cursor-agent-vscode-extension)
+- [Issues](https://github.com/ark4ez/cursor-agent-vscode-extension/issues)
+- [Changelog](https://github.com/ark4ez/cursor-agent-vscode-extension/blob/master/CHANGELOG.md)
+- [License (MIT)](https://github.com/ark4ez/cursor-agent-vscode-extension/blob/master/LICENSE)

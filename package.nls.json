@@ -5,6 +5,7 @@
   "command.openSettings": "Cursor: Open AI Feature Settings",
   "command.setApiKey": "Cursor: Set API Key",
   "command.clearApiKey": "Cursor: Clear API Key",
+  "command.showSetupChecklist": "Cursor: Show Setup Checklist",
   "command.newChat": "Cursor: New Chat",
   "command.findInChat": "Cursor: Find in Chat",
   "command.generateCommitMessage": "Cursor: Generate Commit Message",

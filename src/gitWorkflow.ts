@@ -4,12 +4,23 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { branchStartsAtBase, slugifyBranchTitle } from "./pureUtils.js";
+import {
+  extractPullRequestUrl,
+  isUnsafeGitRefName,
+  sanitizePullRequestTitle,
+} from "./gitWorkflowPure.js";
 import { githubCliEnv } from "./shellEnv.js";
 import { runExecutableCommand } from "./shellCommand.js";
 import {
   pullRequestRecoveryMessage,
   type PullRequestRecovery,
 } from "./gitWorkflowRecovery.js";
+
+export {
+  extractPullRequestUrl,
+  isUnsafeGitRefName,
+  sanitizePullRequestTitle,
+} from "./gitWorkflowPure.js";
 
 async function run(
   cwd: string,
@@ -70,7 +81,7 @@ export async function createBranchCommitAndPullRequest(options: {
   const baseBranch = options.baseBranch?.trim()
     || vscode.workspace.getConfiguration("cursorSubscription").get<string>("defaultBaseBranch", "main")
     || "main";
-  if (baseBranch.startsWith("-")) {
+  if (isUnsafeGitRefName(baseBranch)) {
     throw new Error("The pull-request base branch is invalid.");
   }
   const stamp = new Date().toISOString().slice(0, 10).replaceAll("-", "");
@@ -159,7 +170,7 @@ export async function createBranchCommitAndPullRequest(options: {
         "pr",
         "create",
         "--title",
-        title.replace(/[\r\n]+/g, " ").slice(0, 120),
+        sanitizePullRequestTitle(title),
         "--body-file",
         bodyFile,
         "--base",
@@ -170,7 +181,7 @@ export async function createBranchCommitAndPullRequest(options: {
     } finally {
       await rm(bodyFile, { force: true }).catch(() => undefined);
     }
-    const url = pr.stdout.trim().split(/\r?\n/).find((line) => /^https?:\/\//.test(line));
+    const url = extractPullRequestUrl(pr.stdout);
     return { branch, url };
   } catch (error) {
     const currentHead = await run(root, "git", ["rev-parse", "HEAD"])
@@ -207,7 +218,7 @@ export async function checkoutPreservedPullRequestBranch(
         : "Checking out the preserved branch requires a trusted workspace.",
     );
   }
-  if (recovery.branch.startsWith("-")) {
+  if (isUnsafeGitRefName(recovery.branch)) {
     throw new Error(
       japanese ? "保持ブランチ名が無効です。" : "The preserved branch name is invalid.",
     );
@@ -251,7 +262,7 @@ export async function retryPullRequestCreation(options: {
   const baseBranch = vscode.workspace.getConfiguration("cursorSubscription")
     .get<string>("defaultBaseBranch", "main")
     || "main";
-  if (baseBranch.startsWith("-")) {
+  if (isUnsafeGitRefName(baseBranch)) {
     throw new Error("The pull-request base branch is invalid.");
   }
 
@@ -280,7 +291,7 @@ export async function retryPullRequestCreation(options: {
         "pr",
         "create",
         "--title",
-        title.replace(/[\r\n]+/g, " ").slice(0, 120),
+        sanitizePullRequestTitle(title),
         "--body-file",
         bodyFile,
         "--base",
@@ -291,7 +302,7 @@ export async function retryPullRequestCreation(options: {
     } finally {
       await rm(bodyFile, { force: true }).catch(() => undefined);
     }
-    const url = pr.stdout.trim().split(/\r?\n/).find((line) => /^https?:\/\//.test(line));
+    const url = extractPullRequestUrl(pr.stdout);
     return { branch: recovery.branch, url };
   } catch (error) {
     if (error instanceof PullRequestCreationError) {

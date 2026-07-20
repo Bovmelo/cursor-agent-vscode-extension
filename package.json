@@ -96,6 +96,10 @@
         "title": "%command.clearApiKey%"
       },
       {
+        "command": "cursorSubscription.showSetupChecklist",
+        "title": "%command.showSetupChecklist%"
+      },
+      {
         "command": "cursorSubscription.newChat",
         "title": "%command.newChat%"
       },

@@ -235,95 +235,20 @@ export function nextSupervisorStatusAfterDecisions(
   return "completed";
 }
 
-export type QueueKind = "queued" | "interrupt";
-
-export interface QueueMessageItem {
-  id: string;
-  conversationId: string;
-  kind: QueueKind;
-}
-
-export function enqueueChatMessage<T extends QueueMessageItem>(
-  queue: readonly T[],
-  item: T,
-): T[] {
-  if (item.kind === "interrupt") {
-    return [item, ...queue];
-  }
-  return [...queue, item];
-}
-
-export function removeQueuedMessages(
-  queue: readonly QueueMessageItem[],
-  predicate: (item: QueueMessageItem) => boolean,
-): QueueMessageItem[] {
-  return queue.filter((item) => !predicate(item));
-}
-
-export function takeNextQueuedMessage<T extends QueueMessageItem>(
-  queue: readonly T[],
-  conversationId: string,
-): { next?: T; remaining: T[] } {
-  const index = queue.findIndex((item) => item.conversationId === conversationId);
-  if (index < 0) {
-    return { remaining: [...queue] };
-  }
-  const remaining = [...queue];
-  const [next] = remaining.splice(index, 1);
-  return { next, remaining };
-}
-
-/**
- * Put a message back after a drain attempt failed to start a run.
- * Preserves per-conversation order; interrupts stay ahead of other work.
- */
-export function requeueUnstartedMessage<T extends QueueMessageItem>(
-  queue: readonly T[],
-  item: T,
-): T[] {
-  if (item.kind === "interrupt") {
-    return [item, ...queue];
-  }
-  const insertAt = queue.findIndex((candidate) => candidate.conversationId === item.conversationId);
-  if (insertAt < 0) {
-    return [...queue, item];
-  }
-  return [...queue.slice(0, insertAt), item, ...queue.slice(insertAt)];
-}
-
-export type ConversationRunState = "idle" | "running" | "queued" | "cancelling";
-
-export function conversationRunState(input: {
-  busy: boolean;
-  pendingCancel: boolean;
-  queueCount: number;
-}): ConversationRunState {
-  if (input.busy && input.pendingCancel) {
-    return "cancelling";
-  }
-  if (input.busy) {
-    return "running";
-  }
-  if (input.queueCount > 0) {
-    return "queued";
-  }
-  return "idle";
-}
-
-/**
- * When an interrupt is enqueued for a busy conversation, cancel the active run
- * but keep other conversations' queues intact.
- */
-export function shouldCancelOnInterrupt(busy: boolean, kind: QueueKind): boolean {
-  return kind === "interrupt" && busy;
-}
-
-export function canStartAnotherParallelAgent(
-  activeRuns: number,
-  maxParallel: number,
-): boolean {
-  return activeRuns < Math.max(1, maxParallel);
-}
+/** Re-export chat queue helpers for backward-compatible imports. */
+export {
+  canStartAnotherParallelAgent,
+  conversationRunState,
+  enqueueChatMessage,
+  removeQueuedMessages,
+  requeueUnstartedMessage,
+  requeueUnstartedMessages,
+  shouldCancelOnInterrupt,
+  takeNextQueuedMessage,
+  type ConversationRunState,
+  type QueueKind,
+  type QueueMessageItem,
+} from "./chatSendQueue.js";
 
 export type SafetyApprovalMode = "safe-worktree" | "auto-review" | "full-access";
 
@@ -448,7 +373,11 @@ export type WebviewIncomingType =
   | "openDashboard"
   | "openSettings"
   | "openExternal"
-  | "pickWorkspaceFolder";
+  | "pickWorkspaceFolder"
+  | "dismissSetupChecklist"
+  | "showSetupChecklist"
+  | "confirmSetupChecklistStep"
+  | "setupChecklistAction";
 
 const WEBVIEW_TYPES = new Set<string>([
   "ready",
@@ -492,6 +421,25 @@ const WEBVIEW_TYPES = new Set<string>([
   "openSettings",
   "openExternal",
   "pickWorkspaceFolder",
+  "dismissSetupChecklist",
+  "showSetupChecklist",
+  "confirmSetupChecklistStep",
+  "setupChecklistAction",
+]);
+
+const SETUP_CHECKLIST_CONFIRM_IDS = new Set([
+  "permissions",
+  "gh",
+]);
+
+const SETUP_CHECKLIST_ACTION_IDS = new Set([
+  "apiKey",
+  "gitWorkspace",
+  "permissions",
+  "gh",
+  "openGhSettings",
+  "openDashboard",
+  "workspaceTrust",
 ]);
 
 export interface ParsedWebviewMessage {
@@ -599,6 +547,24 @@ export function parseWebviewMessage(raw: unknown): ParsedWebviewMessage | undefi
     && typeof message.path !== "string"
   ) {
     return undefined;
+  }
+
+  if (type === "confirmSetupChecklistStep") {
+    if (
+      typeof message.id !== "string"
+      || !SETUP_CHECKLIST_CONFIRM_IDS.has(message.id)
+    ) {
+      return undefined;
+    }
+  }
+
+  if (type === "setupChecklistAction") {
+    if (
+      typeof message.id !== "string"
+      || !SETUP_CHECKLIST_ACTION_IDS.has(message.id)
+    ) {
+      return undefined;
+    }
   }
 
   return {
