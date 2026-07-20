@@ -4,7 +4,13 @@ import {
   buildBackgroundRunCenterState,
   buildRunCenterState,
   buildSupervisorRunCenterState,
+  runCenterRelativePath,
 } from "../out/runCenterCoordinator.js";
+
+test("runCenterRelativePath handles Windows roots on any host platform", () => {
+  assert.equal(runCenterRelativePath("C:\\repo", "C:\\repo\\src\\feature.ts"), "src/feature.ts");
+  assert.equal(runCenterRelativePath("/repo", "/repo/src/feature.ts"), "src/feature.ts");
+});
 
 function conversation(id, title, updatedAt, assistant = {}) {
   return {

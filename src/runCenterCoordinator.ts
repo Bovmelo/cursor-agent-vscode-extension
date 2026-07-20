@@ -1,6 +1,16 @@
 import * as path from "node:path";
 import type { RunCenterState } from "./runCenterModel.js";
 
+/** Relative POSIX path that stays correct when session roots use Windows paths on POSIX CI hosts. */
+export function runCenterRelativePath(root: string, file: string): string {
+  const looksWindows =
+    /^[A-Za-z]:[\\/]/.test(root) ||
+    /^[A-Za-z]:[\\/]/.test(file) ||
+    root.includes("\\") ||
+    file.includes("\\");
+  return (looksWindows ? path.win32 : path).relative(root, file).replaceAll("\\", "/");
+}
+
 export interface RunCenterTranscriptSnapshot {
   readonly role: "user" | "assistant";
   readonly text: string;
@@ -291,7 +301,7 @@ export class RunCenterCoordinator {
       })),
       progress,
       changes: session?.files.map((file) => ({
-        path: path.relative(session.root, file).replaceAll("\\", "/"),
+        path: runCenterRelativePath(session.root, file),
         status: "modified" as const,
         open: {
           command: "cursorSubscription.openSessionFile",
