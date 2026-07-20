@@ -72,12 +72,26 @@ test("diagnostic redaction removes Cursor API key export forms", () => {
   );
   assert.equal(redactDiagnosticText("apiKey cursor-secret-value"), "apiKey <redacted>");
   assert.equal(redactDiagnosticText("APIKEY\tABCDEF0123456789"), "APIKEY\t<redacted>");
+  assert.equal(
+    redactDiagnosticText("cursorApiKey cursor-secret-value"),
+    "cursorApiKey <redacted>",
+  );
+  assert.equal(
+    redactDiagnosticText("CURSOR_API_KEY ABCDEF0123456789"),
+    "CURSOR_API_KEY <redacted>",
+  );
+  assert.equal(
+    redactDiagnosticText("cursor-api-key 'key_0123456789abcdef'"),
+    "cursor-api-key <redacted>",
+  );
 });
 
 test("diagnostic redaction avoids ordinary API key labels and short identifiers", () => {
   assert.equal(
-    redactDiagnosticText("API key is configured; apiKey missing; key_name is a field"),
-    "API key is configured; apiKey missing; key_name is a field",
+    redactDiagnosticText(
+      "API key is configured; apiKey missing; cursorApiKey unset; CURSOR_API_KEY required; key_name is a field",
+    ),
+    "API key is configured; apiKey missing; cursorApiKey unset; CURSOR_API_KEY required; key_name is a field",
   );
 });
 

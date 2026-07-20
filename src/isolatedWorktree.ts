@@ -1130,22 +1130,24 @@ export async function cleanupIsolatedWorktree(
   session: IsolatedWorktreeSession | undefined,
   storageRoot: vscode.Uri,
   onLog?: (message: string) => void,
-): Promise<void> {
+): Promise<boolean> {
   if (!session?.worktreePath) {
-    return;
+    return true;
   }
   const worktree = session.worktreePath;
-  if (await removeManagedWorktree(session.root, worktree, onLog)) {
-    try {
-      await vscode.workspace.fs.delete(vscode.Uri.joinPath(
-        storageRoot,
-        session.baselinesFolder,
-        session.id,
-      ), { recursive: true });
-    } catch {
-      // The baseline directory may already have been cleaned up.
-    }
+  if (!(await removeManagedWorktree(session.root, worktree, onLog))) {
+    return false;
   }
+  try {
+    await vscode.workspace.fs.delete(vscode.Uri.joinPath(
+      storageRoot,
+      session.baselinesFolder,
+      session.id,
+    ), { recursive: true });
+  } catch {
+    // The baseline directory may already have been cleaned up.
+  }
+  return true;
 }
 
 /** Map a path under the isolated worktree to the corresponding main-workspace path. */

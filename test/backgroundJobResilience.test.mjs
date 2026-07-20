@@ -130,6 +130,15 @@ test("background job state machine permits only ordered apply and discard transi
   );
   assert.deepEqual(
     reduceBackgroundJobState(
+      { status: "completed" },
+      { type: "discard-cleanup-failed", error: "cleanup failed" },
+      messages,
+    ),
+    { status: "completed", error: "cleanup failed" },
+    "discard cleanup failures must remain retryable",
+  );
+  assert.deepEqual(
+    reduceBackgroundJobState(
       { status: "applied", error: "cleanup failed" },
       { type: "applied-cleanup-succeeded" },
       messages,
@@ -228,6 +237,10 @@ test("background apply, cancel, and discard claim the latest durable job", () =>
     applySource,
     /applyStarted = true[\s\S]*?applyJob\(job, applyable\)[\s\S]*?apply-uncertain/u,
   );
+  assert.match(
+    applySource,
+    /const worktreeRemoved = await cleanupIsolatedWorktree[\s\S]*?if \(!worktreeRemoved\)[\s\S]*?throw new Error\(WORKTREE_CLEANUP_ERROR\)[\s\S]*?cleanupWorkerProtocol/u,
+  );
   assert.match(applySource, /validateOperationalBoundaries\(job\)/u);
 });
 
@@ -244,6 +257,10 @@ test("interrupted apply recovery fails closed and applied cleanup never reapplie
     backgroundJobsSource.indexOf("public async cleanupApplied("),
     backgroundJobsSource.indexOf("public async discard("),
   );
+  const discardSource = backgroundJobsSource.slice(
+    backgroundJobsSource.indexOf("public async discard("),
+    backgroundJobsSource.indexOf("public getTreeItem("),
+  );
 
   assert.match(pollSource, /recoverInterruptedApply\(current\)/u);
   assert.match(recoverySource, /job\.status !== "applying"/u);
@@ -252,7 +269,14 @@ test("interrupted apply recovery fails closed and applied cleanup never reapplie
   assert.match(cleanupSource, /job\.status !== "applied"/u);
   assert.match(cleanupSource, /isWorkerExitConfirmed\(job\)/u);
   assert.match(cleanupSource, /validateOperationalBoundaries\(job\)/u);
-  assert.match(cleanupSource, /cleanupIsolatedWorktree[\s\S]*?cleanupWorkerProtocol/u);
+  assert.match(
+    cleanupSource,
+    /const worktreeRemoved = await cleanupIsolatedWorktree[\s\S]*?if \(!worktreeRemoved\)[\s\S]*?throw new Error\(WORKTREE_CLEANUP_ERROR\)[\s\S]*?cleanupWorkerProtocol/u,
+  );
+  assert.match(
+    discardSource,
+    /const worktreeRemoved = await cleanupIsolatedWorktree[\s\S]*?if \(!worktreeRemoved\)[\s\S]*?throw new Error\(WORKTREE_CLEANUP_ERROR\)[\s\S]*?cleanupWorkerProtocol[\s\S]*?discard-cleanup-failed[\s\S]*?showErrorMessage[\s\S]*?type: "discard"/u,
+  );
   assert.match(cleanupSource, /applied-cleanup-succeeded[\s\S]*?save\(job\)/u);
   assert.doesNotMatch(cleanupSource, /applyJob\(/u);
 });

@@ -54,6 +54,8 @@ const APPLY_RECOVERY_ERROR =
   "Applying background changes failed after workspace mutation began. Automatic retry is disabled; inspect the workspace and discard the background job when recovery is complete.";
 const INTERRUPTED_APPLY_RECOVERY_ERROR =
   "The extension host stopped while background changes were being applied. The workspace may have been modified. Automatic retry is disabled; inspect the workspace and discard the background job when recovery is complete.";
+const WORKTREE_CLEANUP_ERROR =
+  "The background job worktree could not be removed. Close processes using its files and retry cleanup.";
 
 interface LaunchedBackgroundWorker {
   token: string;
@@ -390,9 +392,14 @@ export class BackgroundJobsController
         changesApplied = true;
         this.applyStateTransition(job, { type: "apply-succeeded" });
         await this.save(job);
-        await cleanupIsolatedWorktree(job.session, this.storageRoot, (message) =>
-          this.output.appendLine(message),
+        const worktreeRemoved = await cleanupIsolatedWorktree(
+          job.session,
+          this.storageRoot,
+          (message) => this.output.appendLine(message),
         );
+        if (!worktreeRemoved) {
+          throw new Error(WORKTREE_CLEANUP_ERROR);
+        }
         await this.cleanupWorkerProtocol(job);
       } catch (error) {
         const originalError = error instanceof Error ? error.message : String(error);
@@ -475,9 +482,14 @@ export class BackgroundJobsController
       }
       try {
         await this.repository.validateOperationalBoundaries(job);
-        await cleanupIsolatedWorktree(job.session, this.storageRoot, (message) =>
-          this.output.appendLine(message),
+        const worktreeRemoved = await cleanupIsolatedWorktree(
+          job.session,
+          this.storageRoot,
+          (message) => this.output.appendLine(message),
         );
+        if (!worktreeRemoved) {
+          throw new Error(WORKTREE_CLEANUP_ERROR);
+        }
         await this.cleanupWorkerProtocol(job);
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -531,11 +543,28 @@ export class BackgroundJobsController
         );
         return;
       }
-      await this.repository.validateOperationalBoundaries(job);
-      await cleanupIsolatedWorktree(job.session, this.storageRoot, (message) =>
-        this.output.appendLine(message),
-      );
-      await this.cleanupWorkerProtocol(job);
+      try {
+        await this.repository.validateOperationalBoundaries(job);
+        const worktreeRemoved = await cleanupIsolatedWorktree(
+          job.session,
+          this.storageRoot,
+          (message) => this.output.appendLine(message),
+        );
+        if (!worktreeRemoved) {
+          throw new Error(WORKTREE_CLEANUP_ERROR);
+        }
+        await this.cleanupWorkerProtocol(job);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        this.applyStateTransition(job, {
+          type: "discard-cleanup-failed",
+          error: errorMessage,
+        });
+        await this.save(job);
+        void vscode.window.showErrorMessage(errorMessage);
+        this.changed.fire(undefined);
+        return;
+      }
       this.applyStateTransition(job, { type: "discard" });
       await this.save(job);
       await this.auditJob(job, "background.discard");

@@ -162,7 +162,26 @@ try {
   assert.match(sourceRejected.conflicts[0].error, /Path escapes|changed while it was being validated/);
   assert.equal(await isMissing(path.join(repository, "source-parent", "payload.txt")), true);
 
-  await cleanupIsolatedWorktree(session, Uri.file(storage));
+  const failedCleanupSession = {
+    ...session,
+    id: "cleanup-failure",
+    worktreePath: path.join(temporary, "missing-worktree-parent", "worktree"),
+  };
+  const retainedBaseline = path.join(
+    storage,
+    failedCleanupSession.baselinesFolder,
+    failedCleanupSession.id,
+    "baseline.txt",
+  );
+  await mkdir(path.dirname(retainedBaseline), { recursive: true });
+  await writeFile(retainedBaseline, "retain after failed cleanup\n", "utf8");
+  assert.equal(
+    await cleanupIsolatedWorktree(failedCleanupSession, Uri.file(storage)),
+    false,
+  );
+  assert.equal(await readFile(retainedBaseline, "utf8"), "retain after failed cleanup\n");
+
+  assert.equal(await cleanupIsolatedWorktree(session, Uri.file(storage)), true);
   assert.equal(await isMissing(session.worktreePath), true);
   assert.equal(await isMissing(path.join(storage, "baselines", session.id)), true);
   assert.equal(await readFile(outsideVictim, "utf8"), "outside original\n");

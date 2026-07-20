@@ -247,6 +247,7 @@ import { WorkflowController } from "./workflowController.js";
 import { DiagnosticsController } from "./diagnosticsController.js";
 import { RunCenterCoordinator } from "./runCenterCoordinator.js";
 import type { RunCenterState } from "./runCenterModel.js";
+import { AsyncLifecycle, ExtensionDeactivation } from "./asyncLifecycle.js";
 
 const API_KEY_SECRET = "cursorSubscription.apiKey";
 const CONVERSATIONS_KEY = "cursorSubscription.conversations";
@@ -282,6 +283,7 @@ const MAX_DROPPED_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_EDITOR_GENERATION_CONTEXT = 60_000;
 const WORKSPACE_INDEX_DEBOUNCE_MS = 300;
 const SUPPORTS_LOCAL_SANDBOX = process.platform !== "win32";
+const extensionDeactivation = new ExtensionDeactivation();
 type AiFeatureSetting =
   | "enableAiSupervisor"
   | "enableAutopilot"
@@ -336,6 +338,7 @@ export function activate(context: vscode.ExtensionContext): void {
     changeSessions,
     reviewDiagnostics,
   );
+  extensionDeactivation.setActive(provider);
   provider.setApplyCoordination(sharedApplyQueue, sharedFileOwnership);
   const auditTimeline = new AuditTimelineController(context.workspaceState, IS_JAPANESE);
   provider.setAuditTimeline(auditTimeline);
@@ -789,12 +792,13 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 }
 
-export function deactivate(): void {
-  // CursorChatProvider is disposed through ExtensionContext subscriptions.
+export function deactivate(): Promise<void> {
+  return extensionDeactivation.deactivate();
 }
 
 class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
+  private readonly lifecycle = new AsyncLifecycle();
   private readonly conversationStore: ConversationStore;
   private readonly webviewController: WebviewController;
   private readonly promptFocusHandoff = new PromptFocusHandoff();
@@ -2643,7 +2647,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     profile: RunProfile,
     conversationId: string,
   ): void {
-    setTimeout(() => {
+    this.lifecycle.defer(() => {
       void this.enqueueMessage(
         prompt,
         false,
@@ -2661,7 +2665,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           }`,
         );
       });
-    }, 0);
+    });
   }
 
   private async markOrchestratorSubtaskRunning(conversationId: string): Promise<void> {
@@ -4547,12 +4551,17 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
   }
 
-  public async dispose(): Promise<void> {
+  public dispose(): Promise<void> {
+    return this.lifecycle.dispose(() => this.disposeInternal());
+  }
+
+  private async disposeInternal(): Promise<void> {
     this.workspaceIndexGeneration += 1;
     if (this.workspaceIndexRefreshTimer) {
       clearTimeout(this.workspaceIndexRefreshTimer);
       this.workspaceIndexRefreshTimer = undefined;
     }
+    this.messageQueue.splice(0, this.messageQueue.length);
     await this.cancelAllChats();
     await this.disposeAgent();
     try {
@@ -5429,6 +5438,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     commandId?: string,
     includeProjectMemory = true,
   ): Promise<void> {
+    if (this.lifecycle.isDisposing) {
+      return;
+    }
     if (!prompt && !commandId) {
       return;
     }
@@ -5596,6 +5608,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private async drainMessageQueue(conversationId?: string): Promise<void> {
+    if (this.lifecycle.isDisposing) {
+      return;
+    }
     if (!conversationId) {
       const conversationIds = queuedConversationIds(this.messageQueue);
       await Promise.all(conversationIds.map((id) => this.drainMessageQueue(id)));
@@ -5606,7 +5621,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
     this.drainingConversations.add(conversationId);
     try {
-      while (!this.isConversationBusy(conversationId)) {
+      while (!this.lifecycle.isDisposing && !this.isConversationBusy(conversationId)) {
         const maximumParallelAgents = normalizeMaxParallelAgents(
           this.alertConfiguration().get<number>("maxParallelChatAgents", 3),
         );
@@ -5660,6 +5675,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
   }
 
+  private deferQueueDrain(): void {
+    this.lifecycle.defer(() => {
+      void this.drainMessageQueue();
+    });
+  }
+
   private async send(
     prompt: string,
     attachContext: boolean,
@@ -5675,6 +5696,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     includeProjectMemory = true,
     queue?: { fromQueue: true; queueKind: "queued" | "interrupt" },
   ): Promise<boolean> {
+    if (this.lifecycle.isDisposing) {
+      return false;
+    }
     const commandCandidate = commandId
       ? this.projectCommands.find((command) => command.id === commandId)
       : undefined;
@@ -5968,7 +5992,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         recoveryActions: RUN_FAILURE_RECOVERY_ACTIONS,
       });
       // Run was reserved then aborted during prep — drain any waiting messages.
-      setTimeout(() => void this.drainMessageQueue(), 0);
+      this.deferQueueDrain();
       return true;
     }
 
@@ -7140,7 +7164,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         void this.maybeAutoSelectBestOfNWinner(conversation.experimentGroupId);
       }
       this.notifyRunComplete(conversation, progressState);
-      setTimeout(() => void this.drainMessageQueue(), 0);
+      this.deferQueueDrain();
     }
     return true;
   }
@@ -7657,6 +7681,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private scheduleWorkspaceIndexRefresh(): void {
+    if (this.lifecycle.isDisposing) {
+      return;
+    }
     const generation = ++this.workspaceIndexGeneration;
     this.workspaceFileCache = undefined;
     this.workspaceFileCacheKey = undefined;
@@ -7665,6 +7692,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
     this.workspaceIndexRefreshTimer = setTimeout(() => {
       this.workspaceIndexRefreshTimer = undefined;
+      if (this.lifecycle.isDisposing) {
+        return;
+      }
       void Promise.all([
         this.publishWorkspaceFileIndex(generation),
         this.publishIntegrationIndex(generation),

@@ -20,6 +20,7 @@ export type BackgroundJobStateEvent =
   | { type: "recover-interrupted-apply"; error: string }
   | { type: "applied-cleanup-succeeded" }
   | { type: "applied-cleanup-failed"; error: string }
+  | { type: "discard-cleanup-failed"; error: string }
   | { type: "discard" };
 
 export interface BackgroundJobStateUpdate {
@@ -93,6 +94,10 @@ export function reduceBackgroundJobState(
       return current.status === "applied" ? { status: "applied", error: undefined } : undefined;
     case "applied-cleanup-failed":
       return current.status === "applied" ? { status: "applied", error: event.error } : undefined;
+    case "discard-cleanup-failed":
+      return DISCARDABLE_STATUSES.has(current.status)
+        ? { status: current.status, error: event.error }
+        : undefined;
     case "discard":
       return DISCARDABLE_STATUSES.has(current.status)
         ? { status: "discarded", error: current.error }

@@ -45,7 +45,7 @@ export interface DiagnosticsBundle {
 }
 
 const SECRET_ASSIGNMENT = /\b(cursor[_-]?api[_-]?key|api[_-]?key|authorization|cookie|credential|gh[_-]?token|password|secret|token)\b(\s*[:=]\s*)(?!Bearer\b)([^\s,;]+)/giu;
-const API_KEY_WHITESPACE = /\b(api[_-]?key)([ \t]+)(?!is\b|was\b|missing\b|unset\b|undefined\b|null\b|none\b|configured\b|present\b|absent\b|required\b)([A-Za-z0-9][A-Za-z0-9._~+\/-]{6,}[A-Za-z0-9])/giu;
+const API_KEY_WHITESPACE = /\b(cursor[_-]?api[_-]?key|api[_-]?key)([ \t]+)(?!is\b|was\b|missing\b|unset\b|undefined\b|null\b|none\b|configured\b|present\b|absent\b|required\b)(?:(["'])([A-Za-z0-9][A-Za-z0-9._~+\/-]{6,}[A-Za-z0-9])\3|[A-Za-z0-9][A-Za-z0-9._~+\/-]{6,}[A-Za-z0-9])/giu;
 const BEARER_TOKEN = /\bBearer\s+[A-Za-z0-9._~+\/-]{8,}/giu;
 const CURSOR_KEY_TOKEN = /(?<![A-Za-z0-9_])key_[A-Za-z0-9][A-Za-z0-9._-]{6,}[A-Za-z0-9](?![A-Za-z0-9_-]|\.[A-Za-z0-9])/giu;
 const URL_CREDENTIALS = /(https?:\/\/)[^\s/@:]+:[^\s/@]+@/giu;
