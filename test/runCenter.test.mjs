@@ -18,7 +18,16 @@ function completeState() {
     runId: "run-1",
     plan: [{ id: "plan-1", label: "Inspect", status: "completed" }],
     progress: { message: "Implementing", status: "running", completed: 2, total: 4 },
-    changes: [{ path: "src/feature.ts", status: "modified", additions: 4, deletions: 1 }],
+    changes: [{
+      path: "src/feature.ts",
+      status: "modified",
+      additions: 4,
+      deletions: 1,
+      open: {
+        command: "cursorSubscription.openSessionFile",
+        arguments: ["session-1", "C:\\repo\\src\\feature.ts"],
+      },
+    }],
     verification: [{ id: "test", label: "Unit tests", status: "passed" }],
     error: { message: "A recoverable failure", code: "E_TEST" },
     recoveryActions: [{
@@ -69,9 +78,14 @@ test("snapshot cloning prevents later array and command-argument mutation", () =
   source.plan.push({ id: "late", label: "Late mutation", status: "pending" });
   source.plan[0].label = "Mutated label";
   source.recoveryActions[0].arguments.push("late");
+  source.changes[0].open.arguments.push("late");
   assert.equal(cloned.plan.length, 1);
   assert.equal(cloned.plan[0].label, "Inspect");
   assert.deepEqual(cloned.recoveryActions[0].arguments, ["run-1"]);
+  assert.deepEqual(cloned.changes[0].open, {
+    command: "cursorSubscription.openSessionFile",
+    arguments: ["session-1", "C:\\repo\\src\\feature.ts"],
+  });
 });
 
 test("TreeDataProvider accepts pushed snapshots and exposes recovery commands", () => {
@@ -104,9 +118,37 @@ test("TreeDataProvider accepts pushed snapshots and exposes recovery commands", 
   assert.equal(planItem.description, "1");
   assert.equal(planItem.accessibilityInformation.label, "Plan: 1");
 
+  const changesSection = roots.find((node) => node.sectionId === "changes");
+  const [changeNode] = provider.getChildren(changesSection);
+  const changeItem = provider.getTreeItem(changeNode);
+  assert.equal(changeItem.description, "Modified +4 -1");
+  assert.deepEqual(changeItem.command, {
+    command: "cursorSubscription.openSessionFile",
+    title: "src/feature.ts",
+    arguments: ["session-1", "C:\\repo\\src\\feature.ts"],
+  });
+
   provider.clear();
   assert.deepEqual(provider.getChildren(), []);
   assert.equal(changeEvents, 2);
   subscription.dispose();
+  provider.dispose();
+});
+
+test("change status labels localize in the tree description", () => {
+  const provider = new RunCenterTreeDataProvider(true, {
+    changes: [
+      { path: "a.ts", status: "added" },
+      { path: "b.ts", status: "modified", additions: 2 },
+      { path: "c.ts", status: "deleted" },
+      { path: "d.ts", status: "renamed", previousPath: "old.ts" },
+    ],
+  });
+  const [changesSection] = provider.getChildren();
+  const items = provider.getChildren(changesSection).map((node) => provider.getTreeItem(node));
+  assert.deepEqual(
+    items.map((item) => item.description),
+    ["追加", "変更 +2", "削除", "名前変更"],
+  );
   provider.dispose();
 });

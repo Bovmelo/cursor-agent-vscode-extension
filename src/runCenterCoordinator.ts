@@ -223,6 +223,11 @@ export class RunCenterCoordinator {
           label: this.localize("Export diagnostics", "診断をエクスポート"),
           command: "cursorSubscription.exportDiagnostics",
         },
+        {
+          id: "runCenter",
+          label: this.localize("Open Run Center", "実行センターを開く"),
+          command: "cursorSubscription.openRunCenter",
+        },
       );
     }
     if (session?.pendingFiles && session.pendingFiles.length > 0) {
@@ -288,6 +293,10 @@ export class RunCenterCoordinator {
       changes: session?.files.map((file) => ({
         path: path.relative(session.root, file).replaceAll("\\", "/"),
         status: "modified" as const,
+        open: {
+          command: "cursorSubscription.openSessionFile",
+          arguments: [session.id, file],
+        },
       })),
       verification: session?.verification?.steps.map((step, index) => ({
         id: `${session.id}:${index}`,
@@ -345,6 +354,11 @@ export class RunCenterCoordinator {
           id: "background-logs",
           label: this.localize("Open Agent logs", "Agentログを開く"),
           command: "cursorSubscription.openOutput",
+        },
+        {
+          id: "background-diagnostics",
+          label: this.localize("Export diagnostics", "診断をエクスポート"),
+          command: "cursorSubscription.exportDiagnostics",
         },
       );
     }
@@ -451,6 +465,10 @@ export class RunCenterCoordinator {
         status: "modified" as const,
         additions: change.added,
         deletions: change.deleted,
+        open: {
+          command: "cursorSubscription.openSupervisorChange",
+          arguments: [{ taskId: task.id, relative: change.relative }],
+        },
       })),
       verification: task.verification?.steps.map((step, index) => ({
         id: `${task.id}:${index}`,

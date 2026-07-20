@@ -1953,17 +1953,25 @@ function setIncludeProjectMemory(value) {
   memoryChipLabel.textContent = i18n.projectMemory;
 }
 
-function setApprovalMode(mode) {
-  approvalSelect.value = mode;
-  // On platforms without a local sandbox, isolation is never available
-  // regardless of the selected mode, so keep the warning state sticky.
-  sandboxUnavailable = !sandboxSupported;
+let executionProfileLabel = "";
+
+function refreshApprovalSelectTitle() {
+  const mode = approvalSelect.value;
   const descriptions = {
     "safe-worktree": i18n.safeWorktreeDescription,
     "auto-review": i18n.autoReviewDescription,
     "full-access": i18n.fullAccessDescription,
   };
-  approvalSelect.title = descriptions[mode] || i18n.approvalMode;
+  const base = descriptions[mode] || i18n.approvalMode;
+  approvalSelect.title = executionProfileLabel ? `${base} · ${executionProfileLabel}` : base;
+}
+
+function setApprovalMode(mode) {
+  approvalSelect.value = mode;
+  // On platforms without a local sandbox, isolation is never available
+  // regardless of the selected mode, so keep the warning state sticky.
+  sandboxUnavailable = !sandboxSupported;
+  refreshApprovalSelectTitle();
   updateSandboxBanner();
   if (!running && !sandboxSupported) {
     status.textContent = sandboxStatusForMode(mode);
@@ -2840,6 +2848,7 @@ function addAssistantMessage(
   files = [],
   progress = [],
   progressState = "completed",
+  recoveryActions,
 ) {
   const node = document.createElement("div");
   node.className = "message assistant" + (isError ? " error" : "");
@@ -2854,6 +2863,7 @@ function addAssistantMessage(
   }
   messages.appendChild(node);
   for (const file of files) addFileChip(node, file.path, file.label);
+  if (isError) renderRecoveryActions(node, recoveryActions);
   scrollToBottom();
   return node;
 }
@@ -2872,6 +2882,46 @@ function addFileChip(messageNode, filePath, label) {
   chip.title = i18n.showDiff + ": " + filePath;
   chip.addEventListener("click", () => vscode.postMessage({ type: "openDiff", path: filePath }));
   filesNode.appendChild(chip);
+}
+
+const DEFAULT_RECOVERY_ACTIONS = ["retry", "diagnostics", "runCenter"];
+const RECOVERY_ACTION_LABELS = {
+  retry: () => i18n.recoveryRetry,
+  diagnostics: () => i18n.recoveryExportDiagnostics,
+  runCenter: () => i18n.recoveryOpenRunCenter,
+  logs: () => i18n.recoveryOpenLogs,
+};
+
+function renderRecoveryActions(messageNode, actions) {
+  const resolved =
+    Array.isArray(actions) && actions.length > 0
+      ? actions.filter((action) => Object.prototype.hasOwnProperty.call(RECOVERY_ACTION_LABELS, action))
+      : DEFAULT_RECOVERY_ACTIONS;
+  if (resolved.length === 0) return;
+
+  let insertAfter = messageNode;
+  if (messageNode.nextElementSibling?.classList.contains("files")) {
+    insertAfter = messageNode.nextElementSibling;
+  }
+  let actionsNode = insertAfter.nextElementSibling;
+  if (!actionsNode || !actionsNode.classList.contains("error-actions")) {
+    actionsNode = document.createElement("div");
+    actionsNode.className = "error-actions";
+    insertAfter.after(actionsNode);
+  } else {
+    actionsNode.replaceChildren();
+  }
+
+  for (const action of resolved) {
+    const button = document.createElement("button");
+    button.className = "error-action";
+    button.type = "button";
+    button.textContent = RECOVERY_ACTION_LABELS[action]();
+    button.addEventListener("click", () =>
+      vscode.postMessage({ type: "runRecoveryAction", action }),
+    );
+    actionsNode.appendChild(button);
+  }
 }
 
 function autoGrow() {
@@ -3864,6 +3914,10 @@ window.addEventListener("message", ({ data }) => {
     case "approvalModeSelected":
       setApprovalMode(data.mode);
       break;
+    case "executionProfileState":
+      executionProfileLabel = typeof data.label === "string" ? data.label : "";
+      refreshApprovalSelectTitle();
+      break;
     case "sandboxSupport":
       sandboxSupported = data.supported !== false;
       if (!sandboxSupported) sandboxUnavailable = true;
@@ -3966,7 +4020,14 @@ window.addEventListener("message", ({ data }) => {
           const live = data.running === true && entryIndex === data.entries.length - 1;
           if (live) {
             assistantRaw = entry.text || "";
-            assistantNode = addAssistantMessage(assistantRaw, entry.error === true, files);
+            assistantNode = addAssistantMessage(
+              assistantRaw,
+              entry.error === true,
+              files,
+              [],
+              "completed",
+              entry.recoveryActions,
+            );
             activeProgress = createProgressPanel(entry.progress || [], "running");
             assistantNode.before(activeProgress.node);
           } else {
@@ -3976,6 +4037,7 @@ window.addEventListener("message", ({ data }) => {
               files,
               entry.progress || [],
               entry.progressState || (entry.error === true ? "error" : "completed"),
+              entry.recoveryActions,
             );
           }
         }
@@ -4049,8 +4111,9 @@ window.addEventListener("message", ({ data }) => {
         messageBody(assistantNode).textContent = data.text;
         assistantNode.classList.add("error");
         ensureMessageCopy(assistantNode);
+        renderRecoveryActions(assistantNode, data.recoveryActions);
       } else {
-        addAssistantMessage(data.text, true);
+        addAssistantMessage(data.text, true, [], [], "completed", data.recoveryActions);
       }
       break;
     case "cancelled":

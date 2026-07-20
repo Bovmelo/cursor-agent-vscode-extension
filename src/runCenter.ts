@@ -7,6 +7,7 @@ import {
   runCenterSectionLabel,
   runCenterSections,
   type RunCenterChange,
+  type RunCenterChangeStatus,
   type RunCenterEntryNode,
   type RunCenterPlanStatus,
   type RunCenterState,
@@ -24,6 +25,7 @@ export {
   runCenterSections,
   type RunCenterChange,
   type RunCenterChangeNode,
+  type RunCenterChangeOpenTarget,
   type RunCenterChangeStatus,
   type RunCenterEntryNode,
   type RunCenterError,
@@ -138,8 +140,8 @@ implements vscode.TreeDataProvider<RunCenterTreeNode>, vscode.Disposable {
           "progress",
           "current",
         );
-      case "change":
-        return this.leafItem(
+      case "change": {
+        const item = this.leafItem(
           element.change.path,
           this.changeDescription(element.change),
           "diff",
@@ -149,6 +151,17 @@ implements vscode.TreeDataProvider<RunCenterTreeNode>, vscode.Disposable {
           "change",
           element.change.path,
         );
+        if (element.change.open) {
+          item.command = {
+            command: element.change.open.command,
+            title: element.change.path,
+            arguments: element.change.open.arguments
+              ? [...element.change.open.arguments]
+              : undefined,
+          };
+        }
+        return item;
+      }
       case "verification":
         return this.leafItem(
           element.verification.label,
@@ -251,7 +264,18 @@ implements vscode.TreeDataProvider<RunCenterTreeNode>, vscode.Disposable {
     return icons[status];
   }
 
+  private changeStatusLabel(status: RunCenterChangeStatus): string {
+    const labels: Record<RunCenterChangeStatus, [string, string]> = {
+      added: ["Added", "追加"],
+      modified: ["Modified", "変更"],
+      deleted: ["Deleted", "削除"],
+      renamed: ["Renamed", "名前変更"],
+    };
+    return this.japanese ? labels[status][1] : labels[status][0];
+  }
+
   private changeDescription(change: RunCenterChange): string {
+    const status = this.changeStatusLabel(change.status);
     const totals: string[] = [];
     if (change.additions !== undefined) {
       totals.push(`+${Math.max(0, Math.trunc(change.additions))}`);
@@ -259,7 +283,7 @@ implements vscode.TreeDataProvider<RunCenterTreeNode>, vscode.Disposable {
     if (change.deletions !== undefined) {
       totals.push(`-${Math.max(0, Math.trunc(change.deletions))}`);
     }
-    return totals.length > 0 ? `${change.status} ${totals.join(" ")}` : change.status;
+    return totals.length > 0 ? `${status} ${totals.join(" ")}` : status;
   }
 }
 

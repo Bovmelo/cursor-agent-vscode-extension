@@ -85,7 +85,15 @@ Type `/` in the chat composer:
 
 Choose **Cursor: Choose What to Do** to enter through four stable goals instead of navigating individual implementation commands: **Ask**, **Change**, **Delegate**, or **Review and apply**. **Cursor: Choose Execution Profile** applies a documented Safe, Balanced, or Automation preset across the existing safety and automation controls. Automation remains trust-gated and requires explicit confirmation.
 
-The Workspace **Run Center** follows the most relevant chat, Supervisor, or background run and keeps its plan, live progress, changed files, verification gates, error details, and recovery actions together. Failed runs offer retry, logs, setup, or redacted diagnostic export where applicable. Shared-audit write failures are visible in the Audit group instead of being output-only.
+The Workspace **Run Center** (実行センター) follows the most relevant chat, Supervisor, or background run and keeps its plan, live progress, changed files, verification gates, error details, and recovery actions together. Click a changed file to open its AI/session or Supervisor diff. Failed runs offer **Retry Last Run**, logs, setup, **Export Redacted Diagnostics**, or **Open Run Center** from the tree, chat error actions, and desktop notifications. Shared-audit write failures are visible in the Audit group instead of being output-only.
+
+| Execution preset | Intent |
+| --- | --- |
+| **Safe** | Prefer Safe worktree / lower automation |
+| **Balanced** | Review-friendly defaults with moderate automation (trust-gated) |
+| **Automation** | Higher autonomy; trust-gated and requires explicit confirmation |
+
+Active preset appears in the status bar and chat footer; change it with **Cursor: Choose Execution Profile** or Settings (`cursorSubscription.executionProfile`).
 
 ### Parallel chat agents
 
@@ -116,6 +124,15 @@ The **Audit** group in the Workspace tree makes apply, restore, PR, and plan act
 The **Rules / Skills / MCP** group lists project rules, Skills, MCP servers, and slash-command templates so you can open or enable/disable each item without editing JSON by hand.
 
 Usage guardrails support daily and monthly token limits plus an estimated monthly USD limit. `cursorSubscription.dailyTokenBudget` warns near 80% and confirms before new runs at 100% (0 disables the budget). Cost estimates use only the blended rate you provide in `cursorSubscription.estimatedCostPerMillionTokensUsd`; they are an approximation, not billing data.
+
+Operability commands (0.2):
+
+- **Cursor: Choose What to Do** — Ask / Change / Delegate / Review entry point
+- **Cursor: Choose Execution Profile** — Safe / Balanced / Automation presets
+- **Cursor: Open Run Center** — focus the Workspace Run Center group
+- **Cursor: Retry Last Run** — resend the last user prompt for the active (or latest) conversation
+- **Cursor: Export Redacted Diagnostics** — Markdown bundle for support (no API key; prompts omitted; secrets redacted)
+- **Cursor: Show Setup Checklist** — reopen the Agent sidebar first-run checklist (workspace-state dismiss/completion)
 
 Additional commands:
 
@@ -239,7 +256,15 @@ Activity Bar の **Cursor** コンテナ:
 
 **Cursor: 目的を選択**では、個別の内部コマンドを探さずに **質問する / 変更する / 任せる / 確認・適用する** の4つから開始できます。**Cursor: 実行プロファイルを選択**は既存の安全性・自動化設定へ、安全重視 / バランス / 自動化重視のプリセットを適用します。自動化重視はWorkspace Trustで制限され、明示確認が必要です。
 
-ワークスペースの **Run Center** は、現在もっとも関連するチャット、Supervisor、バックグラウンド実行を追跡し、計画、進捗、変更ファイル、検証、エラー詳細、復旧操作を同じ場所へ表示します。失敗時は再試行、ログ、セットアップ、機密情報を除外した診断エクスポートへ進めます。共有監査ログの書き込み失敗もAuditグループへ表示します。
+ワークスペースの **実行センター（Run Center）** は、現在もっとも関連するチャット、Supervisor、バックグラウンド実行を追跡し、計画、進捗、変更ファイル、検証、エラー詳細、復旧操作を同じ場所へ表示します。変更ファイルをクリックするとセッション差分または Supervisor 差分を開きます。失敗時はツリー、チャットのエラー操作、通知から **直前の実行を再試行**、ログ、セットアップ、**機密情報を除外した診断をエクスポート**、**実行センターを開く** へ進めます。共有監査ログの書き込み失敗もAuditグループへ表示します。
+
+| 実行プリセット | 意図 |
+| --- | --- |
+| **安全重視** | 安全 worktree / 自動化を抑える |
+| **バランス** | 確認しやすい既定と中程度の自動化（Trust 制限あり） |
+| **自動化重視** | より高い自律性。Trust 制限と明示確認が必要 |
+
+現在のプリセットはステータスバーとチャットフッタに表示されます。**Cursor: 実行プロファイルを選択** または設定（`cursorSubscription.executionProfile`）から変更できます。
 
 通常チャットは会話ごとに独立したCursor AgentとRunを持ちます。処理中に **並列Agent** バーの目立つ **並列Agentを起動** ボタンを押して別の指示を送ると、両方を同時実行できます。上限到達時はボタンが無効になり、現在数と上限を確認できます。バーには実行中・待機中の会話が常時表示され、クリックで即座に切り替え、×ボタンでそのAgentだけを停止できます。並列タスクが完了・失敗・停止した場合は「確認待ち」として残り、その会話を一度開いて別の会話または画面へ移動した時点で消えます。履歴にも **実行中** または **待機中** と表示され、会話へ戻ると途中の出力も復元されます。同一会話内のメッセージは従来どおり順番に処理しますが、送信待ちキューから選択して別Agentとして並列起動することもできます（同じ並列上限が適用されます）。同時数は `cursorSubscription.maxParallelChatAgents`（初期値3、最大8）で設定できます。同時呼び出しはCursorの利用枠を並行して消費する場合があります。同じファイルへの並行編集も、変更箇所が重ならなければ3-wayマージで自動統合します。テキスト変更が重なった場合は確認ダイアログからAIへ戻し、双方の意図を推測して解決できます。競合マーカーの除去と解決中の再変更を確認できたファイルだけを適用します。
 
@@ -266,6 +291,15 @@ Activity Bar の **Cursor** コンテナ:
 使用量ガードには日次・月次トークン上限と推定月間USD上限があります。`cursorSubscription.dailyTokenBudget` は約80%で警告し、100%では新規実行前に確認します（0で無効）。コスト推定は `cursorSubscription.estimatedCostPerMillionTokensUsd` にユーザーが設定した概算単価だけを使い、実際の請求額ではありません。
 
 チャット上部の歯車ボタン、または **Cursor: AI機能の設定を開く** から機能別にオン・オフできます。マスタースイッチを無効にしても基本チャットは引き続き利用できます。
+
+運用コマンド（0.2）:
+
+- **Cursor: 目的を選択** — 質問 / 変更 / 委譲 / 確認・適用
+- **Cursor: 実行プロファイルを選択** — 安全重視 / バランス / 自動化重視
+- **Cursor: 実行センターを開く**
+- **Cursor: 直前の実行を再試行**
+- **Cursor: 機密情報を除外した診断をエクスポート** — サポート用 Markdown（APIキーなし、プロンプト非含有、秘密情報は伏せ字）
+- **Cursor: セットアップチェックリストを表示**
 
 ### Windowsでの安全性
 

@@ -93,3 +93,48 @@ export function localizeExecutionProfile(
   };
   return { label: localized[definition.id][0], description: localized[definition.id][1] };
 }
+
+export type MatchedExecutionProfileId = ExecutionProfileId | "custom";
+
+export interface MatchExecutionProfileInput {
+  readonly settings: Readonly<Record<string, ExecutionProfileSettingValue>>;
+  readonly approvalMode: string;
+  readonly supportsLocalSandbox: boolean;
+}
+
+/**
+ * Infer which preset matches the current approval mode + settings snapshot.
+ * Mirrors the approval remapping used when applying a profile (safe-worktree
+ * becomes auto-review when a local sandbox is available).
+ */
+export function matchExecutionProfile(
+  input: MatchExecutionProfileInput,
+): MatchedExecutionProfileId {
+  for (const profile of executionProfiles()) {
+    const expectedApproval =
+      profile.approvalMode === "safe-worktree" && input.supportsLocalSandbox
+        ? "auto-review"
+        : profile.approvalMode;
+    if (expectedApproval !== input.approvalMode) {
+      continue;
+    }
+    const matches = Object.entries(profile.settings).every(
+      ([key, value]) => input.settings[key] === value,
+    );
+    if (matches) {
+      return profile.id;
+    }
+  }
+  return "custom";
+}
+
+export function currentExecutionProfileLabel(
+  id: ExecutionProfileId | "custom" | undefined,
+  japanese: boolean,
+): string {
+  if (!id || id === "custom") {
+    return japanese ? "カスタム" : "Custom";
+  }
+  const definition = executionProfile(id);
+  return definition ? localizeExecutionProfile(definition, japanese).label : id;
+}

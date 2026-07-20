@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { AgentFactory } from "../out/agentFactory.js";
+import { MockAgentBackend } from "./mockAgentBackend.mjs";
 
 const supportedCapabilities = {
   sandbox: "supported",
@@ -23,25 +24,16 @@ function factoryOptions(overrides = {}) {
 }
 
 {
-  const calls = [];
-  let builtInsRequested = 0;
-  const backend = {
+  const backend = new MockAgentBackend({
     capabilities: supportedCapabilities,
-    create: async (options) => {
-      calls.push(["create", options]);
-      return { agentId: "created-agent" };
+    createHandler: async () => {
+      throw new Error("create must not be called");
     },
-    resume: async (agentId, options) => {
-      calls.push(["resume", agentId, options]);
-      return { agentId };
+    resumeHandler: async (agentId) => ({ agentId }),
+    builtInSubagents: {
+      researcher: { description: "read", prompt: "inspect" },
     },
-    builtInSubagents: () => {
-      builtInsRequested += 1;
-      return { researcher: { description: "read", prompt: "inspect" } };
-    },
-    classifyResumeError: () => "other",
-    isSandboxUnavailableError: () => false,
-  };
+  });
   let boundaries = 0;
   let saves = 0;
   const conversation = { agentId: "existing-agent" };
@@ -69,20 +61,19 @@ function factoryOptions(overrides = {}) {
   assert.equal(agent.agentId, "existing-agent");
   assert.equal(boundaries, 1);
   assert.equal(saves, 0);
-  assert.equal(builtInsRequested, 1);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0][0], "resume");
-  assert.deepEqual(calls[0][2].local, {
+  const resumeCall = backend.calls.find((call) => call[0] === "resume");
+  assert.ok(resumeCall);
+  assert.deepEqual(resumeCall[2].local, {
     cwd: "C:/workspace",
     autoReview: true,
     enableAgentRetries: true,
     sandbox: { enabled: true },
     settingSources: ["user"],
   });
-  assert.deepEqual(calls[0][2].subagents, {
+  assert.deepEqual(resumeCall[2].subagents, {
     researcher: { description: "read", prompt: "inspect" },
   });
-  assert.deepEqual(calls[0][2].mcpServers, {
+  assert.deepEqual(resumeCall[2].mcpServers, {
     docs: { url: "https://example.test/mcp" },
   });
 }
@@ -95,20 +86,18 @@ function factoryOptions(overrides = {}) {
   let notified = 0;
   let boundaries = 0;
   let saves = 0;
-  const backend = {
+  const backend = new MockAgentBackend({
     capabilities: unsupportedCapabilities,
-    create: async (options) => {
+    createHandler: async (options) => {
       createOptions = options;
       return { agentId: "replacement-agent" };
     },
-    resume: async () => {
+    resumeHandler: async () => {
       throw new Error("resume must not be called");
     },
-    builtInSubagents: () => {
-      throw new Error("subagents must not be requested");
-    },
-    classifyResumeError: () => "other",
-    isSandboxUnavailableError: () => false,
+  });
+  backend.builtInSubagents = () => {
+    throw new Error("subagents must not be requested");
   };
   const conversation = { agentId: "old-agent" };
   const factory = new AgentFactory(
@@ -154,22 +143,13 @@ for (const recoverable of [
   { label: "missing session", error: { code: "agent_not_found" }, kind: "session-not-found" },
   { label: "invalid agent ID", error: { code: "invalid_agent_id" }, kind: "invalid-agent-id" },
 ]) {
-  const calls = [];
-  let saves = 0;
-  const backend = {
+  const backend = new MockAgentBackend({
     capabilities: supportedCapabilities,
-    create: async () => {
-      calls.push("create");
-      return { agentId: "replacement-agent" };
-    },
-    resume: async () => {
-      calls.push("resume");
-      throw recoverable.error;
-    },
-    builtInSubagents: () => ({}),
+    createHandler: async () => ({ agentId: "replacement-agent" }),
+    resumeError: recoverable.error,
     classifyResumeError: (error) => (error === recoverable.error ? recoverable.kind : "other"),
-    isSandboxUnavailableError: () => false,
-  };
+  });
+  let saves = 0;
   const conversation = { agentId: "persisted-agent" };
   const factory = new AgentFactory(
     factoryOptions({
@@ -190,7 +170,11 @@ for (const recoverable of [
 
   assert.equal(agent.agentId, "replacement-agent", recoverable.label);
   assert.equal(conversation.agentId, "replacement-agent", recoverable.label);
-  assert.deepEqual(calls, ["resume", "create"], recoverable.label);
+  assert.deepEqual(
+    backend.calls.filter((call) => call[0] === "resume" || call[0] === "create").map((call) => call[0]),
+    ["resume", "create"],
+    recoverable.label,
+  );
   assert.equal(saves, 1, recoverable.label);
 }
 
@@ -198,21 +182,13 @@ for (const fatal of [
   Object.assign(new Error("service unavailable"), { status: 503, isRetryable: true }),
   Object.assign(new Error("invalid API key"), { status: 401, code: "unauthenticated" }),
 ]) {
-  let creates = 0;
-  let saves = 0;
-  const backend = {
+  const backend = new MockAgentBackend({
     capabilities: supportedCapabilities,
-    create: async () => {
-      creates += 1;
-      return { agentId: "must-not-be-created" };
-    },
-    resume: async () => {
-      throw fatal;
-    },
-    builtInSubagents: () => ({}),
+    createHandler: async () => ({ agentId: "must-not-be-created" }),
+    resumeError: fatal,
     classifyResumeError: () => "other",
-    isSandboxUnavailableError: () => false,
-  };
+  });
+  let saves = 0;
   const conversation = { agentId: "persisted-agent" };
   const factory = new AgentFactory(
     factoryOptions({
@@ -235,6 +211,6 @@ for (const fatal of [
   );
 
   assert.equal(conversation.agentId, "persisted-agent");
-  assert.equal(creates, 0);
+  assert.equal(backend.calls.some((call) => call[0] === "create"), false);
   assert.equal(saves, 0);
 }

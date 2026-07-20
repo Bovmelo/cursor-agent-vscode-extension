@@ -53,6 +53,11 @@ test("sidebar group labels stay short in the consolidated tree", () => {
   assert.equal(sidebarGroupLabel("sessions", false), "Sessions");
   assert.equal(sidebarGroupLabel("inbox", false), "Inbox");
   assert.equal(sidebarGroupLabel("integrations", true), "Rules / Skills / MCP");
+  assert.equal(sidebarGroupLabel("runCenter", true), "実行センター");
+  assert.equal(sidebarGroupLabel("sessions", true), "セッション");
+  assert.equal(sidebarGroupLabel("inbox", true), "受信箱");
+  assert.equal(sidebarGroupLabel("background", true), "バックグラウンド");
+  assert.equal(sidebarGroupLabel("audit", true), "監査");
 });
 
 test("empty sidebar groups offer a concrete next action", () => {

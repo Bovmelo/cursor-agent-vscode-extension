@@ -29,12 +29,18 @@ export interface RunCenterProgress {
 
 export type RunCenterChangeStatus = "added" | "modified" | "deleted" | "renamed";
 
+export interface RunCenterChangeOpenTarget {
+  readonly command: string;
+  readonly arguments?: readonly unknown[];
+}
+
 export interface RunCenterChange {
   readonly path: string;
   readonly status: RunCenterChangeStatus;
   readonly additions?: number;
   readonly deletions?: number;
   readonly previousPath?: string;
+  readonly open?: RunCenterChangeOpenTarget;
 }
 
 export type RunCenterVerificationStatus =
@@ -213,7 +219,15 @@ export function cloneRunCenterState(state: RunCenterState): RunCenterState {
     ...state,
     plan: state.plan?.map((item) => ({ ...item })),
     progress: state.progress ? { ...state.progress } : undefined,
-    changes: state.changes?.map((change) => ({ ...change })),
+    changes: state.changes?.map((change) => ({
+      ...change,
+      open: change.open
+        ? {
+            ...change.open,
+            arguments: change.open.arguments ? [...change.open.arguments] : undefined,
+          }
+        : undefined,
+    })),
     verification: state.verification?.map((verification) => ({ ...verification })),
     error: state.error ? { ...state.error } : undefined,
     recoveryActions: state.recoveryActions?.map((action) => ({

@@ -2,7 +2,7 @@
   "name": "cursor-subscription-for-vscode",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.1.19",
+  "version": "0.2.0",
   "publisher": "ark4ez",
   "license": "MIT",
   "type": "module",
@@ -352,7 +352,7 @@
         },
         {
           "command": "cursorSubscription.chooseExecutionProfile",
-          "when": "view == cursorSubscription.workspaceTree",
+          "when": "view == cursorSubscription.chatView || view == cursorSubscription.workspaceTree",
           "group": "navigation@3"
         },
         {
@@ -564,6 +564,16 @@
     "configuration": {
       "title": "%extension.displayName%",
       "properties": {
+        "cursorSubscription.executionProfile": {
+          "type": "string",
+          "enum": [
+            "safe",
+            "balanced",
+            "automation"
+          ],
+          "markdownDescription": "%config.executionProfile.description%",
+          "order": 0
+        },
         "cursorSubscription.enableAiNativeFeatures": {
           "type": "boolean",
           "default": true,

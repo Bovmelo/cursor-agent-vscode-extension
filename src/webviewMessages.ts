@@ -10,6 +10,8 @@ export interface DroppedFileUpload {
   data?: unknown;
 }
 
+export type RecoveryActionId = "retry" | "diagnostics" | "runCenter" | "logs";
+
 interface ComposerPayload {
   prompt: string;
   attachContext?: boolean;
@@ -96,7 +98,8 @@ export type WebviewToHostMessage =
         | "openGhSettings"
         | "openDashboard"
         | "workspaceTrust";
-    };
+    }
+  | { type: "runRecoveryAction"; action: RecoveryActionId };
 
 export const WEBVIEW_TO_HOST_MESSAGE_TYPES = [
   "cancel",
@@ -131,6 +134,7 @@ export const WEBVIEW_TO_HOST_MESSAGE_TYPES = [
   "ready",
   "removeQueuedMessage",
   "resolveAttachments",
+  "runRecoveryAction",
   "sandboxLearnMore",
   "searchConversations",
   "searchFiles",
@@ -170,6 +174,22 @@ const ALERT_SETTINGS = new Set([
   "playSoundOnComplete",
   "playSoundOnError",
 ]);
+const RECOVERY_ACTION_IDS: ReadonlySet<string> = new Set([
+  "retry",
+  "diagnostics",
+  "runCenter",
+  "logs",
+]);
+
+function asRecoveryActionIds(value: unknown): readonly RecoveryActionId[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  if (!value.every((item): item is RecoveryActionId =>
+    typeof item === "string" && RECOVERY_ACTION_IDS.has(item)
+  )) {
+    return undefined;
+  }
+  return value;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -361,6 +381,11 @@ export function parseWebviewMessage(raw: unknown): WebviewToHostMessage | undefi
         }
       : undefined;
   }
+  if (type === "runRecoveryAction") {
+    return typeof raw.action === "string" && RECOVERY_ACTION_IDS.has(raw.action)
+      ? { type, action: raw.action as RecoveryActionId }
+      : undefined;
+  }
   return undefined;
 }
 
@@ -390,7 +415,7 @@ export type HostToWebviewMessage =
   | { type: "contextAttached"; label: string }
   | { type: "contextInfo"; label: string | null }
   | { type: "contextPreview"; chips: unknown[] }
-  | { type: "error"; text: string }
+  | { type: "error"; text: string; recoveryActions?: readonly RecoveryActionId[] }
   | { type: "errorSoundSetting"; enabled: boolean }
   | { type: "fileEdited"; path: string; label: string }
   | { type: "fileResults"; requestId: number; files: unknown[] }
@@ -437,6 +462,11 @@ export type HostToWebviewMessage =
       approvalMode: string;
       steps: unknown;
     }
+  | {
+      type: "executionProfileState";
+      profileId: string;
+      label: string;
+    }
   | { type: "started"; activeRuns?: number }
   | { type: "toolStatus"; callId: string; text: string; status?: string }
   | {
@@ -465,6 +495,7 @@ export const HOST_TO_WEBVIEW_MESSAGE_TYPES = [
   "contextPreview",
   "error",
   "errorSoundSetting",
+  "executionProfileState",
   "fileEdited",
   "fileResults",
   "finished",
@@ -541,8 +572,12 @@ export function parseHostToWebviewMessage(raw: unknown): HostToWebviewMessage | 
       valid = hasArray("entries") && hasBoolean("running");
       break;
     case "chunk":
-    case "error":
       valid = hasString("text");
+      break;
+    case "error":
+      valid =
+        hasString("text") &&
+        (raw.recoveryActions === undefined || asRecoveryActionIds(raw.recoveryActions) !== undefined);
       break;
     case "completionSoundSetting":
     case "errorSoundSetting":
@@ -611,6 +646,9 @@ export function parseHostToWebviewMessage(raw: unknown): HostToWebviewMessage | 
         hasBoolean("sandboxSupported") &&
         hasString("approvalMode") &&
         "steps" in raw;
+      break;
+    case "executionProfileState":
+      valid = hasString("profileId") && hasString("label");
       break;
     case "started":
       valid = raw.activeRuns === undefined || hasNumber("activeRuns");

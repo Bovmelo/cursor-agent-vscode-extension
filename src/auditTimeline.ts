@@ -46,6 +46,10 @@ export class AuditTimelineController implements vscode.TreeDataProvider<AuditNod
     this.changed.fire(undefined);
   }
 
+  public getSharedLogError(): string | undefined {
+    return this.sharedLogError;
+  }
+
   public getTreeItem(node: AuditNode): vscode.TreeItem {
     if (node.kind === "health") {
       const item = new vscode.TreeItem(node.label, vscode.TreeItemCollapsibleState.None);

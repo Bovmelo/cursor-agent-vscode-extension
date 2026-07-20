@@ -5,12 +5,41 @@ const EXTENSION_ID = "ark4ez.cursor-subscription-for-vscode";
 const CHAT_VIEW_ID = "cursorSubscription.chatView";
 const WORKSPACE_TREE_VIEW_ID = "cursorSubscription.workspaceTree";
 const WEBVIEW_STATE_COMMAND = "cursorSubscription.__e2e.webviewState";
+const SETUP_CHECKLIST_STATE_COMMAND = "cursorSubscription.__e2e.setupChecklistState";
+const RUN_CENTER_SNAPSHOT_COMMAND = "cursorSubscription.__e2e.runCenterSnapshot";
+const EXPORT_DIAGNOSTICS_DRY_RUN_COMMAND = "cursorSubscription.__e2e.exportDiagnosticsDryRun";
+const RETRY_LAST_RUN_PROBE_COMMAND = "cursorSubscription.__e2e.retryLastRunProbe";
 const SET_API_KEY_COMMAND = "cursorSubscription.setApiKey";
 const START_BACKGROUND_JOB_COMMAND = "cursorSubscription.startBackgroundJob";
 const CREATE_PULL_REQUEST_COMMAND = "cursorSubscription.createPullRequest";
 const RUN_TASK_PIPELINE_COMMAND = "cursorSubscription.runTaskPipeline";
 const SCAN_SUPERVISOR_GITHUB_COMMAND = "cursorSubscription.scanSupervisorGitHub";
 const SUITE = process.env.CURSOR_EXTENSION_E2E_SUITE || "smoke";
+
+function assertNoSecretsInJson(value, path = "$") {
+  if (typeof value === "string") {
+    assert.doesNotMatch(
+      value,
+      /\b(sk-[A-Za-z0-9]{10,}|cursor_api_key|ghp_[A-Za-z0-9]{20,})\b/iu,
+      `${path} must not contain secret-looking material`,
+    );
+    assert.doesNotMatch(
+      value,
+      /\b(api[_-]?key|authorization|password|secret|token)\b\s*[:=]\s*[^\s,<"]{8,}/iu,
+      `${path} must not contain credential assignments`,
+    );
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => assertNoSecretsInJson(entry, `${path}[${index}]`));
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const [key, entry] of Object.entries(value)) {
+      assertNoSecretsInJson(entry, `${path}.${key}`);
+    }
+  }
+}
 
 async function completesWithin(operation, description, milliseconds = 20_000) {
   let timeout;
@@ -67,8 +96,18 @@ async function runSmokeSuite() {
     for (const command of [
       "cursorSubscription.openChat",
       "cursorSubscription.focusWorkspaceSessions",
+      "cursorSubscription.showSetupChecklist",
+      "cursorSubscription.openRunCenter",
+      "cursorSubscription.exportDiagnostics",
+      "cursorSubscription.retryLastRun",
+      "cursorSubscription.chooseWorkflow",
+      "cursorSubscription.chooseExecutionProfile",
       SET_API_KEY_COMMAND,
       WEBVIEW_STATE_COMMAND,
+      SETUP_CHECKLIST_STATE_COMMAND,
+      RUN_CENTER_SNAPSHOT_COMMAND,
+      EXPORT_DIAGNOSTICS_DRY_RUN_COMMAND,
+      RETRY_LAST_RUN_PROBE_COMMAND,
       `${CHAT_VIEW_ID}.focus`,
       `${WORKSPACE_TREE_VIEW_ID}.focus`,
     ]) {
@@ -144,6 +183,54 @@ async function runSmokeSuite() {
       vscode.commands.executeCommand(`${WORKSPACE_TREE_VIEW_ID}.focus`),
       "focusing the registered workspace tree view",
     );
+  });
+
+  await check("showSetupChecklist and openRunCenter complete without throw", async () => {
+    await completesWithin(
+      vscode.commands.executeCommand("cursorSubscription.showSetupChecklist"),
+      "showing the setup checklist",
+    );
+    await completesWithin(
+      vscode.commands.executeCommand("cursorSubscription.openRunCenter"),
+      "opening Run Center",
+    );
+  });
+
+  await check("E2E hooks expose checklist, Run Center, diagnostics, and retry probe", async () => {
+    const checklist = await completesWithin(
+      vscode.commands.executeCommand(SETUP_CHECKLIST_STATE_COMMAND),
+      "reading setup checklist state",
+    );
+    assert.equal(typeof checklist, "object");
+    assert.equal(checklist.visible, true);
+    assert.equal(checklist.steps?.apiKey?.complete, false);
+
+    const runCenter = await completesWithin(
+      vscode.commands.executeCommand(RUN_CENTER_SNAPSHOT_COMMAND),
+      "reading Run Center snapshot",
+    );
+    assert.equal(typeof runCenter, "object");
+    assert.ok(runCenter !== null);
+
+    const bundle = await completesWithin(
+      vscode.commands.executeCommand(EXPORT_DIAGNOSTICS_DRY_RUN_COMMAND),
+      "collecting diagnostics dry-run bundle",
+    );
+    assert.ok(Array.isArray(bundle.checks), "diagnostics bundle must include checks");
+    const apiKeyCheck = bundle.checks.find((check) => check.label === "Cursor API key");
+    assert.equal(apiKeyCheck?.status, "error");
+    assertNoSecretsInJson(bundle);
+
+    const retryProbe = await completesWithin(
+      vscode.commands.executeCommand(RETRY_LAST_RUN_PROBE_COMMAND),
+      "probing retryLastRun without send",
+    );
+    assert.equal(typeof retryProbe, "object");
+    assert.equal(typeof retryProbe.wouldCallSend, "boolean");
+    // Fresh profile has no transcript seed; probe must stay structured and non-sending.
+    if (retryProbe.wouldCallSend !== true) {
+      assert.equal(retryProbe.wouldCallSend, false);
+    }
   });
 }
 

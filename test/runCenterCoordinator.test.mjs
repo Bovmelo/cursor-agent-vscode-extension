@@ -68,12 +68,50 @@ test("conversation projection combines runtime, plan, session, and verification 
   });
   assert.equal(state.plan[0].status, "blocked");
   assert.equal(state.changes[0].path, "src/feature.ts");
+  assert.deepEqual(state.changes[0].open, {
+    command: "cursorSubscription.openSessionFile",
+    arguments: ["session", "C:\\repo\\src\\feature.ts"],
+  });
   assert.equal(state.verification[0].status, "failed");
   assert.deepEqual(
     state.recoveryActions.map((action) => action.id),
     ["review", "verify"],
   );
   assert.equal(state.updatedAt, 500);
+});
+
+test("assistant errors expose retry, logs, diagnostics, and Run Center recovery", () => {
+  const state = buildRunCenterState({
+    conversations: [
+      conversation("failed", "Failed run", 100, {
+        text: "Boom\nRun: run-xyz",
+        error: true,
+        progressState: "error",
+      }),
+    ],
+    now: 500,
+  });
+  const japanese = buildRunCenterState(
+    {
+      conversations: [
+        conversation("failed", "Failed run", 100, {
+          text: "Boom",
+          error: true,
+          progressState: "error",
+        }),
+      ],
+      now: 500,
+    },
+    true,
+  );
+
+  assert.deepEqual(
+    state.recoveryActions.map((action) => action.id),
+    ["retry", "logs", "diagnostics", "runCenter"],
+  );
+  assert.equal(state.recoveryActions.at(-1).command, "cursorSubscription.openRunCenter");
+  assert.equal(state.recoveryActions.at(-1).label, "Open Run Center");
+  assert.equal(japanese.recoveryActions.at(-1).label, "実行センターを開く");
 });
 
 test("an active background run takes precedence over a newer conversation", () => {
@@ -133,6 +171,14 @@ test("failed background recovery accurately offers a new agent", () => {
   assert.equal(state.recoveryActions[0].label, "Start a new background agent");
   assert.equal(japanese.recoveryActions[0].label, "新しいバックグラウンドAgentを開始");
   assert.equal(state.recoveryActions[0].command, "cursorSubscription.startBackgroundJob");
+  assert.deepEqual(
+    state.recoveryActions.map((action) => action.command),
+    [
+      "cursorSubscription.startBackgroundJob",
+      "cursorSubscription.openOutput",
+      "cursorSubscription.exportDiagnostics",
+    ],
+  );
 });
 
 test("older completed operational results yield to the current conversation", () => {
@@ -180,6 +226,10 @@ test("supervisor projection resolves dependency and blocked recovery state", () 
     status: "modified",
     additions: 4,
     deletions: 1,
+    open: {
+      command: "cursorSubscription.openSupervisorChange",
+      arguments: [{ taskId: "task", relative: "src/app.ts" }],
+    },
   });
   assert.equal(state.error.message, "Owned by another task");
   assert.deepEqual(

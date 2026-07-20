@@ -1062,6 +1062,24 @@ mark.chat-find-hit.chat-find-current {
   border-radius: 10px;
   cursor: pointer;
 }
+.error-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+.error-action {
+  padding: 3px 10px;
+  font-size: 11px;
+  color: var(--vscode-badge-foreground);
+  background: var(--vscode-badge-background);
+  border: 0;
+  border-radius: 10px;
+  cursor: pointer;
+}
+.error-action:hover {
+  filter: brightness(1.08);
+}
 .context-note {
   margin-top: 5px;
   font-size: 11px;

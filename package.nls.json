@@ -67,6 +67,7 @@
   "view.auditTimeline": "AI Audit Timeline",
   "viewsWelcome.chat": "Choose a goal to get started.\n[Ask, change, delegate, or review](command:cursorSubscription.chooseWorkflow)\n[Resume setup](command:cursorSubscription.showSetupChecklist)",
   "viewsWelcome.workspace": "Track runs, changes, verification, and recovery here.\n[Choose a workflow](command:cursorSubscription.chooseWorkflow)\n[Export diagnostics](command:cursorSubscription.exportDiagnostics)",
+  "config.executionProfile.description": "Preset that configures safety and automation controls together. Prefer **Cursor: Choose Execution Profile** so related settings stay consistent; editing individual keys may leave a custom combination.",
   "config.enableAiNativeFeatures.description": "Master switch for the additional AI-native editor features. Core chat remains available when disabled.",
   "config.maxParallelChatAgents.description": "Maximum normal chat agents that may run at once across separate conversations. Concurrent calls can consume plan quota simultaneously, and agents editing the same files may conflict.",
   "config.runPreparationTimeoutSeconds.description": "Maximum seconds to wait for Cursor agent connection, run creation, or the first response. A stalled run is discarded so the next message can start cleanly.",

@@ -16,7 +16,44 @@ const bundle = {
   workspaceTrusted: true,
   workspaceCount: 1,
   approvalMode: "auto-review",
+  executionProfile: "balanced",
+  profileMatch: "custom",
   checks: [{ label: "Git", status: "ok", detail: "api_key=do-not-share" }],
+  configurationSnapshot: [
+    { label: "supervisorMode", status: "ok", detail: "observe" },
+    { label: "shared log", status: "warning", detail: "token=abc12345" },
+  ],
+  recentBackgroundJobs: [
+    {
+      id: "job-1",
+      title: "Background with password=hunter2",
+      status: "error",
+      updatedAt: "2026-07-20T00:00:00.000Z",
+      error: "Authorization: Bearer abcdefghijklmnop",
+    },
+  ],
+  runCenter: {
+    runId: "run-1",
+    title: "Run with secret=value",
+    progress: {
+      message: "Working",
+      status: "running",
+      detail: "https://user:pass@example.com",
+    },
+    error: "cookie=session",
+  },
+  recentSupervisorTasks: [
+    {
+      id: "task-1",
+      title: "Supervisor",
+      status: "failed",
+      source: "manual",
+      updatedAt: "2026-07-20T00:00:00.000Z",
+      error: "gh_token=leak",
+      blockedReasons: ["api_key=blocked"],
+    },
+  ],
+  auditSharedLogError: "failed to write password=shared-secret",
 };
 
 test("diagnostic redaction removes common credential forms", () => {
@@ -27,7 +64,19 @@ test("diagnostic redaction removes common credential forms", () => {
 test("diagnostic bundles are sanitized before Markdown export", () => {
   const sanitized = sanitizeDiagnosticsBundle(bundle);
   assert.equal(sanitized.checks[0].detail, "api_key=<redacted>");
+  assert.equal(sanitized.configurationSnapshot?.[1].detail, "token=<redacted>");
+  assert.equal(sanitized.recentBackgroundJobs?.[0].title, "Background with password=<redacted>");
+  assert.equal(sanitized.runCenter?.title, "Run with secret=<redacted>");
+  assert.equal(sanitized.recentSupervisorTasks?.[0].error, "gh_token=<redacted>");
+  assert.equal(sanitized.auditSharedLogError, "failed to write password=<redacted>");
+
   const markdown = formatDiagnosticsMarkdown(bundle);
   assert.match(markdown, /Cursor Agent Diagnostics/u);
-  assert.doesNotMatch(markdown, /do-not-share/u);
+  assert.match(markdown, /## Recent background jobs/u);
+  assert.match(markdown, /## Run Center/u);
+  assert.match(markdown, /## Recent supervisor tasks/u);
+  assert.match(markdown, /## Configuration snapshot/u);
+  assert.match(markdown, /Profile match: custom/u);
+  assert.doesNotMatch(markdown, /do-not-share|hunter2|abcdefghijklmnop|shared-secret|user:pass/u);
+  assert.doesNotMatch(JSON.stringify(sanitized), /prompt/iu);
 });

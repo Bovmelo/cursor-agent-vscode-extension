@@ -178,7 +178,7 @@ import {
   defaultWorkspaceFolder,
 } from "./workspaceFolder.js";
 import { WebviewController } from "./webviewController.js";
-import type { HostToWebviewMessage } from "./webviewMessages.js";
+import type { HostToWebviewMessage, RecoveryActionId } from "./webviewMessages.js";
 import { PromptFocusHandoff } from "./promptFocusHandoff.js";
 import { cleanupOrphanedManagedWorktrees } from "./worktreeLifecycle.js";
 import { ApplyQueue, FileOwnershipCoordinator } from "./parallelOwnership.js";
@@ -218,11 +218,35 @@ import {
 } from "./safety.js";
 import { runExecutableCommand } from "./shellCommand.js";
 import { githubCliEnv } from "./shellEnv.js";
-import { type ExecutionProfileId } from "./executionProfiles.js";
+import {
+  currentExecutionProfileLabel,
+  matchExecutionProfile,
+  type ExecutionProfileId,
+  type ExecutionProfileSettingValue,
+} from "./executionProfiles.js";
 import { type DiagnosticsBundle } from "./diagnosticsBundle.js";
+import {
+  summarizeBackgroundJobs,
+  summarizeRunCenter,
+  summarizeSupervisorTasks,
+} from "./diagnosticsCollectors.js";
+import {
+  buildConfigurationSnapshot,
+  buildRecentAuditSnapshot,
+  buildRecentRunsFromConversations,
+  configurationKeysForDiagnostics,
+} from "./diagnosticsCollect.js";
+import {
+  conversationSummaries as buildConversationSummaries,
+  conversationToMarkdown as formatConversationMarkdown,
+  findConversationForRetry,
+} from "./conversationUi.js";
+import { buildSetupChecklistState, type SetupChecklistState } from "./setupChecklistState.js";
+import { buildRunCenterHostSnapshot } from "./runCenterSnapshot.js";
 import { WorkflowController } from "./workflowController.js";
 import { DiagnosticsController } from "./diagnosticsController.js";
 import { RunCenterCoordinator } from "./runCenterCoordinator.js";
+import type { RunCenterState } from "./runCenterModel.js";
 
 const API_KEY_SECRET = "cursorSubscription.apiKey";
 const CONVERSATIONS_KEY = "cursorSubscription.conversations";
@@ -247,6 +271,11 @@ const INLINE_COMPLETION_STATS_KEY = "cursorSubscription.inlineCompletionStats";
 const VIEW_ID = "cursorSubscription.chatView";
 const E2E_MARKER = "CURSOR_SUBSCRIPTION_E2E";
 const E2E_WEBVIEW_STATE_COMMAND = "cursorSubscription.__e2e.webviewState";
+const E2E_SETUP_CHECKLIST_COMMAND = "cursorSubscription.__e2e.setupChecklistState";
+const E2E_RUN_CENTER_SNAPSHOT_COMMAND = "cursorSubscription.__e2e.runCenterSnapshot";
+const E2E_EXPORT_DIAGNOSTICS_DRY_RUN_COMMAND = "cursorSubscription.__e2e.exportDiagnosticsDryRun";
+const E2E_RETRY_LAST_RUN_PROBE_COMMAND = "cursorSubscription.__e2e.retryLastRunProbe";
+const RUN_FAILURE_RECOVERY_ACTIONS = ["retry", "diagnostics", "runCenter"] as const satisfies readonly RecoveryActionId[];
 const DEFAULT_MODEL = "auto";
 const IS_JAPANESE = vscode.env.language.toLowerCase().startsWith("ja");
 const MAX_DROPPED_FILE_BYTES = 20 * 1024 * 1024;
@@ -372,6 +401,12 @@ export function activate(context: vscode.ExtensionContext): void {
     backgroundJobs: () => backgroundJobs.snapshots(),
     supervisorTasks: () => supervisor.snapshots(),
   });
+  provider.setDiagnosticsSources({
+    backgroundJobs: () => backgroundJobs.snapshots(),
+    supervisorTasks: () => supervisor.snapshots(),
+    runCenter: () => runCenter.snapshot,
+    auditSharedLogError: () => auditTimeline.getSharedLogError(),
+  });
   const runCenterBackgroundSubscription = backgroundJobs.onDidChangeTreeData(() =>
     provider.refreshRunCenterView(),
   );
@@ -471,9 +506,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("cursorSubscription.chooseWorkflow", () =>
       provider.chooseWorkflow(),
     ),
-    vscode.commands.registerCommand("cursorSubscription.chooseExecutionProfile", () =>
-      provider.chooseExecutionProfile(),
-    ),
+    vscode.commands.registerCommand("cursorSubscription.chooseExecutionProfile", async () => {
+      await provider.chooseExecutionProfile();
+    }),
     vscode.commands.registerCommand("cursorSubscription.openOutput", () => output.show(true)),
     vscode.commands.registerCommand("cursorSubscription.exportDiagnostics", () =>
       provider.exportDiagnostics(),
@@ -727,12 +762,26 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
   );
 
+  provider.publishExecutionProfileState();
+
   if (
     process.env[E2E_MARKER] === "1" &&
     context.extensionMode !== vscode.ExtensionMode.Production
   ) {
     context.subscriptions.push(
       vscode.commands.registerCommand(E2E_WEBVIEW_STATE_COMMAND, () => provider.e2eWebviewState()),
+      vscode.commands.registerCommand(E2E_SETUP_CHECKLIST_COMMAND, () =>
+        provider.e2eSetupChecklistState(),
+      ),
+      vscode.commands.registerCommand(E2E_RUN_CENTER_SNAPSHOT_COMMAND, () =>
+        provider.e2eRunCenterSnapshot(),
+      ),
+      vscode.commands.registerCommand(E2E_EXPORT_DIAGNOSTICS_DRY_RUN_COMMAND, () =>
+        provider.e2eExportDiagnosticsDryRun(),
+      ),
+      vscode.commands.registerCommand(E2E_RETRY_LAST_RUN_PROBE_COMMAND, () =>
+        provider.e2eRetryLastRunProbe(),
+      ),
     );
   }
 }
@@ -781,6 +830,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     backgroundJobs: () => readonly BackgroundJob[];
     supervisorTasks: () => readonly SupervisorTask[];
   };
+  private diagnosticsSources?: {
+    backgroundJobs: () => readonly BackgroundJob[];
+    supervisorTasks: () => readonly SupervisorTask[];
+    runCenter: () => RunCenterState;
+    auditSharedLogError: () => string | undefined;
+  };
+  private lastSetupChecklistState?: SetupChecklistState;
+  private executionProfileStatusBar?: vscode.StatusBarItem;
   private auditWriteQueue: Promise<void> = Promise.resolve();
   private readonly previewContents = new Map<string, string>();
   private projectCommands: ProjectCommand[] = [];
@@ -952,6 +1009,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.refreshRunCenter();
   }
 
+  public setDiagnosticsSources(sources: {
+    backgroundJobs: () => readonly BackgroundJob[];
+    supervisorTasks: () => readonly SupervisorTask[];
+    runCenter: () => RunCenterState;
+    auditSharedLogError: () => string | undefined;
+  }): void {
+    this.diagnosticsSources = sources;
+  }
+
   public refreshRunCenterView(): void {
     this.refreshRunCenter();
   }
@@ -969,16 +1035,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
   public async chooseExecutionProfile(): Promise<void> {
     await this.workflowController.chooseExecutionProfile();
+    this.publishExecutionProfileState();
   }
 
   public async retryLastRun(): Promise<void> {
-    const conversation =
-      this.conversationStore.active() ??
-      [...this.conversations].sort((left, right) => right.updatedAt - left.updatedAt)[0];
-    const lastPrompt = conversation
-      ? [...conversation.transcript].reverse().find((entry) => entry.role === "user")
-      : undefined;
-    if (!conversation || !lastPrompt?.text.trim()) {
+    const target = findConversationForRetry(this.conversations, this.activeId);
+    if (!target) {
       void vscode.window.showInformationMessage(
         localize(
           "There is no previous prompt to retry.",
@@ -987,9 +1049,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       );
       return;
     }
-    this.activeId = conversation.id;
+    this.activeId = target.conversation.id;
     this.showingHome = false;
-    await this.send(lastPrompt.text, false, lastPrompt.files ?? [], "agent", []);
+    await this.send(
+      target.lastUserPrompt.text,
+      false,
+      target.lastUserPrompt.files ?? [],
+      "agent",
+      [],
+    );
     await this.drainMessageQueue();
   }
 
@@ -1004,37 +1072,29 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       this.detectGhCli(true),
     ]);
     const blockedProxy = detectBlockedProxyEnvironment();
-    const recentAudit = this.context.workspaceState
-      .get<AuditEntry[]>(AUDIT_LOG_KEY, [])
-      .slice(0, 20)
-      .map((entry) => ({
-        at: new Date(entry.at).toISOString(),
-        action: entry.action,
-        summary: entry.summary,
-        taskId: entry.taskId,
-        sessionId: entry.sessionId,
-      }));
-    const recentRuns = [...this.conversations]
-      .sort((left, right) => right.updatedAt - left.updatedAt)
-      .slice(0, 20)
-      .flatMap((conversation) => {
-        const result = [...conversation.transcript]
-          .reverse()
-          .find((entry) => entry.role === "assistant");
-        if (!result) return [];
-        const runId = /(?:^|\n)Run:\s*([^\s]+)/u.exec(result.text)?.[1];
-        return [
-          {
-            title: conversation.title,
-            state: result.progressState ?? (result.error ? "error" : "completed"),
-            detail: result.error ? result.text.slice(0, 500) : undefined,
-            runId,
-          },
-        ];
-      });
+    const configuration = vscode.workspace.getConfiguration("cursorSubscription");
+    const settings: Record<string, ExecutionProfileSettingValue | undefined> = {};
+    for (const key of configurationKeysForDiagnostics()) {
+      settings[key] = configuration.get(key) as ExecutionProfileSettingValue | undefined;
+    }
+    const approvalMode = this.selectedApprovalMode();
+    const storedProfile = this.context.workspaceState.get<string>(EXECUTION_PROFILE_KEY);
+    const profileMatch = matchExecutionProfile({
+      settings: Object.fromEntries(
+        Object.entries(settings).filter(
+          (entry): entry is [string, ExecutionProfileSettingValue] => entry[1] !== undefined,
+        ),
+      ),
+      approvalMode,
+      supportsLocalSandbox: SUPPORTS_LOCAL_SANDBOX,
+    });
     const version = String(
       (this.context.extension.packageJSON as { version?: unknown }).version ?? "unknown",
     );
+    const backgroundJobs = this.diagnosticsSources?.backgroundJobs() ?? [];
+    const supervisorTasks = this.diagnosticsSources?.supervisorTasks() ?? [];
+    const runCenterState = this.diagnosticsSources?.runCenter();
+    const auditSharedLogError = this.diagnosticsSources?.auditSharedLogError();
     return {
       generatedAt: new Date().toISOString(),
       extensionVersion: version,
@@ -1044,8 +1104,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       language: vscode.env.language,
       workspaceTrusted: vscode.workspace.isTrusted,
       workspaceCount: vscode.workspace.workspaceFolders?.length ?? 0,
-      approvalMode: this.selectedApprovalMode(),
-      executionProfile: this.context.workspaceState.get<string>(EXECUTION_PROFILE_KEY),
+      approvalMode,
+      executionProfile: storedProfile,
       selectedModel: this.selectedModel(),
       checks: [
         {
@@ -1062,8 +1122,23 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           detail: blockedProxy ? `${blockedProxy.variable}=${blockedProxy.address}` : undefined,
         },
       ],
-      recentRuns,
-      recentAudit,
+      recentRuns: buildRecentRunsFromConversations(this.conversations),
+      recentAudit: buildRecentAuditSnapshot(
+        this.context.workspaceState.get<AuditEntry[]>(AUDIT_LOG_KEY, []),
+      ),
+      recentBackgroundJobs: summarizeBackgroundJobs(backgroundJobs),
+      runCenter: runCenterState ? summarizeRunCenter(runCenterState) : undefined,
+      recentSupervisorTasks: summarizeSupervisorTasks(supervisorTasks),
+      auditSharedLogError,
+      profileMatch,
+      configurationSnapshot: buildConfigurationSnapshot(settings, [
+        { label: "approvalMode", status: "ok", detail: approvalMode },
+        {
+          label: "executionProfile",
+          status: "ok",
+          detail: storedProfile ?? "custom",
+        },
+      ]),
     };
   }
 
@@ -1072,6 +1147,81 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       attached: this.webviewController.attached,
       ready: this.webviewReady,
     };
+  }
+
+  public async e2eSetupChecklistState(): Promise<SetupChecklistState> {
+    if (this.lastSetupChecklistState) {
+      return this.lastSetupChecklistState;
+    }
+    return this.buildCurrentSetupChecklistState();
+  }
+
+  public e2eRunCenterSnapshot(): RunCenterState | undefined {
+    return this.runCenter?.snapshot;
+  }
+
+  public async e2eExportDiagnosticsDryRun(): Promise<DiagnosticsBundle> {
+    return this.collectDiagnosticsBundle();
+  }
+
+  public e2eRetryLastRunProbe(): {
+    wouldCallSend: boolean;
+    conversationId?: string;
+    promptLength?: number;
+  } {
+    const target = findConversationForRetry(this.conversations, this.activeId);
+    if (!target) {
+      return { wouldCallSend: false };
+    }
+    return {
+      wouldCallSend: true,
+      conversationId: target.conversation.id,
+      promptLength: target.lastUserPrompt.text.length,
+    };
+  }
+
+  public publishExecutionProfileState(): void {
+    const stored = this.context.workspaceState.get<ExecutionProfileId>(EXECUTION_PROFILE_KEY);
+    const configuration = vscode.workspace.getConfiguration("cursorSubscription");
+    const settings: Record<string, ExecutionProfileSettingValue> = {};
+    for (const key of configurationKeysForDiagnostics()) {
+      const value = configuration.get(key);
+      if (
+        typeof value === "boolean" ||
+        typeof value === "number" ||
+        typeof value === "string"
+      ) {
+        settings[key] = value;
+      }
+    }
+    const matched = matchExecutionProfile({
+      settings,
+      approvalMode: this.selectedApprovalMode(),
+      supportsLocalSandbox: SUPPORTS_LOCAL_SANDBOX,
+    });
+    const profileId = stored ?? matched;
+    const label = currentExecutionProfileLabel(profileId, IS_JAPANESE);
+    if (!this.executionProfileStatusBar) {
+      this.executionProfileStatusBar = vscode.window.createStatusBarItem(
+        vscode.StatusBarAlignment.Right,
+        50,
+      );
+      this.executionProfileStatusBar.command = "cursorSubscription.chooseExecutionProfile";
+      this.disposables.push(this.executionProfileStatusBar);
+    }
+    this.executionProfileStatusBar.text = `$(shield) ${label}`;
+    this.executionProfileStatusBar.tooltip = localize(
+      "Cursor execution profile — click to change",
+      "Cursor実行プロファイル — クリックで変更",
+    );
+    this.executionProfileStatusBar.show();
+    if (this.webviewReady) {
+      this.post({
+        type: "executionProfileState",
+        profileId,
+        label,
+      });
+    }
   }
 
   private async withOrchestratorLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -1130,6 +1280,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             }
             await this.publishAuthState();
             await this.publishSetupChecklistState();
+            this.publishExecutionProfileState();
             await this.flushPendingChatFiles();
             // Chat queues are in-memory. Rebuild pending orchestration launches
             // from persisted experiment state after an extension-host restart.
@@ -1514,6 +1665,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             if (typeof message.id === "string") {
               await this.runSetupChecklistAction(message.id);
             }
+            break;
+          case "runRecoveryAction":
+            await this.handleRecoveryAction(message.action);
             break;
         }
       },
@@ -4651,35 +4805,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     totalTokens: number;
     experimentGroupId?: string;
   }> {
-    const normalized = query.trim().toLowerCase();
-    return [...this.conversations]
-      .filter((conversation) => {
-        if (!normalized) {
-          return true;
-        }
-        if (conversation.title.toLowerCase().includes(normalized)) {
-          return true;
-        }
-        return conversation.transcript.some((entry) =>
-          entry.text.toLowerCase().includes(normalized),
-        );
-      })
-      .sort((a, b) => {
-        if (Boolean(a.pinned) !== Boolean(b.pinned)) {
-          return a.pinned ? -1 : 1;
-        }
-        return b.updatedAt - a.updatedAt;
-      })
-      .map(({ id, title, updatedAt, pinned, tokenUsage, experimentGroupId }) => ({
-        id,
-        title,
-        updatedAt,
-        running: this.isConversationBusy(id),
-        queued: this.messageQueue.some((item) => item.conversationId === id),
-        pinned: pinned === true,
-        totalTokens: tokenUsage?.totalTokens ?? 0,
-        experimentGroupId,
-      }));
+    return buildConversationSummaries(this.conversations, query, {
+      isBusy: (id) => this.isConversationBusy(id),
+      isQueued: (id) => this.messageQueue.some((item) => item.conversationId === id),
+    });
   }
 
   private async saveConversations(): Promise<void> {
@@ -4881,31 +5010,46 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (!this.runCenter) return;
     const session = this.changeSessions.snapshot();
     this.runCenter.pushState(
-      this.runCenterCoordinator.buildState({
-        conversations: this.conversations,
-        runtimes: [...this.chatRuntimes.entries()].map(([conversationId, runtime]) => ({
-          conversationId,
-          busy: runtime.busy,
-          live: runtime.live
+      this.runCenterCoordinator.buildState(
+        buildRunCenterHostSnapshot({
+          conversations: this.conversations,
+          runtimes: [...this.chatRuntimes.entries()].map(([conversationId, runtime]) => ({
+            conversationId,
+            busy: runtime.busy,
+            live: runtime.live
+              ? {
+                  assistantText: runtime.live.assistantText,
+                  progressSteps: [...runtime.live.progressSteps.values()],
+                  progressState: runtime.live.progressState,
+                }
+              : undefined,
+          })),
+          activeConversationId: this.activeId,
+          queuedConversationIds: this.messageQueue.map((item) => item.conversationId),
+          session: session
             ? {
-                assistantText: runtime.live.assistantText,
-                progressSteps: [...runtime.live.progressSteps.values()],
-                progressState: runtime.live.progressState,
+                id: session.id,
+                goal: session.goal,
+                root: session.root,
+                files: session.files,
+                pendingFiles: this.changeSessions.pendingFiles(session.id),
+                verification: session.verification
+                  ? {
+                      success: session.verification.success,
+                      steps: session.verification.steps.map((step) => ({
+                        command: step.command,
+                        success: step.success,
+                        output: step.output,
+                      })),
+                    }
+                  : undefined,
               }
             : undefined,
-        })),
-        activeConversationId: this.activeId,
-        queuedConversationIds: this.messageQueue.map((item) => item.conversationId),
-        session: session
-          ? {
-              ...session,
-              pendingFiles: this.changeSessions.pendingFiles(session.id),
-            }
-          : undefined,
-        plan: this.executionPlans[0],
-        backgroundJobs: this.runCenterSources?.backgroundJobs() ?? [],
-        supervisorTasks: this.runCenterSources?.supervisorTasks() ?? [],
-      }),
+          plan: this.executionPlans[0],
+          backgroundJobs: this.runCenterSources?.backgroundJobs() ?? [],
+          supervisorTasks: this.runCenterSources?.supervisorTasks() ?? [],
+        }),
+      ),
     );
   }
 
@@ -4971,28 +5115,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private conversationToMarkdown(conversation: Conversation): string {
-    const lines = [
-      `# ${conversation.title}`,
-      "",
-      `- Created: ${new Date(conversation.createdAt).toISOString()}`,
-      `- Updated: ${new Date(conversation.updatedAt).toISOString()}`,
-      `- Tokens: ${conversation.tokenUsage?.totalTokens ?? 0}`,
-      "",
-    ];
-    for (const entry of conversation.transcript) {
-      lines.push(`## ${entry.role === "user" ? "User" : "Assistant"}`);
-      lines.push("");
-      lines.push(entry.text);
-      lines.push("");
-      if (entry.files?.length) {
-        lines.push("Edited files:");
-        for (const file of entry.files) {
-          lines.push(`- ${file}`);
-        }
-        lines.push("");
-      }
-    }
-    return lines.join("\n");
+    return formatConversationMarkdown(conversation);
   }
 
   private ensureConversation(prompt: string): Conversation {
@@ -5839,6 +5962,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       this.postIfActive(conversationId, {
         type: "error",
         text: error instanceof Error ? error.message : String(error),
+        recoveryActions: RUN_FAILURE_RECOVERY_ACTIONS,
       });
       // Run was reserved then aborted during prep — drain any waiting messages.
       setTimeout(() => void this.drainMessageQueue(), 0);
@@ -6466,6 +6590,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           this.postIfActive(conversationId, {
             type: "error",
             text: errorText,
+            recoveryActions: RUN_FAILURE_RECOVERY_ACTIONS,
           });
           assistantText = assistantText ? `${assistantText}\n\n${errorText}` : errorText;
         }
@@ -6745,7 +6870,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               ? error.message
               : String(error);
       if (!wasCancelled) {
-        this.postIfActive(conversationId, { type: "error", text });
+        this.postIfActive(conversationId, {
+          type: "error",
+          text,
+          recoveryActions: RUN_FAILURE_RECOVERY_ACTIONS,
+        });
       }
       if (!assistantText) {
         assistantText = text;
@@ -7124,6 +7253,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const openLabel = localize("Open Chat", "チャットを開く");
     const logsLabel = localize("Open Logs", "ログを開く");
     const retryLabel = localize("Retry", "再試行");
+    const diagnosticsLabel = localize("Export diagnostics", "診断をエクスポート");
+    const runCenterLabel = localize("Open Run Center", "Run Centerを開く");
     const title = conversation.title || localize("Chat", "チャット");
     const message =
       progressState === "error"
@@ -7132,12 +7263,27 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
     const show =
       progressState === "error"
-        ? vscode.window.showErrorMessage(message, openLabel, logsLabel, retryLabel)
+        ? vscode.window.showErrorMessage(
+            message,
+            openLabel,
+            retryLabel,
+            diagnosticsLabel,
+            runCenterLabel,
+            logsLabel,
+          )
         : vscode.window.showInformationMessage(message, openLabel);
 
     void show.then(async (answer) => {
       if (answer === logsLabel) {
-        this.output.show(true);
+        await vscode.commands.executeCommand("cursorSubscription.openOutput");
+        return;
+      }
+      if (answer === diagnosticsLabel) {
+        await vscode.commands.executeCommand("cursorSubscription.exportDiagnostics");
+        return;
+      }
+      if (answer === runCenterLabel) {
+        await vscode.commands.executeCommand("cursorSubscription.openRunCenter");
         return;
       }
       if (answer === retryLabel) {
@@ -8757,10 +8903,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     return available;
   }
 
-  private async publishSetupChecklistState(options?: { forceGhProbe?: boolean }): Promise<void> {
-    if (!this.webviewReady) {
-      return;
-    }
+  private async buildCurrentSetupChecklistState(options?: {
+    forceGhProbe?: boolean;
+  }): Promise<SetupChecklistState> {
     const dismissed = this.context.workspaceState.get<boolean>(
       SETUP_CHECKLIST_DISMISSED_KEY,
       false,
@@ -8780,23 +8925,47 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       false,
     );
     const ghAvailable = await this.detectGhCli(options?.forceGhProbe === true);
-    const ghDone = ghAvailable || ghSkipped;
+    return buildSetupChecklistState({
+      dismissed,
+      apiKeyConfigured,
+      workspaceTrusted: vscode.workspace.isTrusted,
+      hasWorkspace,
+      gitReady,
+      permissionsConfirmed,
+      approvalMode,
+      ghSkipped,
+      ghAvailable,
+      sandboxSupported: SUPPORTS_LOCAL_SANDBOX,
+    });
+  }
+
+  private async publishSetupChecklistState(options?: { forceGhProbe?: boolean }): Promise<void> {
+    const state = await this.buildCurrentSetupChecklistState(options);
+    this.lastSetupChecklistState = state;
+    if (!this.webviewReady) {
+      return;
+    }
     this.post({
       type: "setupChecklistState",
-      // Keep the reconnect path visible until the only universally required
-      // step is complete. Git, trust, permissions, and gh remain contextual.
-      visible: !dismissed || !apiKeyConfigured,
-      dismissed,
-      sandboxSupported: SUPPORTS_LOCAL_SANDBOX,
-      approvalMode,
-      steps: {
-        apiKey: { complete: apiKeyConfigured },
-        workspaceTrust: { complete: vscode.workspace.isTrusted },
-        gitWorkspace: { complete: hasWorkspace && gitReady, hasWorkspace, gitReady },
-        permissions: { complete: permissionsConfirmed, mode: approvalMode },
-        gh: { complete: ghDone, available: ghAvailable, optional: true },
-      },
+      ...state,
     });
+  }
+
+  private async handleRecoveryAction(action: RecoveryActionId): Promise<void> {
+    switch (action) {
+      case "retry":
+        await this.retryLastRun();
+        break;
+      case "diagnostics":
+        await vscode.commands.executeCommand("cursorSubscription.exportDiagnostics");
+        break;
+      case "runCenter":
+        await vscode.commands.executeCommand("cursorSubscription.openRunCenter");
+        break;
+      case "logs":
+        await vscode.commands.executeCommand("cursorSubscription.openOutput");
+        break;
+    }
   }
 
   private async publishModels(apiKey: string): Promise<void> {

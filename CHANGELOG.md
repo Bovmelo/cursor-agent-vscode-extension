@@ -2,28 +2,26 @@
 
 ## Unreleased
 
-- Added a goal-first Ask / Change / Delegate / Review entry point and Safe / Balanced / Automation execution presets
+## 0.2.0 - 2026-07-20
+
+- Added a goal-first Ask / Change / Delegate / Review entry point and Safe / Balanced / Automation execution presets (Settings schema + status-bar / chat footer discoverability)
 - Added a Workspace Run Center that unifies plan, progress, changes, verification, errors, and recovery actions across chat, Supervisor, and background runs
-- Added redacted diagnostic export, log/retry actions for failed runs, and visible shared-audit write health
+- Run Center change rows open session or Supervisor diffs; Japanese sidebar labels; chat error banners and desktop notifications link to Retry / Export diagnostics / Open Run Center
+- Added redacted diagnostic export (including background jobs, Run Center, Supervisor, shared-audit health, and profile match), log/retry actions for failed runs, and visible shared-audit write health
 - Versioned and bounded conversation persistence with serialized debounced writes, migration, pruning, and shutdown flush
 - Hardened attachments with file/count/batch limits, dangerous-type and symlink rejection, exact managed-root recovery/deletion, and retained orphan cleanup
 - Replaced fixed background polling with an adaptive one-shot scheduler, durable repository boundary, and pure fail-closed state machine
 - Extracted Webview CSS/client assets, introduced a shared typed message contract, and strengthened keyboard focus/live-region validation
-- Added a provider-neutral Agent backend boundary with Cursor SDK capability negotiation
+- Added a provider-neutral Agent backend boundary with Cursor SDK capability negotiation (test-only `MockAgentBackend`)
+- Extracted chat send/queue, conversation UI, setup checklist, Run Center host snapshot, and diagnostics collect helpers from `extension.ts`
 - Added lint, formatting, coverage, dependency-audit, Webview accessibility, and cross-platform quality gates
 - Replaced the vulnerable transitive `undici@5` production path with a pinned `undici@7.28.0` override and removed all temporary audit exceptions
-
-Planned toward 0.2.x (see [ROADMAP.md](./ROADMAP.md)); stabilize before net-new Supervisor / automation features:
-
-- Harden Extension Host E2E coverage, Workspace Trust gates, and API-key handling paths (SecretStorage / stdin-only workers; no key material in jobs, logs, or docs)
-- Expand CI to include macOS validate + darwin-arm64 package smoke; Extension Host E2E stays Linux/Windows-only (headless Electron)
-- Fix release workflow Marketplace publish: always run `publish-marketplace` after release; skip the publish step when `VSCE_PAT` is unset (env-only; no invalid job-level `secrets` `if`); warn + step summary on skip; concurrency + publish preflight
-- Extracted chat send / queue helpers into `chatSendQueue.ts` (wired from `extension.ts`; batch requeue preserves order)
-- Added a first-run setup checklist in the Agent sidebar (API key, workspace trust, Git workspace, permission mode, optional `gh`), with dismiss/completion persisted in workspace state and reopen from the Agent More menu or Command Palette
-- Hardened GitHub trigger unit tests (`gh pr view --json` contract, fingerprint key material, graceful API edge cases)
-- Hardened untrusted-workspace E2E trust-gate assertions and suite-child credential scrubbing (also scrub `VSCE_PAT` / Azure / npm tokens from suite children)
-- Extracted `githubIssues.ts` / `taskPipeline.ts` helpers; mocked `gh issue list` + Task Pipeline pure/wiring tests; early trust gates for Task Pipeline and Create PR
-- Untrusted E2E now asserts trust gates for Create PR, Task Pipeline, and Supervisor GitHub scan (not only background agents)
+- Hardened Extension Host E2E coverage (setup checklist, Run Center, diagnostics dry-run, retry probe), Workspace Trust gates, and API-key handling paths
+- Expanded CI to include macOS validate + darwin-arm64 package smoke; Extension Host E2E stays Linux/Windows-only
+- Fixed release workflow Marketplace publish predictability (concurrency, skip warning when `VSCE_PAT` unset, publish preflight)
+- Added a first-run setup checklist in the Agent sidebar with dismiss/completion persisted in workspace state
+- Extracted `githubIssues.ts` / `taskPipeline.ts` helpers; PATH-shim integration tests for `gitWorkflow` create/retry PR paths
+- Untrusted E2E asserts trust gates for Create PR, Task Pipeline, and Supervisor GitHub scan (not only background agents)
 
 ## 0.1.19 - 2026-07-18
 

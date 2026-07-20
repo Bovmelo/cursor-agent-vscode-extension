@@ -46,12 +46,12 @@ export function sidebarGroupContextValue(groupId: SidebarGroupId): string {
 
 export function sidebarGroupLabel(groupId: SidebarGroupId, japanese: boolean): string {
   const labels: Record<SidebarGroupId, [string, string]> = {
-    runCenter: ["Run Center", "Run Center"],
-    sessions: ["Sessions", "Sessions"],
-    inbox: ["Inbox", "Inbox"],
+    runCenter: ["Run Center", "実行センター"],
+    sessions: ["Sessions", "セッション"],
+    inbox: ["Inbox", "受信箱"],
     integrations: ["Rules / Skills / MCP", "Rules / Skills / MCP"],
-    background: ["Background", "Background"],
-    audit: ["Audit", "Audit"],
+    background: ["Background", "バックグラウンド"],
+    audit: ["Audit", "監査"],
   };
   return japanese ? labels[groupId][1] : labels[groupId][0];
 }

@@ -304,6 +304,10 @@ export class WebviewController {
           setupActionSkipGh: "スキップ",
           setupActionOpenGhSettings: "GitHub トリガー設定を開く",
           setupActionOpenDashboard: "Dashboardを開く",
+          recoveryRetry: "再試行",
+          recoveryExportDiagnostics: "診断を書き出す",
+          recoveryOpenRunCenter: "Run Centerを開く",
+          recoveryOpenLogs: "ログを開く",
         }
       : {
           history: "Conversation history",
@@ -512,6 +516,10 @@ export class WebviewController {
           setupActionSkipGh: "Skip",
           setupActionOpenGhSettings: "Open GitHub trigger settings",
           setupActionOpenDashboard: "Open Dashboard",
+          recoveryRetry: "Retry",
+          recoveryExportDiagnostics: "Export diagnostics",
+          recoveryOpenRunCenter: "Open Run Center",
+          recoveryOpenLogs: "Open logs",
         };
 
     const clientConfig = JSON.stringify({

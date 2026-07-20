@@ -42,7 +42,7 @@ The next product line is **hardening and operability for a trustworthy 0.2.x**, 
 - Versioned bounded persistence, managed attachment retention, adaptive background recovery, and redacted diagnostics
 - Extracted Webview assets and message contract, backend capability boundary, and expanded quality / accessibility gates
 
-The next product work should validate these flows with real users and improve recovery success and time-to-first-success before adding new autonomous modes.
+**0.2.0 cut (2026-07-20):** foundation above is released. Follow-up work should validate recovery success and time-to-first-success with real users, continue `extension.ts` decomposition, and deepen E2E before adding new autonomous modes. In-run SDK steering remains blocked until Cursor exposes a public API (cancel + priority resend stays the interrupt model).
 
 See also: [README](./README.md), [Changelog](./CHANGELOG.md).
 
@@ -88,6 +88,6 @@ Anysphere / Cursor 非提携の**非公式**拡張機能です。公開 [Cursor 
 - バージョン付き容量制限保存、管理対象添付の保持、適応型バックグラウンド復旧、機密情報除外済み診断
 - Webview資産とmessage契約の分離、backend capability境界、品質・アクセシビリティゲート
 
-次のプロダクト開発では新しい自律モードを増やす前に、実利用での復旧成功率と初回成功までの時間を検証・改善します。
+**0.2.0 カット（2026-07-20）:** 上記基盤をリリース済み。次は実利用での復旧成功率と初回成功までの時間の検証、`extension.ts` 分割の継続、E2E の深化を優先し、新しい自律モードは後回しにします。実行中の SDK ステアリングは公開 API 待ち（現状は cancel + 優先再送）。
 
 関連: [README](./README.md)、[Changelog](./CHANGELOG.md)。

@@ -35,8 +35,14 @@ Evidence-based notes for agents. No secrets. Refresh with **Cursor: Refresh Proj
 | `src/sensitivePaths.ts` / `sensitivePathMatch.ts` | Exclude/scrub globs for apply and worktree secret content |
 | `src/gitWorkflow.ts` / `gitWorkflowPure.ts` / `githubTriggers.ts` / `githubIssues.ts` / `gitApi.ts` | PR creation, CI/PR feedback, `gh issue list` |
 | `src/taskPipeline.ts` | Pure Task Pipeline goal / pending-PR / prompt helpers (wired from `extension.ts`) |
+| `src/runCenter.ts` / `runCenterCoordinator.ts` / `runCenterModel.ts` / `runCenterSnapshot.ts` | Workspace Run Center tree + host snapshot → state |
+| `src/workflowController.ts` / `workflowRecipes.ts` / `executionProfiles.ts` | Goal-first entry + Safe/Balanced/Automation presets |
+| `src/diagnosticsBundle.ts` / `diagnosticsCollectors.ts` / `diagnosticsCollect.ts` / `diagnosticsController.ts` | Redacted diagnostics export |
+| `src/conversationUi.ts` / `setupChecklistState.ts` / `chatSendQueue.ts` | Pure chat UI / checklist / queue helpers |
+| `src/agentBackend.ts` | Provider-neutral Agent backend; production `CursorSdkBackend` |
 | `src/inlineCompletion.ts` | Opt-in completions helpers (limits, sanitize, acceptance rate) |
 | `src/usageStats.ts` / `auditLog.ts` / `auditTimeline.ts` | Token budgets and audit UI/log |
+| `media/webview.css` / `media/webview.js` | Extracted Agent webview assets (host in `webviewController.ts`) |
 | `package.json` + `package.nls*.json` | Contributes, settings, i18n |
 | `test/*.test.mjs` | Node test runner against compiled `out/` |
 | `scripts/validate-webview.mjs` | Ensures webview HTML template still evaluates |

@@ -47,6 +47,24 @@ test("webview message parser validates and normalizes payloads", () => {
     parseWebviewMessage({ type: "resolveAttachments", requestId: 1, references: [] }),
     undefined,
   );
+  assert.deepEqual(parseWebviewMessage({ type: "runRecoveryAction", action: "retry" }), {
+    type: "runRecoveryAction",
+    action: "retry",
+  });
+  assert.deepEqual(parseWebviewMessage({ type: "runRecoveryAction", action: "diagnostics" }), {
+    type: "runRecoveryAction",
+    action: "diagnostics",
+  });
+  assert.deepEqual(parseWebviewMessage({ type: "runRecoveryAction", action: "runCenter" }), {
+    type: "runRecoveryAction",
+    action: "runCenter",
+  });
+  assert.deepEqual(parseWebviewMessage({ type: "runRecoveryAction", action: "logs" }), {
+    type: "runRecoveryAction",
+    action: "logs",
+  });
+  assert.equal(parseWebviewMessage({ type: "runRecoveryAction", action: "unknown" }), undefined);
+  assert.equal(parseWebviewMessage({ type: "runRecoveryAction" }), undefined);
 });
 
 test("host message parser validates payloads before transport", () => {
@@ -57,4 +75,44 @@ test("host message parser validates payloads before transport", () => {
   assert.equal(parseHostToWebviewMessage({ type: "authState" }), undefined);
   assert.equal(parseHostToWebviewMessage({ type: "chunk", text: 42 }), undefined);
   assert.equal(parseHostToWebviewMessage({ type: "not-a-message" }), undefined);
+  assert.deepEqual(parseHostToWebviewMessage({ type: "error", text: "boom" }), {
+    type: "error",
+    text: "boom",
+  });
+  assert.deepEqual(
+    parseHostToWebviewMessage({
+      type: "error",
+      text: "boom",
+      recoveryActions: ["retry", "diagnostics", "runCenter", "logs"],
+    }),
+    {
+      type: "error",
+      text: "boom",
+      recoveryActions: ["retry", "diagnostics", "runCenter", "logs"],
+    },
+  );
+  assert.equal(
+    parseHostToWebviewMessage({
+      type: "error",
+      text: "boom",
+      recoveryActions: ["retry", "unknown"],
+    }),
+    undefined,
+  );
+  assert.deepEqual(
+    parseHostToWebviewMessage({
+      type: "executionProfileState",
+      profileId: "balanced",
+      label: "Balanced",
+    }),
+    {
+      type: "executionProfileState",
+      profileId: "balanced",
+      label: "Balanced",
+    },
+  );
+  assert.equal(
+    parseHostToWebviewMessage({ type: "executionProfileState", profileId: "balanced" }),
+    undefined,
+  );
 });
