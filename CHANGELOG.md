@@ -2,7 +2,14 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-07-20
+
+- Added **Review AI Change Evidence**, a read-only critical review of saved before/after session evidence with verdicts, counter-evidence, missing tests, and rollback guidance
+- Added **Failure Time Machine** to inspect bounded, redacted verification history, highlight the last-pass/first-failure boundary, find recurring failure signatures, and re-run verification for the latest failed session
+- Linked completed `/orchestrate` source tasks, plans, and subtasks to the final synthesis conversation so the consolidated result is always reachable
 - Background jobs in **ready to apply** state list pending files in the Workspace tree and Run Center; click a file to open the baseline ↔ worktree diff before apply/discard
+- Hardened background-worker recovery for cancelled runtime writes, shutdown lifecycle races, detached-process cleanup, and restricted-workspace restoration
+- Expanded diagnostic redaction and bounded recovery telemetry while keeping sensitive paths and process details out of exported bundles
 
 ## 0.2.0 - 2026-07-20
 
