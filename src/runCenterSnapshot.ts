@@ -24,6 +24,10 @@ export interface RunCenterHostRuntimeInput {
   };
 }
 
+type HostBackgroundJob = BackgroundJob & {
+  readonly changes?: BackgroundRunSnapshot["changes"];
+};
+
 export interface RunCenterHostSnapshotInput {
   readonly conversations: readonly Conversation[];
   readonly runtimes: readonly RunCenterHostRuntimeInput[];
@@ -31,7 +35,7 @@ export interface RunCenterHostSnapshotInput {
   readonly queuedConversationIds: readonly string[];
   readonly session?: RunCenterSessionSnapshot;
   readonly plan?: ExecutionPlan;
-  readonly backgroundJobs: readonly BackgroundJob[];
+  readonly backgroundJobs: readonly HostBackgroundJob[];
   readonly supervisorTasks: readonly SupervisorTask[];
   readonly now?: number;
 }
@@ -80,7 +84,7 @@ function toPlanSnapshot(plan: ExecutionPlan | undefined): RunCenterPlanSnapshot 
   };
 }
 
-function toBackgroundSnapshot(job: BackgroundJob): BackgroundRunSnapshot {
+function toBackgroundSnapshot(job: HostBackgroundJob): BackgroundRunSnapshot {
   return {
     id: job.id,
     title: job.title,
@@ -88,6 +92,12 @@ function toBackgroundSnapshot(job: BackgroundJob): BackgroundRunSnapshot {
     updatedAt: job.updatedAt,
     assistantText: job.assistantText,
     error: job.error,
+    changes: job.changes?.map((change) => ({
+      relative: change.relative,
+      kind: change.kind,
+      added: change.added,
+      deleted: change.deleted,
+    })),
   };
 }
 

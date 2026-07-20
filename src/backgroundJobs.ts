@@ -4,6 +4,13 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import type { ModelParameterValue, ModelSelection } from "@cursor/sdk";
 import * as vscode from "vscode";
+import {
+  backgroundChangeContextValue,
+  buildBackgroundJobChildDrafts,
+  canPreviewBackgroundChanges,
+  type BackgroundChangeTarget,
+  type BackgroundPendingChange,
+} from "./backgroundJobChanges.js";
 import type { BackgroundJob, BackgroundWorkerInput } from "./backgroundJobTypes.js";
 import {
   FileBackgroundJobRepository,
@@ -32,6 +39,8 @@ import {
   cleanupIsolatedWorktree,
   collectIsolatedChanges,
   prepareIsolatedWorktree,
+  readIsolatedBaseline,
+  safePath,
   type IsolatedChange,
 } from "./isolatedWorktree.js";
 import { runConfiguredHooks } from "./hooks.js";
@@ -39,6 +48,8 @@ import { createExcludedPathMatcher } from "./sensitivePaths.js";
 import { minimalShellEnv } from "./shellEnv.js";
 import { managedWorktreesRoot } from "./worktreeLifecycle.js";
 import { pickWorkspaceFolder } from "./workspaceFolder.js";
+
+export type { BackgroundChangeTarget } from "./backgroundJobChanges.js";
 
 const API_KEY_SECRET = "cursorSubscription.apiKey";
 const MODEL_KEY = "cursorSubscription.model";
@@ -64,9 +75,11 @@ interface LaunchedBackgroundWorker {
 
 interface BackgroundNode {
   job: BackgroundJob;
-  kind: "job" | "summary";
+  kind: "job" | "summary" | "change";
   label: string;
   description?: string;
+  relative?: string;
+  excluded?: boolean;
 }
 
 interface BackgroundPollResult {
@@ -89,7 +102,10 @@ export type AuditBackgroundJob = (
 ) => Promise<void>;
 
 export class BackgroundJobsController
-  implements vscode.TreeDataProvider<BackgroundNode>, vscode.Disposable
+  implements
+    vscode.TreeDataProvider<BackgroundNode>,
+    vscode.TextDocumentContentProvider,
+    vscode.Disposable
 {
   private readonly changed = new vscode.EventEmitter<BackgroundNode | undefined>();
   private readonly jobs = new Map<string, BackgroundJob>();
@@ -100,6 +116,10 @@ export class BackgroundJobsController
   private readonly activeJobOperations = new Set<string>();
   private readonly launchedWorkers = new Map<string, LaunchedBackgroundWorker>();
   private readonly recoveryWarnings = new Set<string>();
+  private readonly pendingChanges = new Map<string, BackgroundPendingChange[]>();
+  private readonly changeLoadErrors = new Map<string, string>();
+  private readonly changeLoads = new Map<string, Promise<void>>();
+  private readonly previewContents = new Map<string, string>();
   private readonly jobsRoot: string;
   private readonly storageRoot: vscode.Uri;
   private readonly repository: BackgroundJobRepository;
@@ -151,6 +171,10 @@ export class BackgroundJobsController
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
     }
+    this.pendingChanges.clear();
+    this.changeLoadErrors.clear();
+    this.changeLoads.clear();
+    this.previewContents.clear();
     // Detached workers intentionally outlive the extension host unless
     // cancelAllRunning is invoked (e.g. API key revocation).
     this.windowStateSubscription.dispose();
@@ -173,6 +197,192 @@ export class BackgroundJobsController
     return [...this.jobs.values()]
       .sort((left, right) => right.updatedAt - left.updatedAt)
       .map((job) => structuredClone(job));
+  }
+
+  /** Lightweight pending-change metadata for Run Center / tree consumers. */
+  public changeSummaries(jobId: string): readonly BackgroundPendingChange[] | undefined {
+    const changes = this.pendingChanges.get(jobId);
+    return changes ? changes.map((change) => ({ ...change })) : undefined;
+  }
+
+  public provideTextDocumentContent(uri: vscode.Uri): string {
+    return this.previewContents.get(uri.toString()) ?? "";
+  }
+
+  public async openChange(
+    target?: BackgroundNode | BackgroundChangeTarget,
+  ): Promise<void> {
+    const resolved = this.resolveChangeTarget(target);
+    if (!resolved) {
+      return;
+    }
+    let { job, relative } = resolved;
+    if (!canPreviewBackgroundChanges(job.status) || !job.session.worktreePath) {
+      void vscode.window.showInformationMessage(
+        this.text(
+          "Background changes are only available while the job is ready to apply.",
+          "バックグラウンド変更は適用待ちのジョブでのみ確認できます。",
+        ),
+      );
+      return;
+    }
+
+    const changes = await this.ensurePendingChanges(job);
+    const currentJob = this.jobs.get(job.id);
+    if (
+      !currentJob
+      || !canPreviewBackgroundChanges(currentJob.status)
+      || !currentJob.session.worktreePath
+    ) {
+      void vscode.window.showInformationMessage(
+        this.text(
+          "This background job is no longer ready to preview.",
+          "このバックグラウンドジョブは現在プレビューできません。",
+        ),
+      );
+      return;
+    }
+    job = currentJob;
+    if (!changes) {
+      const loadError = this.changeLoadErrors.get(job.id);
+      if (loadError) {
+        void vscode.window.showErrorMessage(loadError);
+      }
+      return;
+    }
+    if (!relative) {
+      if (changes.length === 0) {
+        void vscode.window.showInformationMessage(
+          this.text(
+            "This background job has no file changes to preview.",
+            "このバックグラウンドジョブにはプレビューできるファイル変更がありません。",
+          ),
+        );
+        return;
+      }
+      if (changes.length === 1) {
+        relative = changes[0].relative;
+      } else {
+        const picked = await vscode.window.showQuickPick(
+          changes.map((change) => ({
+            label: change.relative,
+            description: `${change.kind} +${change.added}/-${change.deleted}${
+              change.excluded
+                ? this.text(" · excluded", " · 適用対象外")
+                : ""
+            }`,
+            relative: change.relative,
+          })),
+          {
+            title: this.text(
+              `Review changes: ${job.title}`,
+              `変更を確認: ${job.title}`,
+            ),
+            placeHolder: this.text(
+              "Select a file to open its pending diff",
+              "適用前の差分を開くファイルを選択",
+            ),
+          },
+        );
+        if (!picked) {
+          return;
+        }
+        relative = picked.relative;
+      }
+    }
+    if (!this.beginJobOperation(job.id)) {
+      return;
+    }
+    try {
+      const previewJob = this.jobs.get(job.id);
+      const previewChanges = this.pendingChanges.get(job.id);
+      if (
+        !previewJob
+        || !canPreviewBackgroundChanges(previewJob.status)
+        || !previewJob.session.worktreePath
+        || !previewChanges?.some((change) => change.relative === relative)
+      ) {
+        void vscode.window.showInformationMessage(
+          this.text(
+            "This background change is no longer available to preview.",
+            "このバックグラウンド変更は現在プレビューできません。",
+          ),
+        );
+        return;
+      }
+      job = previewJob;
+
+      let proposedPath: string;
+      try {
+        proposedPath = safePath(job.session.worktreePath, relative, "background agent");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        void vscode.window.showErrorMessage(message);
+        return;
+      }
+
+      let baseline = "";
+      try {
+        const baselineState = await readIsolatedBaseline(
+          job.session,
+          this.storageRoot,
+          relative,
+          (pathRelative) => `Background baseline is unavailable for ${pathRelative}.`,
+        );
+        baseline = baselineState.bytes
+          ? Buffer.from(baselineState.bytes).toString("utf8")
+          : "";
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        void vscode.window.showErrorMessage(message);
+        return;
+      }
+
+      let proposed = "";
+      try {
+        proposed = Buffer.from(
+          await vscode.workspace.fs.readFile(
+            vscode.Uri.file(proposedPath),
+          ),
+        ).toString("utf8");
+      } catch {
+        // Deleted files have no proposed content.
+      }
+      if (baseline.includes("\0") || proposed.includes("\0")) {
+        void vscode.window.showInformationMessage(
+          this.text(
+            `“${relative}” looks like a binary file, so a text diff is unavailable.`,
+            `「${relative}」はバイナリの可能性があるため、テキスト差分を開けません。`,
+          ),
+        );
+        return;
+      }
+
+      const previewId = randomUUID();
+      const fileName = path.basename(relative);
+      const baselineUri = vscode.Uri.from({
+        scheme: "cursor-background-preview",
+        path: `/${previewId}/baseline/${fileName}`,
+      });
+      const proposedUri = vscode.Uri.from({
+        scheme: "cursor-background-preview",
+        path: `/${previewId}/proposed/${fileName}`,
+      });
+      this.previewContents.set(baselineUri.toString(), baseline);
+      this.previewContents.set(proposedUri.toString(), proposed);
+      await vscode.commands.executeCommand(
+        "vscode.diff",
+        baselineUri,
+        proposedUri,
+        this.text(
+          `${relative} ↔ background change`,
+          `${relative} ↔ バックグラウンド変更`,
+        ),
+        { preview: true },
+      );
+    } finally {
+      this.finishJobOperation(job.id);
+    }
   }
 
   public async create(): Promise<void> {
@@ -392,6 +602,7 @@ export class BackgroundJobsController
         changesApplied = true;
         this.applyStateTransition(job, { type: "apply-succeeded" });
         await this.save(job);
+        this.clearPendingChanges(job.id);
         const worktreeRemoved = await cleanupIsolatedWorktree(
           job.session,
           this.storageRoot,
@@ -416,6 +627,9 @@ export class BackgroundJobsController
           error: errorMessage,
         });
         await this.save(job);
+        if (!canPreviewBackgroundChanges(job.status)) {
+          this.clearPendingChanges(job.id);
+        }
         void vscode.window.showErrorMessage(errorMessage);
       }
       this.changed.fire(undefined);
@@ -567,6 +781,7 @@ export class BackgroundJobsController
       }
       this.applyStateTransition(job, { type: "discard" });
       await this.save(job);
+      this.clearPendingChanges(job.id);
       await this.auditJob(job, "background.discard");
       this.changed.fire(undefined);
     } finally {
@@ -582,6 +797,36 @@ export class BackgroundJobsController
         : vscode.TreeItemCollapsibleState.None,
     );
     item.description = node.description;
+    if (node.kind === "change") {
+      item.contextValue = backgroundChangeContextValue({ excluded: Boolean(node.excluded) });
+      item.iconPath = new vscode.ThemeIcon(node.excluded ? "circle-slash" : "diff");
+      item.tooltip = node.excluded
+        ? this.text(
+            "Excluded from apply · click to preview",
+            "適用対象外 · クリックでプレビュー",
+          )
+        : this.text("Click to open the pending diff", "クリックで適用前の差分を開く");
+      item.command = {
+        command: "cursorSubscription.openBackgroundChange",
+        title: this.text("Open background change", "バックグラウンド変更を開く"),
+        arguments: [{ jobId: node.job.id, relative: node.relative ?? node.label }],
+      };
+      return item;
+    }
+    if (node.kind === "summary" && canPreviewBackgroundChanges(node.job.status)) {
+      item.contextValue = `cursorBackground.${node.kind}.${node.job.status}`;
+      item.iconPath = new vscode.ThemeIcon("diff");
+      item.tooltip = this.text(
+        "Click to choose and preview a pending diff",
+        "クリックして適用前の差分を選択・表示",
+      );
+      item.command = {
+        command: "cursorSubscription.openBackgroundChange",
+        title: this.text("Review background changes", "バックグラウンド変更を確認"),
+        arguments: [{ jobId: node.job.id }],
+      };
+      return item;
+    }
     item.contextValue = `cursorBackground.${node.kind}.${node.job.status}`;
     item.iconPath = new vscode.ThemeIcon(this.icon(node.job.status));
     item.tooltip = [node.job.prompt, node.job.error, node.job.assistantText]
@@ -604,17 +849,37 @@ export class BackgroundJobsController
     if (node.kind !== "job") {
       return [];
     }
-    return [
-      {
-        kind: "summary",
-        job: node.job,
-        label:
-          node.job.error ||
-          node.job.assistantText?.split(/\r?\n/u)[0].slice(0, 180) ||
-          this.text("Waiting for the agent…", "Agentの完了を待機中…"),
-        description: node.job.workspaceRoot,
-      },
-    ];
+    const summaryLabel =
+      node.job.error ||
+      node.job.assistantText?.split(/\r?\n/u)[0].slice(0, 180) ||
+      this.text("Waiting for the agent…", "Agentの完了を待機中…");
+    if (!canPreviewBackgroundChanges(node.job.status)) {
+      this.clearPendingChanges(node.job.id);
+      return [
+        {
+          kind: "summary",
+          job: node.job,
+          label: summaryLabel,
+          description: node.job.workspaceRoot,
+        },
+      ];
+    }
+    this.requestPendingChanges(node.job);
+    return buildBackgroundJobChildDrafts({
+      summaryLabel,
+      workspaceRoot: node.job.workspaceRoot,
+      changes: this.pendingChanges.get(node.job.id),
+      loadError: this.changeLoadErrors.get(node.job.id),
+      loading: this.changeLoads.has(node.job.id),
+      japanese: this.japanese,
+    }).map((draft) => ({
+      job: node.job,
+      kind: draft.kind,
+      label: draft.label,
+      description: draft.description,
+      relative: draft.relative,
+      excluded: draft.excluded,
+    }));
   }
 
   private async initialize(): Promise<void> {
@@ -655,6 +920,14 @@ export class BackgroundJobsController
         if (current.updatedAt !== known.updatedAt || current.status !== known.status) {
           this.jobs.set(id, current);
           changed = true;
+          if (canPreviewBackgroundChanges(current.status)) {
+            if (current.status !== known.status || current.updatedAt !== known.updatedAt) {
+              this.clearPendingChanges(current.id);
+            }
+            this.requestPendingChanges(current);
+          } else {
+            this.clearPendingChanges(current.id);
+          }
           if (["completed", "error", "cancelled"].includes(current.status) && !current.notified) {
             current.notified = true;
             await this.save(current);
@@ -665,6 +938,8 @@ export class BackgroundJobsController
               ),
             );
           }
+        } else if (canPreviewBackgroundChanges(current.status)) {
+          this.requestPendingChanges(current);
         }
         changed ||= interruptedApplyRecovered || recovered.changed;
       } catch {
@@ -1127,6 +1402,80 @@ export class BackgroundJobsController
 
   private resolve(target?: BackgroundNode | string): BackgroundJob | undefined {
     return typeof target === "string" ? this.jobs.get(target) : target?.job;
+  }
+
+  private resolveChangeTarget(
+    target?: BackgroundNode | BackgroundChangeTarget,
+  ): { job: BackgroundJob; relative?: string } | undefined {
+    if (!target) {
+      return undefined;
+    }
+    const jobId = "job" in target ? target.job.id : target.jobId;
+    const job = this.jobs.get(jobId);
+    if (!job) {
+      return undefined;
+    }
+    return { job, relative: target.relative?.trim() || undefined };
+  }
+
+  private async ensurePendingChanges(
+    job: BackgroundJob,
+  ): Promise<readonly BackgroundPendingChange[] | undefined> {
+    this.requestPendingChanges(job);
+    await this.changeLoads.get(job.id);
+    return this.pendingChanges.get(job.id);
+  }
+
+  private requestPendingChanges(job: BackgroundJob): void {
+    if (!canPreviewBackgroundChanges(job.status) || this.disposed) {
+      return;
+    }
+    if (this.pendingChanges.has(job.id) || this.changeLoads.has(job.id)) {
+      return;
+    }
+    const load = this.loadPendingChanges(job).finally(() => {
+      this.changeLoads.delete(job.id);
+    });
+    this.changeLoads.set(job.id, load);
+  }
+
+  private async loadPendingChanges(job: BackgroundJob): Promise<void> {
+    try {
+      const isExcluded = createExcludedPathMatcher(vscode.Uri.file(job.workspaceRoot));
+      const changes = await collectIsolatedChanges(job.session, this.storageRoot, {
+        pathEscapeLabel: "background agent",
+        isExcluded,
+        missingBaselineMessage: (relative) =>
+          `Background baseline is unavailable for ${relative}.`,
+      });
+      if (this.disposed || this.jobs.get(job.id)?.status !== "completed") {
+        return;
+      }
+      this.pendingChanges.set(job.id, changes);
+      this.changeLoadErrors.delete(job.id);
+    } catch (error) {
+      if (this.disposed) {
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      this.pendingChanges.delete(job.id);
+      this.changeLoadErrors.set(
+        job.id,
+        this.text(
+          `Could not load changes: ${message}`,
+          `変更を読み込めませんでした: ${message}`,
+        ),
+      );
+      this.output.appendLine(
+        `[${new Date().toISOString()}] Could not load background changes for ${job.id}: ${message}`,
+      );
+    }
+    this.changed.fire(undefined);
+  }
+
+  private clearPendingChanges(jobId: string): void {
+    this.pendingChanges.delete(jobId);
+    this.changeLoadErrors.delete(jobId);
   }
 
   private text(english: string, japanese: string): string {

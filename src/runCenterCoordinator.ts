@@ -85,6 +85,13 @@ export type BackgroundRunStatus =
   | "discarded"
   | "error";
 
+export interface BackgroundChangeSnapshot {
+  readonly relative: string;
+  readonly kind: "added" | "modified" | "deleted";
+  readonly added: number;
+  readonly deleted: number;
+}
+
 export interface BackgroundRunSnapshot {
   readonly id: string;
   readonly title: string;
@@ -92,6 +99,7 @@ export interface BackgroundRunSnapshot {
   readonly updatedAt: number;
   readonly assistantText?: string;
   readonly error?: string;
+  readonly changes?: readonly BackgroundChangeSnapshot[];
 }
 
 export type SupervisorRunStatus =
@@ -402,6 +410,19 @@ export class RunCenterCoordinator {
         status: active ? "running" : failed ? "paused" : "completed",
         detail: job.assistantText?.slice(0, 1_000),
       },
+      changes:
+        job.status === "completed"
+          ? job.changes?.map((change) => ({
+              path: change.relative,
+              status: change.kind,
+              additions: change.added,
+              deletions: change.deleted,
+              open: {
+                command: "cursorSubscription.openBackgroundChange",
+                arguments: [{ jobId: job.id, relative: change.relative }],
+              },
+            }))
+          : undefined,
       error: job.error ? { message: job.error.split(/\r?\n/u)[0], detail: job.error } : undefined,
       recoveryActions,
       updatedAt: job.updatedAt,

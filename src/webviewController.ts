@@ -66,6 +66,7 @@ export class WebviewController {
 
   public getHtml(webview: vscode.Webview): string {
     const nonce = randomBytes(16).toString("base64");
+    const assetVersion = encodeURIComponent(nonce);
     const SUPPORTS_LOCAL_SANDBOX = this.supportsLocalSandbox;
     const MAX_DROPPED_FILE_BYTES = this.maxDroppedFileBytes;
     const extensionVersion = String(
@@ -265,6 +266,8 @@ export class WebviewController {
           orchestratorPlanAgent: "計画",
           orchestratorSynthesisAgent: "統合",
           orchestratorOpenAgent: "開く",
+          orchestratorFinalResult: "最終結果",
+          orchestratorOpenFinalResult: "最終結果を開く",
           orchestratorFlowSubtasks: "サブタスク",
           orchestratorFlowWaiting: "待機中",
           orchestratorGroup: "Orchestrate",
@@ -477,6 +480,8 @@ export class WebviewController {
           orchestratorPlanAgent: "Plan",
           orchestratorSynthesisAgent: "Synthesis",
           orchestratorOpenAgent: "Open",
+          orchestratorFinalResult: "Final result",
+          orchestratorOpenFinalResult: "Open final result",
           orchestratorFlowSubtasks: "Subtasks",
           orchestratorFlowWaiting: "Waiting",
           orchestratorGroup: "Orchestrate",
@@ -538,7 +543,7 @@ export class WebviewController {
     content="default-src 'none'; img-src ${webview.cspSource} https: data:; style-src ${webview.cspSource} 'unsafe-inline'; script-src ${webview.cspSource} 'nonce-${nonce}';"
   >
   <title>Cursor Agent</title>
-  <link rel="stylesheet" href="${styleUri}">
+  <link rel="stylesheet" href="${styleUri}?v=${assetVersion}">
 </head>
 <body>
   <div class="header">
@@ -821,7 +826,7 @@ export class WebviewController {
   <script nonce="${nonce}">
     window.__cursorAgentWebviewConfig = Object.freeze(${clientConfig});
   </script>
-  <script nonce="${nonce}" src="${clientUri}"></script>
+  <script nonce="${nonce}" src="${clientUri}?v=${assetVersion}"></script>
 </body>
 </html>`;
   }

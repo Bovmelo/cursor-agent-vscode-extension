@@ -33,6 +33,7 @@ test("conversationSummaries filters, pins, and marks busy/queued", () => {
   const summaries = conversationSummaries(items, "needle", {
     isBusy: (id) => id === "busy" || id === "pinned",
     isQueued: (id) => id === "pinned",
+    orchestratorFinalResultLinks: new Map([["pinned", "synthesis"]]),
   });
 
   assert.equal(summaries.length, 1);
@@ -40,6 +41,7 @@ test("conversationSummaries filters, pins, and marks busy/queued", () => {
   assert.equal(summaries[0].running, true);
   assert.equal(summaries[0].queued, true);
   assert.equal(summaries[0].pinned, true);
+  assert.equal(summaries[0].orchestratorFinalResultConversationId, "synthesis");
 });
 
 test("conversationToMarkdown includes roles and edited files", () => {

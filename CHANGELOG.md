@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Background jobs in **ready to apply** state list pending files in the Workspace tree and Run Center; click a file to open the baseline ↔ worktree diff before apply/discard
+
 ## 0.2.0 - 2026-07-20
 
 - Added a goal-first Ask / Change / Delegate / Review entry point and Safe / Balanced / Automation execution presets (Settings schema + status-bar / chat footer discoverability)

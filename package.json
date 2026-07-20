@@ -60,6 +60,9 @@
     "onCommand:cursorSubscription.runAutopilot",
     "onCommand:cursorSubscription.reviewChanges",
     "onCommand:cursorSubscription.debugContext",
+    "onCommand:cursorSubscription.reviewChangeSession",
+    "onCommand:cursorSubscription.openFailureTimeMachine",
+    "onCommand:cursorSubscription.reverifyChangeSession",
     "onCommand:cursorSubscription.executeLastPlan",
     "onCommand:cursorSubscription.scanSupervisorGitHub"
   ],
@@ -300,6 +303,18 @@
         "title": "%command.compareChangeSessions%"
       },
       {
+        "command": "cursorSubscription.reviewChangeSession",
+        "title": "%command.reviewChangeSession%"
+      },
+      {
+        "command": "cursorSubscription.openFailureTimeMachine",
+        "title": "%command.openFailureTimeMachine%"
+      },
+      {
+        "command": "cursorSubscription.reverifyChangeSession",
+        "title": "%command.reverifyChangeSession%"
+      },
+      {
         "command": "cursorSubscription.executeLastPlan",
         "title": "%command.executeLastPlan%"
       },
@@ -321,6 +336,10 @@
         "command": "cursorSubscription.applyBackgroundJob",
         "title": "%command.applyBackgroundJob%",
         "icon": "$(check)"
+      },
+      {
+        "command": "cursorSubscription.openBackgroundChange",
+        "title": "%command.openBackgroundChange%"
       },
       {
         "command": "cursorSubscription.cancelBackgroundJob",

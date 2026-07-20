@@ -60,6 +60,10 @@ export interface VerificationResult {
   steps: VerificationStep[];
 }
 
+export interface VerificationRunSnapshot extends VerificationResult {
+  at: number;
+}
+
 export interface ChangeSessionSnapshot {
   id: string;
   goal: string;
@@ -76,6 +80,7 @@ export interface ChangeSessionSnapshot {
   proposedFiles?: Record<string, ProposedFileSnapshot>;
   nonRestorableFiles?: string[];
   verification?: VerificationResult;
+  verificationHistory?: VerificationRunSnapshot[];
   repair?: RepairBudgetSnapshot;
 }
 
@@ -126,6 +131,7 @@ interface SessionNode {
 const SESSION_HISTORY_KEY = "cursorSubscription.changeSessionHistory";
 const LAST_SESSION_KEY = "cursorSubscription.lastChangeSession";
 const MAX_SESSION_HISTORY = 20;
+const MAX_VERIFICATION_HISTORY = 20;
 
 function compactOutput(value: string): string {
   const trimmed = value.trim();
@@ -366,6 +372,21 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     if (!current) {
       return;
     }
+    const history = current.verificationHistory
+      ? [...current.verificationHistory]
+      : current.verification
+        ? [{
+            ...current.verification,
+            at: current.finishedAt ?? current.startedAt,
+            steps: current.verification.steps.map((step) => ({ ...step })),
+          }]
+        : [];
+    history.push({
+      ...result,
+      at: Date.now(),
+      steps: result.steps.map((step) => ({ ...step })),
+    });
+    current.verificationHistory = history.slice(-MAX_VERIFICATION_HISTORY);
     current.verification = result;
     current.phase = result.success ? "review" : "failed";
     void this.persist();
@@ -762,6 +783,9 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     }
 
     const nodes: SessionNode[] = [];
+    const hasRecordedFailure = session.verificationHistory
+      ? session.verificationHistory.some((run) => !run.success && !run.skipped)
+      : Boolean(session.verification && !session.verification.success && !session.verification.skipped);
     if (session.verification) {
       nodes.push({
         kind: "verification",
@@ -781,6 +805,37 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
         description: `${session.repair.attempts}/${session.repair.maxAttempts} · ${this.repairLabel(session.repair.status)}`,
         sessionId: session.id,
       });
+    }
+    if (hasRecordedFailure) {
+      nodes.push({
+        kind: "action",
+        label: this.japanese ? "失敗のタイムマシンを開く" : "Open failure time machine",
+        sessionId: session.id,
+        contextValue: "cursorAiSession.action.failureTimeMachine",
+        command: {
+          command: "cursorSubscription.openFailureTimeMachine",
+          title: this.japanese ? "失敗のタイムマシンを開く" : "Open failure time machine",
+          arguments: [session.id],
+        },
+      });
+      if (
+        session.id === this.sessions[0]?.id
+        && session.verification
+        && !session.verification.success
+        && !session.verification.skipped
+      ) {
+        nodes.push({
+          kind: "action",
+          label: this.japanese ? "検証を再実行" : "Re-run verification",
+          sessionId: session.id,
+          contextValue: "cursorAiSession.action.reverify",
+          command: {
+            command: "cursorSubscription.reverifyChangeSession",
+            title: this.japanese ? "検証を再実行" : "Re-run verification",
+            arguments: [session.id],
+          },
+        });
+      }
     }
     for (const file of session.files) {
       nodes.push({
@@ -864,6 +919,19 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
         },
       });
     }
+    if (session.files.length > 0) {
+      nodes.push({
+        kind: "action",
+        label: this.japanese ? "変更の根拠を審査" : "Review change evidence",
+        sessionId: session.id,
+        contextValue: "cursorAiSession.action.changeCourt",
+        command: {
+          command: "cursorSubscription.reviewChangeSession",
+          title: this.japanese ? "変更の根拠を審査" : "Review change evidence",
+          arguments: [session.id],
+        },
+      });
+    }
     return nodes;
   }
 
@@ -880,6 +948,15 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       case "repairDetail":
         return new vscode.ThemeIcon("wrench");
       case "action":
+        if (element.command?.command === "cursorSubscription.openFailureTimeMachine") {
+          return new vscode.ThemeIcon("history");
+        }
+        if (element.command?.command === "cursorSubscription.reverifyChangeSession") {
+          return new vscode.ThemeIcon("debug-rerun");
+        }
+        if (element.command?.command === "cursorSubscription.reviewChangeSession") {
+          return new vscode.ThemeIcon("law");
+        }
         return new vscode.ThemeIcon("discard");
       default:
         return new vscode.ThemeIcon("circle-filled");

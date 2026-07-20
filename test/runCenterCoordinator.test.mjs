@@ -155,6 +155,29 @@ test("completed background results expose apply and discard actions", () => {
   assert.deepEqual(state.recoveryActions[0].arguments, ["job"]);
 });
 
+test("completed background results expose clickable pending changes", () => {
+  const state = buildBackgroundRunCenterState({
+    id: "job",
+    title: "Background",
+    status: "completed",
+    updatedAt: 200,
+    changes: [{ relative: "src/app.ts", kind: "modified", added: 3, deleted: 1 }],
+  });
+
+  assert.deepEqual(state.changes, [
+    {
+      path: "src/app.ts",
+      status: "modified",
+      additions: 3,
+      deletions: 1,
+      open: {
+        command: "cursorSubscription.openBackgroundChange",
+        arguments: [{ jobId: "job", relative: "src/app.ts" }],
+      },
+    },
+  ]);
+});
+
 test("failed background recovery accurately offers a new agent", () => {
   const state = buildBackgroundRunCenterState({
     id: "job",

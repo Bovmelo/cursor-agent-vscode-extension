@@ -16,6 +16,7 @@ import {
   markSubtaskConversation,
   markSubtaskLaunch,
   markSubtaskStatus,
+  orchestratorFinalResultLinks,
   orchestratorSummaries,
   parseOrchestratorSubtasks,
   prepareOrchestratorResume,
@@ -167,9 +168,55 @@ test("orchestrator parses subtasks and advances through synthesis", () => {
   assert.match(withActivity.subtasks[0].activity?.text ?? "", /Reading file/);
   assert.equal(withActivity.subtasks[1].activity, undefined);
 
+  const withDeletedSynthesis = buildOrchestratorDetail(
+    {
+      ...experiment,
+      status: "completed",
+      planConversationId: "plan",
+      synthesisConversationId: "deleted-final",
+    },
+    new Set(),
+    new Map(),
+    new Set(["plan", "c1", "c2"]),
+  );
+  assert.equal(withDeletedSynthesis.plan.conversationId, "plan");
+  assert.equal(withDeletedSynthesis.synthesis.conversationId, undefined);
+
   assert.equal(extractSubagentName({ subagent_type: "researcher" }), "researcher");
   assert.equal(extractSubagentName({ name: "implementer" }), "implementer");
   assert.equal(extractSubagentName({}), undefined);
+});
+
+test("completed orchestrations link every related task to the final synthesis", () => {
+  const completed = {
+    ...createOrchestratorExperiment("ship it", { sourceConversationId: "source" }),
+    status: "completed",
+    planConversationId: "plan",
+    synthesisConversationId: "final",
+    subtasks: [
+      { id: "a", title: "A", prompt: "A", status: "completed", conversationId: "task-a" },
+      { id: "b", title: "B", prompt: "B", status: "failed", conversationId: "task-b" },
+    ],
+  };
+  const links = orchestratorFinalResultLinks([
+    completed,
+    {
+      ...completed,
+      id: "running",
+      status: "synthesizing",
+      sourceConversationId: "unfinished-source",
+      synthesisConversationId: "unfinished-final",
+    },
+  ]);
+
+  assert.deepEqual([...links], [
+    ["source", "final"],
+    ["plan", "final"],
+    ["task-a", "final"],
+    ["task-b", "final"],
+  ]);
+  assert.equal(links.has("final"), false);
+  assert.equal(links.has("unfinished-source"), false);
 });
 
 test("orchestrator accepts fenced and embedded JSON subtask lists", () => {

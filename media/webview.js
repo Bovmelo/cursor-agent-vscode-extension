@@ -1227,6 +1227,20 @@ function appendOrchestratorFlowConnector() {
   orchestratorAgents.appendChild(connector);
 }
 
+function createOpenConversationButton(conversationId, label, title, className) {
+  const button = document.createElement("button");
+  button.className = className || "task-action";
+  button.type = "button";
+  button.textContent = label;
+  button.title = title;
+  button.setAttribute("aria-label", title);
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    vscode.postMessage({ type: "openConversation", id: conversationId });
+  });
+  return button;
+}
+
 function appendOrchestratorAgentRow(label, status, conversationId, running, activity, options) {
   const waiting = options && options.waiting === true;
   const row = document.createElement("div");
@@ -1250,20 +1264,32 @@ function appendOrchestratorAgentRow(label, status, conversationId, running, acti
   meta.className = "orchestrator-agent-meta";
   meta.textContent = orchestratorStatusMeta(status, running, waiting);
   row.append(statusEl, body, meta);
+  const actions = document.createElement("span");
+  actions.className = "orchestrator-agent-actions";
   if (conversationId) {
-    const open = document.createElement("button");
-    open.className = "task-action";
-    open.type = "button";
-    open.textContent = i18n.orchestratorOpenAgent;
-    open.addEventListener("click", () => {
-      vscode.postMessage({ type: "openConversation", id: conversationId });
-    });
-    row.appendChild(open);
+    actions.appendChild(createOpenConversationButton(
+      conversationId,
+      i18n.orchestratorOpenAgent,
+      i18n.orchestratorOpenAgent,
+      "task-action orchestrator-agent-action",
+    ));
+  }
+  const finalResultConversationId = options?.finalResultConversationId;
+  if (finalResultConversationId && finalResultConversationId !== conversationId) {
+    actions.appendChild(createOpenConversationButton(
+      finalResultConversationId,
+      i18n.orchestratorFinalResult,
+      i18n.orchestratorOpenFinalResult,
+      "task-action orchestrator-result-action",
+    ));
+  }
+  if (actions.childElementCount > 0) {
+    row.appendChild(actions);
   }
   orchestratorAgents.appendChild(row);
 }
 
-function createOrchestratorFlowSubtask(subtask) {
+function createOrchestratorFlowSubtask(subtask, finalResultConversationId) {
   const node = document.createElement("div");
   node.className = "orchestrator-flow-subtask";
   if (subtask.conversationId) {
@@ -1300,15 +1326,26 @@ function createOrchestratorFlowSubtask(subtask) {
   }
   top.append(statusEl, body);
   node.appendChild(top);
+  const actions = document.createElement("span");
+  actions.className = "orchestrator-agent-actions";
   if (subtask.conversationId) {
-    const open = document.createElement("button");
-    open.className = "task-action";
-    open.type = "button";
-    open.textContent = i18n.orchestratorOpenAgent;
-    open.addEventListener("click", () => {
-      vscode.postMessage({ type: "openConversation", id: subtask.conversationId });
-    });
-    node.appendChild(open);
+    actions.appendChild(createOpenConversationButton(
+      subtask.conversationId,
+      i18n.orchestratorOpenAgent,
+      i18n.orchestratorOpenAgent,
+      "task-action orchestrator-agent-action",
+    ));
+  }
+  if (finalResultConversationId && finalResultConversationId !== subtask.conversationId) {
+    actions.appendChild(createOpenConversationButton(
+      finalResultConversationId,
+      i18n.orchestratorFinalResult,
+      i18n.orchestratorOpenFinalResult,
+      "task-action orchestrator-result-action",
+    ));
+  }
+  if (actions.childElementCount > 0) {
+    node.appendChild(actions);
   }
   return node;
 }
@@ -1419,6 +1456,9 @@ function renderOrchestratorDetail(experiment) {
   }
   orchestratorAgents.innerHTML = "";
   orchestratorAgents.className = "orchestrator-flow";
+  const finalResultConversationId = experiment.status === "completed"
+    ? experiment.synthesis?.conversationId
+    : undefined;
   const planStatus = experiment.status === "planning"
     ? "planning"
     : experiment.plan?.running
@@ -1430,6 +1470,7 @@ function renderOrchestratorDetail(experiment) {
     experiment.plan?.conversationId,
     experiment.plan?.running === true,
     experiment.plan?.activity,
+    { finalResultConversationId },
   );
   appendOrchestratorFlowConnector();
   const subtasksBand = document.createElement("div");
@@ -1442,7 +1483,7 @@ function renderOrchestratorDetail(experiment) {
   const subtasksRow = document.createElement("div");
   subtasksRow.className = "orchestrator-flow-subtasks-row";
   for (const subtask of subtasks) {
-    subtasksRow.appendChild(createOrchestratorFlowSubtask(subtask));
+    subtasksRow.appendChild(createOrchestratorFlowSubtask(subtask, finalResultConversationId));
   }
   subtasksBand.append(subtasksHeader, subtasksRow);
   orchestratorAgents.appendChild(subtasksBand);
@@ -1576,8 +1617,20 @@ function renderTasks() {
       });
       actions.appendChild(winner);
     }
+    const finalResult = conv.orchestratorFinalResultConversationId
+      ? createOpenConversationButton(
+          conv.orchestratorFinalResultConversationId,
+          i18n.orchestratorFinalResult,
+          i18n.orchestratorOpenFinalResult,
+          "task-final-result",
+        )
+      : null;
     actions.append(pin, exp, del);
-    row.append(title, meta, actions);
+    row.append(title);
+    if (finalResult) {
+      row.appendChild(finalResult);
+    }
+    row.append(meta, actions);
     row.addEventListener("click", () => vscode.postMessage({ type: "openConversation", id: conv.id }));
     taskList.appendChild(row);
   }
@@ -1655,6 +1708,14 @@ function createParallelTaskChip(task) {
   });
 
   chip.appendChild(main);
+  if (task.orchestratorFinalResultConversationId) {
+    chip.appendChild(createOpenConversationButton(
+      task.orchestratorFinalResultConversationId,
+      "↗",
+      i18n.orchestratorOpenFinalResult,
+      "parallel-task-result",
+    ));
+  }
   if (task.status === "running" || task.status === "queued") {
     const stop = document.createElement("button");
     stop.className = "parallel-task-stop";

@@ -531,10 +531,39 @@ export function orchestratorSummaries(
   }));
 }
 
+/** Completed orchestration conversations that should link to the final synthesis conversation. */
+export function orchestratorFinalResultLinks(
+  experiments: ReadonlyArray<OrchestratorExperiment>,
+): ReadonlyMap<string, string> {
+  const links = new Map<string, string>();
+  for (const experiment of experiments) {
+    const finalConversationId = experiment.synthesisConversationId;
+    if (experiment.status !== "completed" || !finalConversationId) {
+      continue;
+    }
+    const relatedConversationIds = [
+      experiment.sourceConversationId,
+      experiment.planConversationId,
+      ...experiment.subtasks.map((subtask) => subtask.conversationId),
+    ];
+    for (const conversationId of relatedConversationIds) {
+      if (
+        conversationId
+        && conversationId !== finalConversationId
+        && !links.has(conversationId)
+      ) {
+        links.set(conversationId, finalConversationId);
+      }
+    }
+  }
+  return links;
+}
+
 export function buildOrchestratorDetail(
   experiment: OrchestratorExperiment,
   busyIds: ReadonlySet<string>,
   activities: ReadonlyMap<string, OrchestratorActivity> = new Map(),
+  availableConversationIds?: ReadonlySet<string>,
 ): {
   id: string;
   prompt: string;
@@ -562,8 +591,15 @@ export function buildOrchestratorDetail(
     changedFileCount?: number;
   }>;
 } {
+  const availableConversationId = (conversationId?: string): string | undefined =>
+    conversationId
+    && (!availableConversationIds || availableConversationIds.has(conversationId))
+      ? conversationId
+      : undefined;
   const activityFor = (conversationId?: string): OrchestratorActivity | undefined =>
     conversationId ? activities.get(conversationId) : undefined;
+  const planConversationId = availableConversationId(experiment.planConversationId);
+  const synthesisConversationId = availableConversationId(experiment.synthesisConversationId);
 
   return {
     id: experiment.id,
@@ -572,28 +608,29 @@ export function buildOrchestratorDetail(
     createdAt: experiment.createdAt,
     error: experiment.error,
     plan: {
-      conversationId: experiment.planConversationId,
-      running: experiment.planConversationId
-        ? busyIds.has(experiment.planConversationId)
+      conversationId: planConversationId,
+      running: planConversationId
+        ? busyIds.has(planConversationId)
         : false,
-      activity: activityFor(experiment.planConversationId),
+      activity: activityFor(planConversationId),
     },
     synthesis: {
-      conversationId: experiment.synthesisConversationId,
-      running: experiment.synthesisConversationId
-        ? busyIds.has(experiment.synthesisConversationId)
+      conversationId: synthesisConversationId,
+      running: synthesisConversationId
+        ? busyIds.has(synthesisConversationId)
         : false,
-      activity: activityFor(experiment.synthesisConversationId),
+      activity: activityFor(synthesisConversationId),
     },
     subtasks: experiment.subtasks.map((subtask) => {
       const summary = subtask.resultSummary?.trim();
+      const conversationId = availableConversationId(subtask.conversationId);
       return {
         id: subtask.id,
         title: subtask.title,
         status: subtask.status,
-        conversationId: subtask.conversationId,
-        running: subtask.conversationId ? busyIds.has(subtask.conversationId) : false,
-        activity: activityFor(subtask.conversationId),
+        conversationId,
+        running: conversationId ? busyIds.has(conversationId) : false,
+        activity: activityFor(conversationId),
         ...(summary ? { resultSummary: truncateForDetailSummary(summary) } : {}),
         ...(subtask.changedFiles
           ? { changedFileCount: subtask.changedFiles.length }

@@ -25,6 +25,7 @@ const templateLiteral = source.slice(templateStart, templateEnd);
 const render = new Function(
   "ui",
   "nonce",
+  "assetVersion",
   "markedUri",
   "purifyUri",
   "styleUri",
@@ -39,6 +40,7 @@ const render = new Function(
 );
 const html = render(
   {},
+  "test-nonce",
   "test-nonce",
   "marked.js",
   "purify.js",
@@ -75,10 +77,12 @@ const scriptElements = [...html.matchAll(/<script([^>]*)>([\s\S]*?)<\/script>/g)
 if (
   scriptElements.length !== 4 ||
   scriptElements.some((match) => !match[1].includes('nonce="test-nonce"')) ||
-  !scriptElements.some((match) => match[1].includes('src="webview.js"')) ||
-  !html.includes('<link rel="stylesheet" href="webview.css">')
+  !scriptElements.some((match) => match[1].includes('src="webview.js?v=test-nonce"')) ||
+  !html.includes('<link rel="stylesheet" href="webview.css?v=test-nonce">')
 ) {
-  throw new Error("All webview scripts and extracted assets must retain their nonce/CSP wiring");
+  throw new Error(
+    "All webview scripts and extracted assets must retain their nonce/CSP and cache-busting wiring",
+  );
 }
 
 const inlineScripts = scriptElements
@@ -233,6 +237,13 @@ if (
   !stylesheet.includes("outline: 2px solid var(--vscode-focusBorder)")
 ) {
   throw new Error("Interactive controls must share a visible keyboard focus treatment");
+}
+if (
+  !stylesheet.includes("textarea:not(#prompt)") ||
+  !stylesheet.includes(".card:focus-within") ||
+  !stylesheet.includes("0 0 18px color-mix(in srgb, var(--vscode-focusBorder) 24%, transparent)")
+) {
+  throw new Error("The prompt focus treatment must highlight the outer composer card");
 }
 if (!stylesheet.includes("@media (prefers-reduced-motion: reduce)")) {
   throw new Error("The webview must honor reduced-motion preferences");

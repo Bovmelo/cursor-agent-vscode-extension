@@ -9,11 +9,13 @@ export interface ConversationSummary {
   pinned: boolean;
   totalTokens: number;
   experimentGroupId?: string;
+  orchestratorFinalResultConversationId?: string;
 }
 
 export interface ConversationSummaryOptions {
   readonly isBusy: (conversationId: string) => boolean;
   readonly isQueued: (conversationId: string) => boolean;
+  readonly orchestratorFinalResultLinks?: ReadonlyMap<string, string>;
 }
 
 /** Filter/sort conversations for the home list, with busy/queue flags from the host. */
@@ -41,16 +43,22 @@ export function conversationSummaries(
       }
       return b.updatedAt - a.updatedAt;
     })
-    .map(({ id, title, updatedAt, pinned, tokenUsage, experimentGroupId }) => ({
-      id,
-      title,
-      updatedAt,
-      running: options.isBusy(id),
-      queued: options.isQueued(id),
-      pinned: pinned === true,
-      totalTokens: tokenUsage?.totalTokens ?? 0,
-      experimentGroupId,
-    }));
+    .map(({ id, title, updatedAt, pinned, tokenUsage, experimentGroupId }) => {
+      const finalResultConversationId = options.orchestratorFinalResultLinks?.get(id);
+      return {
+        id,
+        title,
+        updatedAt,
+        running: options.isBusy(id),
+        queued: options.isQueued(id),
+        pinned: pinned === true,
+        totalTokens: tokenUsage?.totalTokens ?? 0,
+        experimentGroupId,
+        ...(finalResultConversationId
+          ? { orchestratorFinalResultConversationId: finalResultConversationId }
+          : {}),
+      };
+    });
 }
 
 /** Render a conversation transcript as Markdown for export. */

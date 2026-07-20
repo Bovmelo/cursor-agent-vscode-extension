@@ -39,6 +39,16 @@ import {
   type ReviewFinding,
   type VerificationResult,
 } from "./aiNative.js";
+import {
+  buildChangeCourtPrompt,
+  formatChangeCourtMarkdown,
+  parseChangeCourtReview,
+  type ChangeCourtFileEvidence,
+} from "./changeCourt.js";
+import {
+  analyzeFailureTimeMachine,
+  formatFailureTimeMachineMarkdown,
+} from "./failureTimeMachine.js";
 import { buildAutoRepairPrompt } from "./autoRepair.js";
 import {
   buildBestOfNJudgePrompt,
@@ -138,6 +148,7 @@ import {
   markSubtaskConversation,
   markSubtaskLaunch,
   markSubtaskStatus,
+  orchestratorFinalResultLinks,
   orchestratorSummaries,
   prepareOrchestratorResume,
   resolveOrchestratorPlan,
@@ -245,7 +256,10 @@ import { buildSetupChecklistState, type SetupChecklistState } from "./setupCheck
 import { buildRunCenterHostSnapshot } from "./runCenterSnapshot.js";
 import { WorkflowController } from "./workflowController.js";
 import { DiagnosticsController } from "./diagnosticsController.js";
-import { RunCenterCoordinator } from "./runCenterCoordinator.js";
+import {
+  RunCenterCoordinator,
+  type BackgroundChangeSnapshot,
+} from "./runCenterCoordinator.js";
 import type { RunCenterState } from "./runCenterModel.js";
 import { AsyncLifecycle, ExtensionDeactivation } from "./asyncLifecycle.js";
 
@@ -401,7 +415,16 @@ export function activate(context: vscode.ExtensionContext): void {
   const runCenter = new RunCenterTreeDataProvider(IS_JAPANESE);
   provider.setRunCenter(runCenter);
   provider.setRunCenterSources({
-    backgroundJobs: () => backgroundJobs.snapshots(),
+    backgroundJobs: () =>
+      backgroundJobs.snapshots().map((job) => ({
+        ...job,
+        changes: backgroundJobs.changeSummaries(job.id)?.map((change) => ({
+          relative: change.relative,
+          kind: change.kind,
+          added: change.added,
+          deleted: change.deleted,
+        })),
+      })),
     supervisorTasks: () => supervisor.snapshots(),
   });
   provider.setDiagnosticsSources({
@@ -475,6 +498,10 @@ export function activate(context: vscode.ExtensionContext): void {
     runCenterSupervisorSubscription,
     orphanCleanupSubscription,
     vscode.workspace.registerTextDocumentContentProvider("cursor-supervisor-preview", supervisor),
+    vscode.workspace.registerTextDocumentContentProvider(
+      "cursor-background-preview",
+      backgroundJobs,
+    ),
     vscode.languages.registerCodeLensProvider({ scheme: "cursor-supervisor-preview" }, supervisor),
     vscode.languages.registerCodeActionsProvider(
       { scheme: "file" },
@@ -549,6 +576,10 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
     vscode.commands.registerCommand("cursorSubscription.discardBackgroundJob", (target) =>
       backgroundJobs.discard(unwrapWorkspaceNode(target)),
+    ),
+    vscode.commands.registerCommand(
+      "cursorSubscription.openBackgroundChange",
+      (target) => backgroundJobs.openChange(unwrapWorkspaceNode(target)),
     ),
     vscode.commands.registerCommand("cursorSubscription.refreshAuditTimeline", () =>
       auditTimeline.refresh(),
@@ -675,6 +706,18 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "cursorSubscription.compareSessionContents",
       (sessionId?: string) => provider.compareSessionContents(sessionId),
+    ),
+    vscode.commands.registerCommand(
+      "cursorSubscription.reviewChangeSession",
+      (sessionId?: string) => provider.reviewChangeSession(sessionId),
+    ),
+    vscode.commands.registerCommand(
+      "cursorSubscription.openFailureTimeMachine",
+      (sessionId?: string) => provider.openFailureTimeMachine(sessionId),
+    ),
+    vscode.commands.registerCommand(
+      "cursorSubscription.reverifyChangeSession",
+      (sessionId?: string) => provider.reverifyChangeSession(sessionId),
     ),
     vscode.commands.registerCommand("cursorSubscription.chooseSupervisorMode", () =>
       supervisor.chooseMode(),
@@ -834,7 +877,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private auditTimeline?: AuditTimelineController;
   private runCenter?: RunCenterTreeDataProvider;
   private runCenterSources?: {
-    backgroundJobs: () => readonly BackgroundJob[];
+    backgroundJobs: () => readonly (BackgroundJob & {
+      changes?: readonly BackgroundChangeSnapshot[];
+    })[];
     supervisorTasks: () => readonly SupervisorTask[];
   };
   private diagnosticsSources?: {
@@ -1009,7 +1054,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   public setRunCenterSources(sources: {
-    backgroundJobs: () => readonly BackgroundJob[];
+    backgroundJobs: () => readonly (BackgroundJob & {
+      changes?: readonly BackgroundChangeSnapshot[];
+    })[];
     supervisorTasks: () => readonly SupervisorTask[];
   }): void {
     this.runCenterSources = sources;
@@ -2516,6 +2563,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         experiment,
         this.busyConversationIds(),
         this.orchestratorActivityByConversationId,
+        new Set(this.conversations.map((conversation) => conversation.id)),
       ),
     });
   }
@@ -3072,6 +3120,159 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
   }
 
+  public async reviewChangeSession(sessionId?: string): Promise<void> {
+    if (!this.ensureFeatureEnabled("enableAiReview", localize("Change Court", "変更の法廷"))) {
+      return;
+    }
+    const session = this.changeSessions.snapshot(sessionId);
+    if (!session || session.files.length === 0) {
+      void vscode.window.showInformationMessage(
+        localize(
+          "There is no AI change session to review.",
+          "審査できるAI変更セッションがありません。",
+        ),
+      );
+      return;
+    }
+    if (this.anyChatBusy()) {
+      void vscode.window.showInformationMessage(
+        localize(
+          "Wait for the active chat run to finish before starting Change Court.",
+          "実行中のチャットが完了してから変更の法廷を開始してください。",
+        ),
+      );
+      return;
+    }
+    const apiKey = await this.context.secrets.get(API_KEY_SECRET);
+    if (!apiKey) {
+      await this.promptForApiKey();
+      return;
+    }
+
+    try {
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: localize("Change Court is reviewing the evidence…", "変更の根拠を審査中…"),
+        },
+        async () => {
+          const files: ChangeCourtFileEvidence[] = [];
+          const unavailableFiles: string[] = [];
+          const isExcluded = createExcludedPathMatcher(vscode.Uri.file(session.root));
+          for (const file of session.files) {
+            const relative = path.relative(session.root, file).replaceAll("\\", "/");
+            if (isExcluded(relative) || !session.proposedFiles?.[file]?.contentCaptured) {
+              unavailableFiles.push(relative);
+              continue;
+            }
+            const [before, after] = await Promise.all([
+              this.changeSessions.baselineContent(session.id, file),
+              this.changeSessions.proposedContent(session.id, file),
+            ]);
+            if (before.includes("\0") || after.includes("\0")) {
+              unavailableFiles.push(relative);
+              continue;
+            }
+            files.push({ relative, before, after });
+          }
+          if (files.length === 0) {
+            void vscode.window.showInformationMessage(
+              localize(
+                "This session has no saved text snapshots that Change Court can review.",
+                "このセッションには変更の法廷で審査できる保存済みテキストがありません。",
+              ),
+            );
+            return;
+          }
+
+          const verification = this.changeCourtVerificationSummary(session.verification);
+          const evidence = buildChangeCourtPrompt({
+            goal: session.goal,
+            verification,
+            files,
+          });
+          const reviewRoot = vscode.Uri.joinPath(
+            this.context.storageUri ?? this.context.globalStorageUri,
+            "change-court",
+          );
+          await vscode.workspace.fs.createDirectory(reviewRoot);
+          const result = await Agent.prompt(evidence.prompt, {
+            apiKey,
+            model: this.selectedModelSelection(),
+            name: "VS Code: Change Court",
+            mode: "plan",
+            // The complete review evidence is carried in the prompt. Keeping
+            // cwd outside the project prevents ambient workspace context from
+            // silently changing the verdict, while Plan mode remains read-only.
+            local: { cwd: reviewRoot.fsPath, settingSources: [] },
+          });
+          if (result.status !== "finished") {
+            throw new Error(this.formatRunFailure(result));
+          }
+          if (result.usage) {
+            await this.recordUsage("chat", result.usage);
+          }
+          const review = parseChangeCourtReview(result.result ?? "");
+          const markdown = formatChangeCourtMarkdown({
+            goal: session.goal,
+            review,
+            verification,
+            includedFiles: evidence.includedFiles,
+            skippedFiles: [...new Set([...evidence.skippedFiles, ...unavailableFiles])],
+            japanese: IS_JAPANESE,
+            reviewedAt: new Date(),
+          });
+          const uri = vscode.Uri.from({
+            scheme: "cursor-ai-preview",
+            path: `/change-court/${session.id}/${randomUUID()}.md`,
+          });
+          this.previewContents.set(uri.toString(), markdown);
+          const document = await vscode.workspace.openTextDocument(uri);
+          await vscode.window.showTextDocument(document, { preview: true });
+        },
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.output.appendLine(`[${new Date().toISOString()}] Change Court failed: ${message}`);
+      void vscode.window.showErrorMessage(
+        localize(`Change Court failed: ${message}`, `変更の法廷に失敗しました: ${message}`),
+      );
+    }
+  }
+
+  public async openFailureTimeMachine(sessionId?: string): Promise<void> {
+    if (
+      !this.ensureFeatureEnabled(
+        "enableChangeSessions",
+        localize("Failure Time Machine", "失敗のタイムマシン"),
+      )
+    ) {
+      return;
+    }
+    const report = analyzeFailureTimeMachine({
+      sessions: this.changeSessions.history(),
+      auditEntries: this.context.workspaceState.get<AuditEntry[]>(AUDIT_LOG_KEY, []),
+      targetSessionId: sessionId,
+    });
+    if (!report) {
+      void vscode.window.showInformationMessage(
+        localize(
+          "No recorded failed AI change session is available.",
+          "記録済みの失敗したAI変更セッションはありません。",
+        ),
+      );
+      return;
+    }
+    const markdown = formatFailureTimeMachineMarkdown(report, IS_JAPANESE);
+    const uri = vscode.Uri.from({
+      scheme: "cursor-ai-preview",
+      path: `/failure-time-machine/${report.targetSessionId}/${randomUUID()}.md`,
+    });
+    this.previewContents.set(uri.toString(), markdown);
+    const document = await vscode.workspace.openTextDocument(uri);
+    await vscode.window.showTextDocument(document, { preview: true });
+  }
+
   public async analyzeDebugContext(): Promise<void> {
     if (
       !this.ensureFeatureEnabled("enableDebugContext", localize("Debug analysis", "デバッグ解析"))
@@ -3140,11 +3341,31 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (!this.ensureFeatureEnabled("enableVerification", localize("Verification", "検証"))) {
       return undefined;
     }
-    const sessionRoot = sessionId
-      ? this.changeSessions.snapshot(sessionId)?.root
-      : this.changeSessions.snapshot()?.root;
+    const session = this.changeSessions.snapshot(sessionId);
+    if (sessionId && !session) {
+      void vscode.window.showWarningMessage(
+        localize(
+          "The selected AI change session is no longer available.",
+          "選択したAI変更セッションは利用できません。",
+        ),
+      );
+      return undefined;
+    }
+    const sessionRoot = session?.root;
+    const sessionWorkspace = sessionRoot
+      ? resolveWorkspaceFolder(vscode.Uri.file(sessionRoot))
+      : undefined;
+    if (sessionId && !sessionWorkspace) {
+      void vscode.window.showWarningMessage(
+        localize(
+          "The selected session workspace is not open. Verification was not run.",
+          "選択したセッションのワークスペースが開かれていないため、検証を実行しませんでした。",
+        ),
+      );
+      return undefined;
+    }
     const workspace =
-      (sessionRoot ? resolveWorkspaceFolder(vscode.Uri.file(sessionRoot)) : undefined) ??
+      sessionWorkspace ??
       resolveWorkspaceFolder(vscode.window.activeTextEditor?.document.uri) ??
       (await pickWorkspaceFolder(
         localize("Select a workspace to verify", "検証するワークスペースを選択"),
@@ -3171,6 +3392,38 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.output.appendLine(summary);
     void vscode.window.showInformationMessage(summary);
     return result;
+  }
+
+  public async reverifyChangeSession(sessionId?: string): Promise<VerificationResult | undefined> {
+    const session = this.changeSessions.snapshot(sessionId);
+    if (!session?.verification || session.verification.success || session.verification.skipped) {
+      void vscode.window.showInformationMessage(
+        localize(
+          "No recorded failed verification is available for this session.",
+          "このセッションには記録済みの検証失敗がありません。",
+        ),
+      );
+      return undefined;
+    }
+    if (session.id !== this.changeSessions.snapshot()?.id) {
+      void vscode.window.showWarningMessage(
+        localize(
+          "Historical workspace state is not retained completely, so only the latest failed session can be verified again.",
+          "過去のワークスペース状態は完全には保持されないため、再検証できるのは最新の失敗セッションだけです。",
+        ),
+      );
+      return undefined;
+    }
+    if (!vscode.workspace.isTrusted) {
+      void vscode.window.showWarningMessage(
+        localize(
+          "Re-running verification requires a trusted workspace.",
+          "検証の再実行には信頼済みワークスペースが必要です。",
+        ),
+      );
+      return undefined;
+    }
+    return this.verifyCurrentChanges(session.id);
   }
 
   public async revertLastSession(sessionId?: string): Promise<void> {
@@ -4669,6 +4922,19 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         );
   }
 
+  private changeCourtVerificationSummary(result?: VerificationResult): string {
+    if (!result) {
+      return "Verification was not run for this change session.";
+    }
+    if (result.skipped) {
+      return "Verification was skipped because no configured or detected commands were available.";
+    }
+    return [
+      `Overall verification: ${result.success ? "passed" : "failed"}.`,
+      ...result.steps.map((step) => `- ${step.success ? "passed" : "failed"}: ${step.command}`),
+    ].join("\n");
+  }
+
   private captureEditorContext(editor: vscode.TextEditor): EditorContextSnapshot | undefined {
     if (editor.document.uri.scheme !== "file") {
       return undefined;
@@ -4816,11 +5082,25 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     pinned: boolean;
     totalTokens: number;
     experimentGroupId?: string;
+    orchestratorFinalResultConversationId?: string;
   }> {
+    const finalResultLinks = this.availableOrchestratorFinalResultLinks();
     return buildConversationSummaries(this.conversations, query, {
       isBusy: (id) => this.isConversationBusy(id),
       isQueued: (id) => this.messageQueue.some((item) => item.conversationId === id),
+      orchestratorFinalResultLinks: finalResultLinks,
     });
+  }
+
+  private availableOrchestratorFinalResultLinks(): ReadonlyMap<string, string> {
+    const existingConversationIds = new Set(this.conversations.map((conversation) => conversation.id));
+    return new Map(
+      [...orchestratorFinalResultLinks(this.orchestratorExperiments)]
+        .filter(([conversationId, finalResultId]) =>
+          existingConversationIds.has(conversationId)
+          && existingConversationIds.has(finalResultId)
+        ),
+    );
   }
 
   private async saveConversations(): Promise<void> {
@@ -5269,6 +5549,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   private postParallelState(): void {
+    const finalResultLinks = this.availableOrchestratorFinalResultLinks();
     const queueCounts = new Map<string, number>();
     for (const item of this.messageQueue) {
       queueCounts.set(item.conversationId, (queueCounts.get(item.conversationId) ?? 0) + 1);
@@ -5333,6 +5614,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           visible: status !== undefined,
           orchestratorExperimentId: conversation.orchestratorExperimentId,
           orchestratorRole,
+          ...(finalResultLinks.has(conversation.id)
+            ? {
+                orchestratorFinalResultConversationId: finalResultLinks.get(conversation.id),
+              }
+            : {}),
           ...(orchestratorSubtaskIndex !== undefined ? { orchestratorSubtaskIndex } : {}),
           activity: status === "running" ? activity : undefined,
         };
