@@ -52,6 +52,10 @@ export class AgentFactory {
     const local: LocalAgentOptions = {
       cwd,
       autoReview: approvalMode !== "full-access",
+      // Be explicit even though current SDKs default this on for headless
+      // embedders. Transport retries are especially important for the Windows
+      // native runtime, where an interrupted pipe can surface as ECANCELED.
+      enableAgentRetries: true,
       sandboxOptions: {
         enabled: this.options.supportsLocalSandbox && approvalMode !== "full-access",
       },

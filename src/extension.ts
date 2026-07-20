@@ -85,6 +85,7 @@ import {
   loadProjectCommands,
   type ProjectCommand,
 } from "./projectCommands.js";
+import { isLocalRuntimeWriteCancelled } from "./pureUtils.js";
 import { RunningSoundController } from "./runningSound.js";
 import {
   isRunPreparationError,
@@ -5512,6 +5513,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     let failed = false;
     let progressState: "completed" | "stopped" | "error" = "completed";
     let verificationResult: VerificationResult | undefined;
+    let resetInterruptedAgent = false;
     runtime.live = {
       userEntry,
       assistantText,
@@ -6089,19 +6091,39 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         await this.recordUsage("chat", result.usage);
       }
       if (result.status === "error") {
-        failed = true;
-        progressState = "error";
-        const errorText = this.formatRunFailure(result);
+        const runtimeWriteCancelled = isLocalRuntimeWriteCancelled(
+          result.error?.code,
+          result.error?.message,
+        );
+        const requestedStop = runtimeWriteCancelled && (
+          preparationAbort.signal.aborted
+          || runtime.pendingCancel
+          || runtime.cancellation !== undefined
+        );
         this.output.appendLine(
           `[${new Date().toISOString()}] Run ${result.id} failed: ${result.error?.code ?? "unknown"} ${result.error?.message ?? ""}`.trim(),
         );
-        this.postIfActive(conversationId, {
-          type: "error",
-          text: errorText,
-        });
-        assistantText = assistantText
-          ? `${assistantText}\n\n${errorText}`
-          : errorText;
+        if (requestedStop) {
+          // A Windows pipe write can lose the race with run.cancel() and arrive
+          // as ECANCELED instead of the SDK's normal cancelled terminal state.
+          progressState = "stopped";
+          this.postIfActive(conversationId, { type: "cancelled" });
+          if (!assistantText) {
+            assistantText = localize("(Stopped)", "（停止しました）");
+          }
+        } else {
+          failed = true;
+          progressState = "error";
+          resetInterruptedAgent = runtimeWriteCancelled;
+          const errorText = this.formatRunFailure(result);
+          this.postIfActive(conversationId, {
+            type: "error",
+            text: errorText,
+          });
+          assistantText = assistantText
+            ? `${assistantText}\n\n${errorText}`
+            : errorText;
+        }
       } else if (result.status === "cancelled") {
         progressState = "stopped";
         if (runtime.live) {
@@ -6468,6 +6490,33 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }
       runtime.run = undefined;
 
+      if (resetInterruptedAgent && runtime.agent && !runtime.isolatedWorktree) {
+        // The run is terminal, so it is safe to drop only the SDK process
+        // handle. Keep conversation.agentId: the next message resumes the
+        // persisted conversation through a freshly spawned local runtime.
+        const interruptedAgent = runtime.agent;
+        runtime.agent = undefined;
+        runtime.rootsKey = undefined;
+        runtime.forceNextRun = false;
+        try {
+          await this.waitForRunCleanup(
+            interruptedAgent[Symbol.asyncDispose](),
+            "resetting the interrupted Cursor agent",
+          );
+          this.output.appendLine(
+            `[${new Date().toISOString()}] Reset the local Cursor runtime after an ECANCELED write failure.`,
+          );
+        } catch (resetError) {
+          // The stale handle is intentionally discarded even when its process
+          // cannot acknowledge disposal; the next run must not reuse it.
+          this.output.appendLine(
+            `[${new Date().toISOString()}] Could not cleanly reset the interrupted Cursor agent: ${
+              resetError instanceof Error ? resetError.message : String(resetError)
+            }`,
+          );
+        }
+      }
+
       const isolated = runtime.isolatedWorktree;
       runtime.isolatedWorktree = undefined;
       if (isolated) {
@@ -6800,6 +6849,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         "The agent already has an active run. Stop it or wait for it to finish, then try again.",
         "エージェントで別の処理が実行中です。停止するか完了を待ってから再試行してください。",
       );
+    } else if (isLocalRuntimeWriteCancelled(result.error?.code, detail)) {
+      summary = localize(
+        "The connection to the local Cursor runtime was interrupted. The extension will reconnect automatically on the next run; try the message again.",
+        "ローカルのCursor Runtimeとの接続が中断されました。次の実行時に自動で再接続するため、メッセージをもう一度送信してください。",
+      );
     } else {
       summary = localize(
         "Cursor Agent could not complete the run.",
@@ -6813,6 +6867,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       result.error?.code
         ? `${localize("Error code", "エラーコード")}: ${result.error.code}`
         : undefined,
+      result.requestId ? `Request: ${result.requestId}` : undefined,
       `Run: ${result.id}`,
     ].filter((line): line is string => Boolean(line)).join("\n");
   }
