@@ -105,8 +105,8 @@ test("SDK reconnects and sequential hooks revalidate their trust boundary", () =
     aiNativeSource.indexOf("export function verificationStage("),
   );
 
-  assert.match(factoryConnectSource, /assertIntegrationBoundary\(\);\s*return await Agent\.resume/u);
-  assert.match(factoryConnectSource, /assertIntegrationBoundary\(\);\s*const agent = await Agent\.create/u);
+  assert.match(factoryConnectSource, /assertIntegrationBoundary\(\);\s*return await this\.backend\.resume/u);
+  assert.match(factoryConnectSource, /assertIntegrationBoundary\(\);\s*const agent = await this\.backend\.create/u);
   assert.match(hookLoopSource, /!vscode\.workspace\.isTrusted[\s\S]*?runConfiguredCommand\(/u);
   assert.match(verificationSource, /for \(const command[\s\S]*?!vscode\.workspace\.isTrusted[\s\S]*?runConfiguredCommand\(/u);
 });

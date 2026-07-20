@@ -33,8 +33,23 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Compile, validate webview, and run tests
-        run: npm run validate
+      - name: Lint TypeScript and quality scripts
+        run: npm run lint
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Compile extension
+        run: npm run compile
+
+      - name: Validate Webview structure and accessibility
+        run: npm run validate:webview && npm run validate:a11y
+
+      - name: Run Node tests with coverage thresholds
+        run: node scripts/run-coverage.mjs
+
+      - name: Audit production dependencies
+        run: npm run audit:dependencies
 
   # Extension Host e2e stays on Ubuntu/Windows only. macOS GitHub-hosted runners are
   # headless without a reliable non-interactive display for Electron/VS Code
@@ -68,3 +83,26 @@ jobs:
       - name: Run Extension Host tests (Windows)
         if: runner.os == 'Windows'
         run: npm run test:e2e
+
+  # Catches vsce/mac packaging breaks without waiting for a tag release.
+  # E2E stays Linux/Windows-only (see e2e job comments above).
+  package-smoke:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.13'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Package VSIX (darwin-arm64)
+        run: npm run package:target -- darwin-arm64
+
+      - name: Assert VSIX exists
+        run: ls *.vsix

@@ -260,6 +260,9 @@ async function runSuiteChild({
       "GITHUB_TOKEN",
       "GH_ENTERPRISE_TOKEN",
       "GITHUB_ENTERPRISE_TOKEN",
+      "VSCE_PAT",
+      "AZURE_DEVOPS_EXT_PAT",
+      "NPM_TOKEN",
     ]) {
       delete env[key];
     }

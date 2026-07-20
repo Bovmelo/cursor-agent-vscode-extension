@@ -2,7 +2,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { AUDIT_LOG_KEY, type AuditEntry } from "./auditLog.js";
 
-interface AuditNode {
+interface AuditEntryNode {
   kind: "entry" | "detail" | "file";
   entry: AuditEntry;
   label: string;
@@ -10,9 +10,18 @@ interface AuditNode {
   file?: string;
 }
 
+interface AuditHealthNode {
+  kind: "health";
+  label: string;
+  description: string;
+}
+
+type AuditNode = AuditEntryNode | AuditHealthNode;
+
 export class AuditTimelineController implements vscode.TreeDataProvider<AuditNode>, vscode.Disposable {
   private readonly changed = new vscode.EventEmitter<AuditNode | undefined>();
   private sharedEntries: AuditEntry[] = [];
+  private sharedLogError: string | undefined;
   public readonly onDidChangeTreeData = this.changed.event;
 
   public constructor(
@@ -32,7 +41,26 @@ export class AuditTimelineController implements vscode.TreeDataProvider<AuditNod
     this.changed.dispose();
   }
 
+  public setSharedLogError(error: string | undefined): void {
+    this.sharedLogError = error;
+    this.changed.fire(undefined);
+  }
+
   public getTreeItem(node: AuditNode): vscode.TreeItem {
+    if (node.kind === "health") {
+      const item = new vscode.TreeItem(node.label, vscode.TreeItemCollapsibleState.None);
+      item.description = node.description;
+      item.tooltip = this.japanese
+        ? `共有監査ログへの書き込みに失敗しました。Agentログを開いて詳細を確認してください。\n\n${node.description}`
+        : `Writing the shared audit log failed. Open Agent logs for details.\n\n${node.description}`;
+      item.contextValue = "cursorAudit.health.error";
+      item.iconPath = new vscode.ThemeIcon("warning", new vscode.ThemeColor("list.warningForeground"));
+      item.command = {
+        command: "cursorSubscription.openOutput",
+        title: this.japanese ? "Agentログを開く" : "Open Agent logs",
+      };
+      return item;
+    }
     const item = new vscode.TreeItem(
       node.label,
       node.kind === "entry" && (node.entry.details || node.entry.files?.length)
@@ -64,7 +92,7 @@ export class AuditTimelineController implements vscode.TreeDataProvider<AuditNod
       ]) {
         entries.set(entry.id, entry);
       }
-      return [...entries.values()]
+      const nodes: AuditNode[] = [...entries.values()]
         .sort((left, right) => right.at - left.at)
         .map((entry) => ({
         kind: "entry",
@@ -72,6 +100,14 @@ export class AuditTimelineController implements vscode.TreeDataProvider<AuditNod
         label: entry.summary,
         description: `${entry.action} · ${new Date(entry.at).toLocaleString()}`,
         }));
+      if (this.sharedLogError) {
+        nodes.unshift({
+          kind: "health",
+          label: this.japanese ? "共有ログの書き込みに失敗" : "Shared log write failed",
+          description: this.sharedLogError.slice(0, 160),
+        });
+      }
+      return nodes;
     }
     if (node.kind !== "entry") {
       return [];

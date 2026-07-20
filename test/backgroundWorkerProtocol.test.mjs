@@ -161,6 +161,35 @@ test("background launch, restored trust, and discard boundaries fail closed", ()
   assert.match(backgroundWorkerSource, /settingSources: input\.workspaceTrustedAtLaunch \? \["all"\] : \[\]/u);
 });
 
+test("background jobs never persist API keys; workers receive them on stdin only", () => {
+  const createSource = backgroundJobsSource.slice(
+    backgroundJobsSource.indexOf("public async create("),
+    backgroundJobsSource.indexOf("public async apply("),
+  );
+  const launchSource = backgroundJobsSource.slice(
+    backgroundJobsSource.indexOf("private launch("),
+    backgroundJobsSource.indexOf("private workerFile("),
+  );
+  const jobLiteral = createSource.slice(
+    createSource.indexOf("const job: BackgroundJob"),
+    createSource.indexOf("this.jobs.set(id, job)"),
+  );
+
+  assert.equal(
+    /apiKey\s*:/.test(jobLiteral),
+    false,
+    "BackgroundJob documents must not include an apiKey field",
+  );
+  assert.match(launchSource, /minimalShellEnv\(\)/u);
+  assert.match(launchSource, /child\.stdin\.end\(JSON\.stringify\(input\)\)/u);
+  assert.match(backgroundWorkerSource, /let apiKey: string \| undefined = input\.apiKey/u);
+  assert.match(backgroundWorkerSource, /input\.apiKey = ""/u);
+  assert.match(
+    backgroundWorkerSource,
+    /apiKey,\s*[\s\S]*?apiKey = undefined/u,
+  );
+});
+
 async function createJob(t, status) {
   const directory = await mkdtemp(join(tmpdir(), "cursor-background-worker-"));
   t.after(() => rm(directory, { recursive: true, force: true }));

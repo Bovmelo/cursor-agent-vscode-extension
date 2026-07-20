@@ -67,10 +67,17 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "lint": "npm run lint:typescript && npm run lint:scripts",
+    "lint:typescript": "oxlint --type-aware --max-warnings=0 src",
+    "lint:scripts": "eslint eslint.config.js prettier.config.js scripts/**/*.mjs",
+    "format:check": "prettier --check .oxlintrc.json eslint.config.js prettier.config.js scripts/audit-dependencies.mjs scripts/run-coverage.mjs scripts/validate-webview-a11y.mjs scripts/vscode-a11y-loader.mjs scripts/vscode-a11y-mock.mjs test/dependencyPolicy.test.mjs",
     "validate:webview": "node scripts/validate-webview.mjs",
+    "validate:a11y": "node scripts/validate-webview-a11y.mjs",
     "test": "npm run compile && node --test test/*.test.mjs",
+    "test:coverage": "npm run compile && node scripts/run-coverage.mjs",
     "test:e2e": "npm run compile && node scripts/run-extension-tests.mjs",
-    "validate": "npm run compile && npm run validate:webview && node --test test/*.test.mjs",
+    "audit:dependencies": "node scripts/audit-dependencies.mjs",
+    "validate": "npm run lint && npm run format:check && npm run compile && npm run validate:webview && npm run validate:a11y && node scripts/run-coverage.mjs && npm run audit:dependencies",
     "vscode:prepublish": "npm run validate",
     "package": "vsce package",
     "package:target": "vsce package --target",
@@ -86,6 +93,35 @@
         "command": "cursorSubscription.openSettings",
         "title": "%command.openSettings%",
         "icon": "$(settings-gear)"
+      },
+      {
+        "command": "cursorSubscription.chooseWorkflow",
+        "title": "%command.chooseWorkflow%",
+        "icon": "$(compass)"
+      },
+      {
+        "command": "cursorSubscription.chooseExecutionProfile",
+        "title": "%command.chooseExecutionProfile%",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "cursorSubscription.openOutput",
+        "title": "%command.openOutput%",
+        "icon": "$(output)"
+      },
+      {
+        "command": "cursorSubscription.exportDiagnostics",
+        "title": "%command.exportDiagnostics%"
+      },
+      {
+        "command": "cursorSubscription.retryLastRun",
+        "title": "%command.retryLastRun%",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "cursorSubscription.openRunCenter",
+        "title": "%command.openRunCenter%",
+        "icon": "$(pulse)"
       },
       {
         "command": "cursorSubscription.setApiKey",
@@ -303,6 +339,28 @@
       }
     ],
     "menus": {
+      "view/title": [
+        {
+          "command": "cursorSubscription.openRunCenter",
+          "when": "view == cursorSubscription.workspaceTree",
+          "group": "navigation@1"
+        },
+        {
+          "command": "cursorSubscription.chooseWorkflow",
+          "when": "view == cursorSubscription.chatView || view == cursorSubscription.workspaceTree",
+          "group": "navigation@2"
+        },
+        {
+          "command": "cursorSubscription.chooseExecutionProfile",
+          "when": "view == cursorSubscription.workspaceTree",
+          "group": "navigation@3"
+        },
+        {
+          "command": "cursorSubscription.openOutput",
+          "when": "view == cursorSubscription.workspaceTree",
+          "group": "navigation@4"
+        }
+      ],
       "scm/title": [
         {
           "command": "cursorSubscription.generateCommitMessage",
@@ -493,6 +551,16 @@
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "cursorSubscription.chatView",
+        "contents": "%viewsWelcome.chat%"
+      },
+      {
+        "view": "cursorSubscription.workspaceTree",
+        "contents": "%viewsWelcome.workspace%"
+      }
+    ],
     "configuration": {
       "title": "%extension.displayName%",
       "properties": {
@@ -917,11 +985,23 @@
     "dompurify": "^3.4.12",
     "marked": "^18.0.6"
   },
+  "overrides": {
+    "@connectrpc/connect-node": {
+      "undici": "7.28.0"
+    }
+  },
   "devDependencies": {
+    "@eslint/js": "10.0.1",
     "@types/node": "~22.13.17",
     "@types/vscode": "~1.101.0",
     "@vscode/test-electron": "3.0.0",
     "@vscode/vsce": "^3.9.2",
+    "axe-core": "4.12.1",
+    "eslint": "10.7.0",
+    "jsdom": "29.1.1",
+    "oxlint": "1.74.0",
+    "oxlint-tsgolint": "0.25.0",
+    "prettier": "3.9.5",
     "typescript": "^7.0.2"
   }
 }

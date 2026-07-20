@@ -52,12 +52,22 @@ test("workspace mutations that can execute or apply agent output require trust",
     extensionSource.indexOf("private async offerCreatePullRequest("),
     extensionSource.indexOf("public async newChat("),
   );
+  const createPullRequestCommand = extensionSource.slice(
+    extensionSource.indexOf("public async createPullRequestFromWorkspace("),
+    extensionSource.indexOf("private async offerCreatePullRequest("),
+  );
+  const taskPipelinePath = extensionSource.slice(
+    extensionSource.indexOf("public async runTaskPipeline("),
+    extensionSource.indexOf("public async executeLastPlan("),
+  );
   const backgroundApplyPath = backgroundSource.slice(
     backgroundSource.indexOf("public async apply("),
     backgroundSource.indexOf("public async cancel("),
   );
 
   assert.match(pullRequestPath, /!vscode\.workspace\.isTrusted/u);
+  assert.match(createPullRequestCommand, /!vscode\.workspace\.isTrusted/u);
+  assert.match(taskPipelinePath, /!vscode\.workspace\.isTrusted/u);
   assert.match(backgroundApplyPath, /!vscode\.workspace\.isTrusted/u);
   assert.match(backgroundApplyPath, /cancellationInvalidatesCompletedResult/u);
   assert.match(

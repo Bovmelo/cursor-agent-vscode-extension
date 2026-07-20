@@ -5,6 +5,10 @@ on:
     tags:
       - 'v*'
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -113,6 +117,23 @@ jobs:
           pattern: vsix-*
           merge-multiple: true
 
+      - name: Skip notice when VSCE_PAT unset
+        if: env.VSCE_PAT == ''
+        run: |
+          echo "::warning::VSCE_PAT is unset; Marketplace publish skipped. GitHub Release artifacts were still created."
+          {
+            echo "## Marketplace publish skipped"
+            echo ""
+            echo "\`VSCE_PAT\` is not set, so Visual Studio Marketplace publish was skipped."
+            echo "GitHub Release artifacts (VSIX files) were still created successfully."
+            echo "Set the repo secret \`VSCE_PAT\` (Azure DevOps PAT with Marketplace publish scope) to enable publishing."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish preflight
+        run: |
+          npx vsce --version
+          node -e "const p=require('./package.json'); console.log('publisher:', p.publisher); console.log('version:', p.version);"
+
       - name: Publish to Visual Studio Marketplace
         if: env.VSCE_PAT != ''
         run: |
@@ -123,7 +144,19 @@ jobs:
             echo "::error::No VSIX artifacts found to publish"
             exit 1
           fi
+          published=()
           for vsix in "${vsixes[@]}"; do
             echo "Publishing ${vsix}"
             npm run publish -- --packagePath "$vsix"
+            published+=("$vsix")
           done
+          {
+            echo "## Marketplace publish"
+            echo ""
+            echo "Published VSIX files:"
+            for vsix in "${published[@]}"; do
+              echo "- \`${vsix}\`"
+            done
+            echo ""
+            echo "Note: a mid-loop failure can leave earlier targets already published."
+          } >> "$GITHUB_STEP_SUMMARY"

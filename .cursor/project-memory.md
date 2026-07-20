@@ -33,7 +33,8 @@ Evidence-based notes for agents. No secrets. Refresh with **Cursor: Refresh Proj
 | `src/integrationCatalog*.ts` / `integrationToggles.ts` | Rules, Skills, MCP, commands listing + enable/disable |
 | `src/hooks.ts` / `shellCommand.ts` | pre/post-edit and verification via `execFile` |
 | `src/sensitivePaths.ts` / `sensitivePathMatch.ts` | Exclude/scrub globs for apply and worktree secret content |
-| `src/gitWorkflow.ts` / `githubTriggers.ts` / `gitApi.ts` | PR creation, CI/PR feedback signals |
+| `src/gitWorkflow.ts` / `gitWorkflowPure.ts` / `githubTriggers.ts` / `githubIssues.ts` / `gitApi.ts` | PR creation, CI/PR feedback, `gh issue list` |
+| `src/taskPipeline.ts` | Pure Task Pipeline goal / pending-PR / prompt helpers (wired from `extension.ts`) |
 | `src/inlineCompletion.ts` | Opt-in completions helpers (limits, sanitize, acceptance rate) |
 | `src/usageStats.ts` / `auditLog.ts` / `auditTimeline.ts` | Token budgets and audit UI/log |
 | `package.json` + `package.nls*.json` | Contributes, settings, i18n |
@@ -101,6 +102,7 @@ Default verification discovery (change sessions): npm scripts named `validate`, 
 | Task | Start here |
 | --- | --- |
 | New chat command / send behavior | `extension.ts` (`enqueueMessage` / `send`), `chatSendQueue.ts` |
+| Task Pipeline / GitHub issues | `extension.ts` (`runTaskPipeline`), `taskPipeline.ts`, `githubIssues.ts` |
 | Chat UI / setup checklist | `webviewController.ts` (sidebar checklist + host `setupChecklistState`) |
 | Approval / safe worktree policy | `safety.ts` (`shouldUseIsolatedWorktree`, modes) |
 | Worktree apply | `isolatedWorktree.ts`, `parallelOwnership.ts` |

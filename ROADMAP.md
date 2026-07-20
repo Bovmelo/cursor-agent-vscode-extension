@@ -14,26 +14,35 @@ The next product line is **hardening and operability for a trustworthy 0.2.x**, 
 
 ### Priority themes (in order)
 
-1. **E2E / trust / API-key hardening**  
-   Strengthen Extension Host E2E coverage, keep Workspace Trust gates at privileged boundaries, and keep API-key handling defensive (SecretStorage, stdin-only worker paths, no key material in job files, logs, or docs).
+1. **E2E / trust / API-key hardening** — largely landed
+   Extension Host E2E covers Restricted Mode gates for background agents, Create PR, Task Pipeline, and Supervisor GitHub scan. Keep API-key handling defensive (SecretStorage, stdin-only worker paths, no key material in job files, logs, or docs). Continue deepening privileged-path coverage as new automation lands.
 
-2. **CI including macOS + predictable Marketplace publish**  
-   Extend continuous validation beyond the current Linux/Windows matrix to include **macOS**, and make release → VSIX → Marketplace publish steps more predictable and repeatable.
+2. **CI including macOS + predictable Marketplace publish** — largely landed
+   `validate` runs on Linux / Windows / **macOS**; `package-smoke` packages `darwin-arm64` on PRs. Extension Host E2E stays Linux/Windows-only (headless Electron). Release concurrency, Marketplace skip warnings, and publish preflight improve tag→VSIX→Marketplace predictability.
 
-3. **Extract chat send/queue helpers from the `extension.ts` monolith**  
-   Move pure send/queue orchestration helpers out of the activation hub so chat behavior is testable without growing the god-path further. Controllers and VS Code/SDK I/O stay where they belong; extract logic, do not rewrite the product.
+3. **Extract chat send/queue helpers from the `extension.ts` monolith** — initial extract done (`chatSendQueue.ts`)
+   Continue extracting pure helpers where tests need them; controllers and VS Code/SDK I/O stay where they belong.
 
-4. **First-run onboarding checklist**  
-   Guide new installs through API key, trust, Git / Safe worktree expectations (especially on Windows, where the local SDK sandbox is unavailable and **Safe worktree** remains the default), and optional `gh` setup — without claiming OS-level isolation.
+4. **First-run onboarding checklist** — done
+   Agent sidebar checklist covers API key, trust, Git, permission mode, and optional `gh`.
 
-5. **Mocked integration tests for GitHub / pipeline paths**  
-   Cover Task Pipeline, PR, and Supervisor GitHub-scan flows with mocked `gh` / integration boundaries so regressions are caught without live network or credentials.
+5. **Mocked integration tests for GitHub / pipeline paths** — largely landed
+   Supervisor GitHub scan unit + wiring contracts; `githubIssues` / `taskPipeline` mocked and pure tests. Optional next: deeper `gitWorkflow` PATH-shim create/retry sequences.
 
 ### Positioning we will keep honest
 
 - Unofficial; not Cursor desktop session login.
 - SDK is beta — defensive resume/create and sandbox-unavailable handling stay required.
 - On Windows, **Safe worktree** reduces accidental workspace edits; it is **not** an OS security boundary. Direct-workspace modes still need explicit confirmation.
+
+### Implemented 0.2 foundation
+
+- Goal-first Ask / Change / Delegate / Review entry point and Safe / Balanced / Automation presets
+- Run Center for plan, progress, changes, verification, error detail, and recovery across chat, Supervisor, and background work
+- Versioned bounded persistence, managed attachment retention, adaptive background recovery, and redacted diagnostics
+- Extracted Webview assets and message contract, backend capability boundary, and expanded quality / accessibility gates
+
+The next product work should validate these flows with real users and improve recovery success and time-to-first-success before adding new autonomous modes.
 
 See also: [README](./README.md), [Changelog](./CHANGELOG.md).
 
@@ -53,23 +62,32 @@ Anysphere / Cursor 非提携の**非公式**拡張機能です。公開 [Cursor 
 
 ### 優先テーマ（順）
 
-1. **E2E / Trust / APIキーの硬化**  
-   Extension Host E2E、特権境界での Workspace Trust、APIキー経路（SecretStorage、ワーカーへの stdin のみ、ジョブファイル・ログ・ドキュメントへの鍵の非混入）を強化する。
+1. **E2E / Trust / APIキーの硬化** — おおむね完了
+   Restricted Mode で background / Create PR / Task Pipeline / Supervisor GitHub スキャンの Trust ゲートを E2E 検証。APIキーは SecretStorage + ワーカー stdin のみ。新自動化追加時も特権経路のカバーを続ける。
 
-2. **macOS を含む CI と予測可能な Marketplace 公開**  
-   現行の Linux / Windows 検証に加え **macOS** を継続検証に含め、リリース → VSIX → Marketplace 公開をより予測可能で再現しやすくする。
+2. **macOS を含む CI と予測可能な Marketplace 公開** — おおむね完了
+   `validate` は Linux / Windows / **macOS**。PR で `darwin-arm64` の `package-smoke`。E2E は Linux/Windows のみ。リリースの concurrency・Marketplace スキップ警告・preflight で公開手順を予測可能に。
 
 3. **`extension.ts` モノリスからのチャット送信 / キュー補助の抽出** — 初期抽出済み（`chatSendQueue.ts`）。必要なら追加の純粋ロジック切り出しを続ける。
 
-4. **初回オンボーディングチェックリスト** — Agent サイドバーに実装済み（APIキー、Trust、Git、権限モード、任意の `gh`）。OS レベルの隔離は主張しない。
+4. **初回オンボーディングチェックリスト** — 実装済み。
 
-5. **GitHub / パイプライン経路のモック統合テスト**  
-   Supervisor の GitHub 検出ユニットテストは強化済み。タスクパイプライン全体のモック統合は継続。
+5. **GitHub / パイプライン経路のモック統合テスト** — おおむね完了
+   Supervisor GitHub 検出ユニット + wiring、`githubIssues` / `taskPipeline` のモック・純粋テスト。任意の次: `gitWorkflow` の create/retry PATH シム統合。
 
 ### 正直に保つ位置づけ
 
 - 非公式。Cursor デスクトップのログインセッションは使わない。
 - SDK はベータ — resume / create 失敗やサンドボックス不可への防御的扱いを維持する。
 - Windows の**安全 worktree**は意図しないワークスペース編集を抑えるが、**OS のセキュリティ境界ではない**。ワークスペース直接実行モードには明示確認が必要。
+
+### 実装済みの0.2基盤
+
+- 質問 / 変更 / 委譲 / 確認・適用の目的別入口と、安全重視 / バランス / 自動化重視プリセット
+- チャット・Supervisor・バックグラウンド実行の計画、進捗、変更、検証、エラー、復旧を統合するRun Center
+- バージョン付き容量制限保存、管理対象添付の保持、適応型バックグラウンド復旧、機密情報除外済み診断
+- Webview資産とmessage契約の分離、backend capability境界、品質・アクセシビリティゲート
+
+次のプロダクト開発では新しい自律モードを増やす前に、実利用での復旧成功率と初回成功までの時間を検証・改善します。
 
 関連: [README](./README.md)、[Changelog](./CHANGELOG.md)。

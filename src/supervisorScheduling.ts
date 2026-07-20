@@ -43,7 +43,7 @@ export function dependencyReadiness(
   if (hasDependencyCycle(task.id, byId)) {
     failed.push(task.id);
   }
-  for (const dependencyId of [...new Set(task.dependencyIds ?? [])]) {
+  for (const dependencyId of new Set(task.dependencyIds ?? [])) {
     if (dependencyId === task.id) {
       failed.push(dependencyId);
       continue;

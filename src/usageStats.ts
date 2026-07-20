@@ -79,7 +79,7 @@ export function recordUsage(
   at = new Date(),
 ): UsageLedger {
   const next: UsageLedger = {
-    days: { ...(ledger?.days ?? {}) },
+    days: { ...ledger?.days },
   };
   const key = dayKey(at);
   const bucket = next.days[key] ?? {

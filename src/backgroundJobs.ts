@@ -1,19 +1,25 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import type { ModelParameterValue, ModelSelection } from "@cursor/sdk";
 import * as vscode from "vscode";
 import type { BackgroundJob, BackgroundWorkerInput } from "./backgroundJobTypes.js";
 import {
-  hardStopBackgroundWorkerProcess,
-  inspectBackgroundProcess,
-} from "./backgroundProcess.js";
+  FileBackgroundJobRepository,
+  type BackgroundJobRepository,
+} from "./backgroundJobRepository.js";
+import { nextBackgroundJobPollDelay } from "./backgroundJobScheduler.js";
+import {
+  isActiveBackgroundJobStatus,
+  reduceBackgroundJobState,
+  type BackgroundJobStateEvent,
+} from "./backgroundJobState.js";
+import { hardStopBackgroundWorkerProcess, inspectBackgroundProcess } from "./backgroundProcess.js";
 import {
   backgroundWorkerProtocolPaths,
   cancellationInvalidatesCompletedResult,
   decideBackgroundWorkerRecovery,
-  isBackgroundJobDocument,
   isAuthenticatedWorkerCancellation,
   isAuthenticatedWorkerHeartbeat,
   isAuthenticatedWorkerHeartbeatIdentity,
@@ -31,6 +37,7 @@ import {
 import { runConfiguredHooks } from "./hooks.js";
 import { createExcludedPathMatcher } from "./sensitivePaths.js";
 import { minimalShellEnv } from "./shellEnv.js";
+import { managedWorktreesRoot } from "./worktreeLifecycle.js";
 import { pickWorkspaceFolder } from "./workspaceFolder.js";
 
 const API_KEY_SECRET = "cursorSubscription.apiKey";
@@ -38,8 +45,13 @@ const MODEL_KEY = "cursorSubscription.model";
 const MODEL_PARAMS_KEY = "cursorSubscription.modelParams";
 const APPROVAL_MODE_KEY = "cursorSubscription.approvalMode";
 const DEADLINE_ERROR = "The background agent exceeded its execution-time budget.";
-const UNRESPONSIVE_ERROR = "The detached background worker stopped responding before reporting a result.";
-const WORKSPACE_TRUST_ERROR = "The background agent stopped because the workspace is no longer trusted.";
+const UNRESPONSIVE_ERROR =
+  "The detached background worker stopped responding before reporting a result.";
+const WORKSPACE_TRUST_ERROR =
+  "The background agent stopped because the workspace is no longer trusted.";
+const BACKGROUND_WORKTREES_HOME_SEGMENT = ".cursor-background/worktrees";
+const APPLY_RECOVERY_ERROR =
+  "Applying background changes failed after workspace mutation began. Automatic retry is disabled; inspect the workspace and discard the background job when recovery is complete.";
 
 interface LaunchedBackgroundWorker {
   token: string;
@@ -53,6 +65,16 @@ interface BackgroundNode {
   description?: string;
 }
 
+interface BackgroundPollResult {
+  changed: boolean;
+  requiresSupervision: boolean;
+}
+
+interface BackgroundRecoveryResult {
+  changed: boolean;
+  requiresSupervision: boolean;
+}
+
 export type ApplyBackgroundJob = (
   job: BackgroundJob,
   changes: readonly IsolatedChange[],
@@ -62,16 +84,31 @@ export type AuditBackgroundJob = (
   action: "background.cancel" | "background.discard",
 ) => Promise<void>;
 
-export class BackgroundJobsController implements vscode.TreeDataProvider<BackgroundNode>, vscode.Disposable {
+export class BackgroundJobsController
+  implements vscode.TreeDataProvider<BackgroundNode>, vscode.Disposable
+{
   private readonly changed = new vscode.EventEmitter<BackgroundNode | undefined>();
   private readonly jobs = new Map<string, BackgroundJob>();
-  private readonly saveQueues = new Map<string, Promise<void>>();
-  private readonly stopRequestQueues = new Map<string, Promise<BackgroundWorkerCancellation | undefined>>();
+  private readonly stopRequestQueues = new Map<
+    string,
+    Promise<BackgroundWorkerCancellation | undefined>
+  >();
+  private readonly activeJobOperations = new Set<string>();
   private readonly launchedWorkers = new Map<string, LaunchedBackgroundWorker>();
   private readonly recoveryWarnings = new Set<string>();
   private readonly jobsRoot: string;
   private readonly storageRoot: vscode.Uri;
-  private pollTimer: ReturnType<typeof setInterval> | undefined;
+  private readonly repository: BackgroundJobRepository;
+  private readonly windowStateSubscription: vscode.Disposable;
+  private pollTimer: ReturnType<typeof setTimeout> | undefined;
+  private pollInFlight = false;
+  private pollAgain = false;
+  private forceNextPoll = false;
+  private unchangedPolls = 0;
+  private requiresSupervision = false;
+  private windowActive: boolean;
+  private initialized = false;
+  private disposed = false;
   public readonly onDidChangeTreeData = this.changed.event;
 
   public constructor(
@@ -83,59 +120,83 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
   ) {
     this.storageRoot = context.storageUri ?? context.globalStorageUri;
     this.jobsRoot = path.join(this.storageRoot.fsPath, "background-jobs");
-    void this.initialize().catch((error) => {
-      this.output.appendLine(`[${new Date().toISOString()}] Could not initialize background jobs: ${String(error)}`);
+    this.repository = new FileBackgroundJobRepository(this.jobsRoot, {
+      storageRoot: this.storageRoot.fsPath,
+      worktreesRoot: managedWorktreesRoot(BACKGROUND_WORKTREES_HOME_SEGMENT),
     });
-    this.pollTimer = setInterval(() => {
-      void this.poll().catch((error) => {
-        this.output.appendLine(`[${new Date().toISOString()}] Could not poll background jobs: ${String(error)}`);
+    this.windowActive = vscode.window.state.active;
+    this.windowStateSubscription = vscode.window.onDidChangeWindowState((state) => {
+      this.windowActive = state.active;
+      this.unchangedPolls = 0;
+      this.requestPoll(false);
+    });
+    void this.initialize()
+      .catch((error) => {
+        this.output.appendLine(
+          `[${new Date().toISOString()}] Could not initialize background jobs: ${String(error)}`,
+        );
+      })
+      .finally(() => {
+        this.initialized = true;
+        this.schedulePoll(this.forceNextPoll ? 0 : undefined);
       });
-    }, 2_000);
-    this.pollTimer.unref?.();
   }
 
   public dispose(): void {
+    this.disposed = true;
     if (this.pollTimer) {
-      clearInterval(this.pollTimer);
+      clearTimeout(this.pollTimer);
     }
     // Detached workers intentionally outlive the extension host unless
     // cancelAllRunning is invoked (e.g. API key revocation).
+    this.windowStateSubscription.dispose();
     this.changed.dispose();
   }
 
   public async cancelAllRunning(): Promise<void> {
     const running = [...this.jobs.values()].filter((job) =>
-      ["starting", "running"].includes(job.status)
+      ["starting", "running"].includes(job.status),
     );
     await Promise.all(running.map((job) => this.cancel(job.id)));
   }
 
   public refresh(): void {
-    void this.poll(true).catch((error) => {
-      this.output.appendLine(`[${new Date().toISOString()}] Could not refresh background jobs: ${String(error)}`);
-    });
+    this.unchangedPolls = 0;
+    this.requestPoll(true);
+  }
+
+  public snapshots(): readonly BackgroundJob[] {
+    return [...this.jobs.values()]
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+      .map((job) => structuredClone(job));
   }
 
   public async create(): Promise<void> {
     if (!vscode.workspace.isTrusted) {
-      void vscode.window.showWarningMessage(this.text(
-        "Background agents require a trusted workspace.",
-        "バックグラウンドAgentには信頼済みワークスペースが必要です。",
-      ));
+      void vscode.window.showWarningMessage(
+        this.text(
+          "Background agents require a trusted workspace.",
+          "バックグラウンドAgentには信頼済みワークスペースが必要です。",
+        ),
+      );
       return;
     }
     const apiKey = await this.context.secrets.get(API_KEY_SECRET);
     if (!apiKey) {
-      void vscode.window.showWarningMessage(this.text(
-        "Set the Cursor API key before starting a background agent.",
-        "バックグラウンドAgentの開始前にCursor APIキーを設定してください。",
-      ));
+      void vscode.window.showWarningMessage(
+        this.text(
+          "Set the Cursor API key before starting a background agent.",
+          "バックグラウンドAgentの開始前にCursor APIキーを設定してください。",
+        ),
+      );
       return;
     }
-    const workspace = await pickWorkspaceFolder(this.text(
-      "Select a workspace for the background agent",
-      "バックグラウンドAgentのワークスペースを選択",
-    ));
+    const workspace = await pickWorkspaceFolder(
+      this.text(
+        "Select a workspace for the background agent",
+        "バックグラウンドAgentのワークスペースを選択",
+      ),
+    );
     if (!workspace) {
       return;
     }
@@ -150,14 +211,19 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
     if (!prompt?.trim()) {
       return;
     }
-    const running = [...this.jobs.values()].filter((job) => ["starting", "running"].includes(job.status));
-    const maximum = vscode.workspace.getConfiguration("cursorSubscription", workspace.uri)
+    const running = [...this.jobs.values()].filter((job) =>
+      ["starting", "running"].includes(job.status),
+    );
+    const maximum = vscode.workspace
+      .getConfiguration("cursorSubscription", workspace.uri)
       .get<number>("maxBackgroundJobs", 2);
     if (running.length >= maximum) {
-      void vscode.window.showWarningMessage(this.text(
-        `The limit of ${maximum} running background job(s) has been reached.`,
-        `実行中バックグラウンドジョブの上限 ${maximum} 件に達しています。`,
-      ));
+      void vscode.window.showWarningMessage(
+        this.text(
+          `The limit of ${maximum} running background job(s) has been reached.`,
+          `実行中バックグラウンドジョブの上限 ${maximum} 件に達しています。`,
+        ),
+      );
       return;
     }
 
@@ -171,7 +237,7 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
       id,
       root: workspace.uri.fsPath,
       storageRoot: this.storageRoot,
-      worktreesHomeSegment: ".cursor-background/worktrees",
+      worktreesHomeSegment: BACKGROUND_WORKTREES_HOME_SEGMENT,
       baselinesFolder: "background-baselines",
       pathEscapeLabel: "background agent",
       isExcluded: createExcludedPathMatcher(workspace.uri),
@@ -185,7 +251,8 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
     });
     const jobFile = path.join(this.jobsRoot, `${id}.json`);
     const now = Date.now();
-    const maxMinutes = vscode.workspace.getConfiguration("cursorSubscription", workspace.uri)
+    const maxMinutes = vscode.workspace
+      .getConfiguration("cursorSubscription", workspace.uri)
       .get<number>("backgroundMaxRunMinutes", 240);
     const job: BackgroundJob = {
       id,
@@ -216,13 +283,17 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
         workspaceTrustedAtLaunch,
       });
       this.changed.fire(undefined);
-      void vscode.window.showInformationMessage(this.text(
-        "Background agent started. It will keep running if this VS Code window closes.",
-        "バックグラウンドAgentを開始しました。VS Codeを閉じても実行を継続します。",
-      ));
+      void vscode.window.showInformationMessage(
+        this.text(
+          "Background agent started. It will keep running if this VS Code window closes.",
+          "バックグラウンドAgentを開始しました。VS Codeを閉じても実行を継続します。",
+        ),
+      );
     } catch (error) {
-      job.status = "error";
-      job.error = error instanceof Error ? error.message : String(error);
+      this.applyStateTransition(job, {
+        type: "launch-failed",
+        error: error instanceof Error ? error.message : String(error),
+      });
       await this.save(job);
       throw error;
     }
@@ -230,121 +301,198 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
 
   public async apply(target?: BackgroundNode | string): Promise<void> {
     if (!vscode.workspace.isTrusted) {
-      void vscode.window.showWarningMessage(this.text(
-        "Applying background-agent changes requires a trusted workspace.",
-        "バックグラウンドAgentの変更を適用するには、信頼済みワークスペースが必要です。",
-      ));
+      void vscode.window.showWarningMessage(
+        this.text(
+          "Applying background-agent changes requires a trusted workspace.",
+          "バックグラウンドAgentの変更を適用するには、信頼済みワークスペースが必要です。",
+        ),
+      );
       return;
     }
-    const job = this.resolve(target);
+    let job = this.resolve(target);
     if (!job || job.status !== "completed") {
       return;
     }
-    await this.recoverWorker(job);
-    if (job.status !== "completed") {
-      this.changed.fire(undefined);
+    if (!this.beginJobOperation(job.id)) {
       return;
     }
-    if (!await this.isWorkerExitConfirmed(job)) {
-      void vscode.window.showWarningMessage(this.text(
-        "The background worker is still finishing, so its changes cannot be applied yet. Try again after it exits.",
-        "バックグラウンドワーカーは終了処理中のため、変更をまだ適用できません。終了後に再試行してください。",
-      ));
-      return;
-    }
-    let cancellationRequested = false;
-    if (job.workerToken) {
-      try {
-        const cancellation = JSON.parse(
-          await readFile(backgroundWorkerProtocolPaths(job.jobFile).cancellation, "utf8"),
-        ) as BackgroundWorkerCancellation;
-        cancellationRequested = cancellationInvalidatesCompletedResult(
-          job.workerToken,
-          cancellation,
-        );
-      } catch {
-        // No authenticated cancellation request exists, so the completed result is applyable.
-      }
-    }
-    if (cancellationRequested) {
-      job.status = "cancelled";
-      await this.save(job);
-      this.changed.fire(undefined);
-      return;
-    }
-    job.status = "applying";
-    await this.save(job);
-    this.changed.fire(undefined);
     try {
-      const isExcluded = createExcludedPathMatcher(vscode.Uri.file(job.workspaceRoot));
-      const changes = await collectIsolatedChanges(job.session, this.storageRoot, {
-        pathEscapeLabel: "background agent",
-        isExcluded,
-        missingBaselineMessage: (relative) => `Background baseline is unavailable for ${relative}.`,
-      });
-      const applyable = changes.filter((change) => !change.excluded);
-      if (applyable.length === 0) {
-        throw new Error(this.text(
-          "No non-excluded changes were available to apply.",
-          "適用可能な（除外されていない）変更がありません。",
-        ));
+      job = await this.repository.read(job.jobFile);
+      this.jobs.set(job.id, job);
+      if (job.status !== "completed") {
+        return;
       }
-      await this.applyJob(job, applyable);
-      job.status = "applied";
-      await cleanupIsolatedWorktree(job.session, this.storageRoot, (message) => this.output.appendLine(message));
-      await this.cleanupWorkerProtocol(job);
+      await this.recoverWorker(job);
+      if (job.status !== "completed") {
+        this.changed.fire(undefined);
+        return;
+      }
+      if (!(await this.isWorkerExitConfirmed(job))) {
+        void vscode.window.showWarningMessage(
+          this.text(
+            "The background worker is still finishing, so its changes cannot be applied yet. Try again after it exits.",
+            "バックグラウンドワーカーは終了処理中のため、変更をまだ適用できません。終了後に再試行してください。",
+          ),
+        );
+        return;
+      }
+      await this.repository.validateOperationalBoundaries(job);
+      let cancellationRequested = false;
+      if (job.workerToken) {
+        try {
+          const cancellation = JSON.parse(
+            await readFile(backgroundWorkerProtocolPaths(job.jobFile).cancellation, "utf8"),
+          ) as BackgroundWorkerCancellation;
+          cancellationRequested = cancellationInvalidatesCompletedResult(
+            job.workerToken,
+            cancellation,
+          );
+        } catch {
+          // No authenticated cancellation request exists, so the completed result is applyable.
+        }
+      }
+      if (cancellationRequested) {
+        this.applyStateTransition(job, { type: "cancel", reason: "user" });
+        await this.save(job);
+        this.changed.fire(undefined);
+        return;
+      }
+      if (!this.applyStateTransition(job, { type: "begin-apply" })) {
+        return;
+      }
       await this.save(job);
-    } catch (error) {
-      job.status = "completed";
-      job.error = error instanceof Error ? error.message : String(error);
-      await this.save(job);
-      void vscode.window.showErrorMessage(job.error);
+      this.changed.fire(undefined);
+      let applyStarted = false;
+      let changesApplied = false;
+      try {
+        const isExcluded = createExcludedPathMatcher(vscode.Uri.file(job.workspaceRoot));
+        const changes = await collectIsolatedChanges(job.session, this.storageRoot, {
+          pathEscapeLabel: "background agent",
+          isExcluded,
+          missingBaselineMessage: (relative) =>
+            `Background baseline is unavailable for ${relative}.`,
+        });
+        const applyable = changes.filter((change) => !change.excluded);
+        if (applyable.length === 0) {
+          throw new Error(
+            this.text(
+              "No non-excluded changes were available to apply.",
+              "適用可能な（除外されていない）変更がありません。",
+            ),
+          );
+        }
+        // The callback spans workspace mutations and post-apply bookkeeping.
+        // A rejected promise cannot prove that its best-effort rollback completed.
+        applyStarted = true;
+        await this.applyJob(job, applyable);
+        changesApplied = true;
+        this.applyStateTransition(job, { type: "apply-succeeded" });
+        await this.save(job);
+        await cleanupIsolatedWorktree(job.session, this.storageRoot, (message) =>
+          this.output.appendLine(message),
+        );
+        await this.cleanupWorkerProtocol(job);
+      } catch (error) {
+        const originalError = error instanceof Error ? error.message : String(error);
+        const errorMessage =
+          applyStarted && !changesApplied
+            ? `${APPLY_RECOVERY_ERROR}\n\n${originalError}`
+            : originalError;
+        this.applyStateTransition(job, {
+          type: changesApplied
+            ? "applied-cleanup-failed"
+            : applyStarted
+              ? "apply-uncertain"
+              : "apply-failed",
+          error: errorMessage,
+        });
+        await this.save(job);
+        void vscode.window.showErrorMessage(errorMessage);
+      }
+      this.changed.fire(undefined);
+    } finally {
+      this.finishJobOperation(job.id);
     }
-    this.changed.fire(undefined);
   }
 
   public async cancel(target?: BackgroundNode | string): Promise<void> {
-    const job = this.resolve(target);
+    let job = this.resolve(target);
     if (!job || !["starting", "running"].includes(job.status)) {
       return;
     }
-    await this.requestWorkerStop(job, "user");
-    job.status = "cancelled";
-    await this.save(job);
-    await this.auditJob(job, "background.cancel");
-    this.changed.fire(undefined);
+    if (!this.beginJobOperation(job.id)) {
+      return;
+    }
+    try {
+      job = await this.repository.read(job.jobFile);
+      this.jobs.set(job.id, job);
+      if (!isActiveBackgroundJobStatus(job.status)) {
+        return;
+      }
+      await this.requestWorkerStop(job, "user");
+      this.applyStateTransition(job, { type: "cancel", reason: "user" });
+      await this.save(job);
+      await this.auditJob(job, "background.cancel");
+      this.changed.fire(undefined);
+    } finally {
+      this.finishJobOperation(job.id);
+    }
   }
 
   public async discard(target?: BackgroundNode | string): Promise<void> {
-    const job = this.resolve(target);
+    let job = this.resolve(target);
     if (!job || ["starting", "running", "applying", "applied", "discarded"].includes(job.status)) {
       return;
     }
-    await this.recoverWorker(job);
-    if (!await this.isWorkerExitConfirmed(job)) {
-      void vscode.window.showWarningMessage(this.text(
-        "The background worker is still stopping, so its worktree cannot be discarded yet. Try again after it exits.",
-        "バックグラウンドワーカーは停止処理中のため、worktreeをまだ破棄できません。終了後に再試行してください。",
-      ));
+    if (!this.beginJobOperation(job.id)) {
       return;
     }
-    await cleanupIsolatedWorktree(job.session, this.storageRoot, (message) => this.output.appendLine(message));
-    await this.cleanupWorkerProtocol(job);
-    job.status = "discarded";
-    await this.save(job);
-    await this.auditJob(job, "background.discard");
-    this.changed.fire(undefined);
+    try {
+      job = await this.repository.read(job.jobFile);
+      this.jobs.set(job.id, job);
+      if (["starting", "running", "applying", "applied", "discarded"].includes(job.status)) {
+        return;
+      }
+      await this.recoverWorker(job);
+      if (["starting", "running", "applying", "applied", "discarded"].includes(job.status)) {
+        return;
+      }
+      if (!(await this.isWorkerExitConfirmed(job))) {
+        void vscode.window.showWarningMessage(
+          this.text(
+            "The background worker is still stopping, so its worktree cannot be discarded yet. Try again after it exits.",
+            "バックグラウンドワーカーは停止処理中のため、worktreeをまだ破棄できません。終了後に再試行してください。",
+          ),
+        );
+        return;
+      }
+      await this.repository.validateOperationalBoundaries(job);
+      await cleanupIsolatedWorktree(job.session, this.storageRoot, (message) =>
+        this.output.appendLine(message),
+      );
+      await this.cleanupWorkerProtocol(job);
+      this.applyStateTransition(job, { type: "discard" });
+      await this.save(job);
+      await this.auditJob(job, "background.discard");
+      this.changed.fire(undefined);
+    } finally {
+      this.finishJobOperation(job.id);
+    }
   }
 
   public getTreeItem(node: BackgroundNode): vscode.TreeItem {
     const item = new vscode.TreeItem(
       node.label,
-      node.kind === "job" ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None,
+      node.kind === "job"
+        ? vscode.TreeItemCollapsibleState.Collapsed
+        : vscode.TreeItemCollapsibleState.None,
     );
     item.description = node.description;
     item.contextValue = `cursorBackground.${node.kind}.${node.job.status}`;
     item.iconPath = new vscode.ThemeIcon(this.icon(node.job.status));
-    item.tooltip = [node.job.prompt, node.job.error, node.job.assistantText].filter(Boolean).join("\n\n");
+    item.tooltip = [node.job.prompt, node.job.error, node.job.assistantText]
+      .filter(Boolean)
+      .join("\n\n");
     return item;
   }
 
@@ -362,24 +510,28 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
     if (node.kind !== "job") {
       return [];
     }
-    return [{
-      kind: "summary",
-      job: node.job,
-      label: node.job.error || node.job.assistantText?.split(/\r?\n/u)[0].slice(0, 180)
-        || this.text("Waiting for the agent…", "Agentの完了を待機中…"),
-      description: node.job.workspaceRoot,
-    }];
+    return [
+      {
+        kind: "summary",
+        job: node.job,
+        label:
+          node.job.error ||
+          node.job.assistantText?.split(/\r?\n/u)[0].slice(0, 180) ||
+          this.text("Waiting for the agent…", "Agentの完了を待機中…"),
+        description: node.job.workspaceRoot,
+      },
+    ];
   }
 
   private async initialize(): Promise<void> {
-    await mkdir(this.jobsRoot, { recursive: true });
-    const files = await readdir(this.jobsRoot).catch(() => []);
-    for (const file of files.filter(isBackgroundJobDocument)) {
-      try {
-        const job = JSON.parse(await readFile(path.join(this.jobsRoot, file), "utf8")) as BackgroundJob;
-        this.jobs.set(job.id, job);
-      } catch (error) {
-        this.output.appendLine(`[${new Date().toISOString()}] Could not restore background job ${file}: ${String(error)}`);
+    await this.repository.initialize();
+    for (const loaded of await this.repository.list()) {
+      if (loaded.ok) {
+        this.jobs.set(loaded.job.id, loaded.job);
+      } else {
+        this.output.appendLine(
+          `[${new Date().toISOString()}] Could not restore background job ${path.basename(loaded.jobFile)}: ${String(loaded.error)}`,
+        );
       }
     }
     if (!vscode.workspace.isTrusted) {
@@ -393,35 +545,115 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
         }
       }
     }
-    await this.poll(true);
+    const result = await this.poll(true);
+    this.requiresSupervision = result.requiresSupervision;
   }
 
-  private async poll(forceRefresh = false): Promise<void> {
+  private async poll(forceRefresh = false): Promise<BackgroundPollResult> {
     let changed = forceRefresh;
+    let requiresSupervision = false;
     for (const [id, known] of this.jobs) {
       try {
-        const current = JSON.parse(await readFile(known.jobFile, "utf8")) as BackgroundJob;
+        const current = await this.repository.read(known.jobFile);
         const recovered = await this.recoverWorker(current);
+        requiresSupervision ||= recovered.requiresSupervision;
         if (current.updatedAt !== known.updatedAt || current.status !== known.status) {
           this.jobs.set(id, current);
           changed = true;
           if (["completed", "error", "cancelled"].includes(current.status) && !current.notified) {
             current.notified = true;
             await this.save(current);
-            void vscode.window.showInformationMessage(this.text(
-              `Background job “${current.title}” is ${current.status}.`,
-              `バックグラウンドジョブ「${current.title}」は${this.statusLabel(current.status)}です。`,
-            ));
+            void vscode.window.showInformationMessage(
+              this.text(
+                `Background job “${current.title}” is ${current.status}.`,
+                `バックグラウンドジョブ「${current.title}」は${this.statusLabel(current.status)}です。`,
+              ),
+            );
           }
         }
-        changed ||= recovered;
+        changed ||= recovered.changed;
       } catch {
         // A worker replaces the JSON file atomically; retry on the next poll.
+        requiresSupervision ||=
+          isActiveBackgroundJobStatus(known.status) ||
+          this.launchedWorkers.has(id) ||
+          this.stopRequestQueues.has(id);
       }
     }
     if (changed) {
       this.changed.fire(undefined);
     }
+    return { changed, requiresSupervision };
+  }
+
+  private requestPoll(forceRefresh: boolean): void {
+    this.forceNextPoll ||= forceRefresh;
+    if (!this.initialized || this.disposed) {
+      return;
+    }
+    if (this.pollInFlight) {
+      this.pollAgain = true;
+      return;
+    }
+    this.schedulePoll(0);
+  }
+
+  private schedulePoll(delay?: number): void {
+    if (this.disposed || !this.initialized) {
+      return;
+    }
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+    }
+    const wait =
+      delay ??
+      nextBackgroundJobPollDelay({
+        requiresSupervision: this.requiresSupervision,
+        windowActive: this.windowActive,
+        unchangedPolls: this.unchangedPolls,
+      });
+    this.pollTimer = setTimeout(() => {
+      this.pollTimer = undefined;
+      void this.runPollCycle();
+    }, wait);
+    this.pollTimer.unref?.();
+  }
+
+  private async runPollCycle(): Promise<void> {
+    if (this.disposed || this.pollInFlight) {
+      this.pollAgain ||= !this.disposed;
+      return;
+    }
+    this.pollInFlight = true;
+    const forceRefresh = this.forceNextPoll;
+    this.forceNextPoll = false;
+    let result: BackgroundPollResult | undefined;
+    try {
+      result = await this.poll(forceRefresh);
+    } catch (error) {
+      this.output.appendLine(
+        `[${new Date().toISOString()}] Could not poll background jobs: ${String(error)}`,
+      );
+    } finally {
+      this.pollInFlight = false;
+    }
+    if (this.disposed) {
+      return;
+    }
+    if (result) {
+      this.requiresSupervision = result.requiresSupervision;
+      this.unchangedPolls = result.changed ? 0 : this.unchangedPolls + 1;
+    } else {
+      // Repository-level failures back off instead of spinning, while active
+      // work keeps the tighter supervision ceiling.
+      this.unchangedPolls += 1;
+    }
+    if (this.pollAgain) {
+      this.pollAgain = false;
+      this.schedulePoll(0);
+      return;
+    }
+    this.schedulePoll();
   }
 
   private launch(job: BackgroundJob, input: BackgroundWorkerInput): void {
@@ -446,9 +678,10 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
     child.once("exit", forgetChild);
     child.once("error", (error) => {
       forgetChild();
-      this.output.appendLine(`[${new Date().toISOString()}] Background worker failed: ${error.message}`);
-      job.status = "error";
-      job.error = error.message;
+      this.output.appendLine(
+        `[${new Date().toISOString()}] Background worker failed: ${error.message}`,
+      );
+      this.applyStateTransition(job, { type: "launch-failed", error: error.message });
       job.workerToken = undefined;
       void this.save(job).then(() => this.changed.fire(undefined));
     });
@@ -483,29 +716,31 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
     reason: BackgroundWorkerCancellationReason,
   ): Promise<BackgroundWorkerCancellation | undefined> {
     const previous = this.stopRequestQueues.get(job.id) ?? Promise.resolve(undefined);
-    const operation = previous.catch(() => undefined).then(async () => {
-      if (!job.workerToken) {
-        return undefined;
-      }
-      const existing = await this.readAuthenticatedCancellation(job);
-      if (existing) {
-        return existing;
-      }
-      const cancellation: BackgroundWorkerCancellation = {
-        token: job.workerToken,
-        requestedAt: Date.now(),
-        reason,
-      };
-      const target = backgroundWorkerProtocolPaths(job.jobFile).cancellation;
-      const temporary = `${target}.host.${process.pid}.${randomUUID()}.tmp`;
-      await writeFile(temporary, JSON.stringify(cancellation), "utf8");
-      try {
-        await rename(temporary, target);
-      } finally {
-        await unlink(temporary).catch(() => undefined);
-      }
-      return cancellation;
-    });
+    const operation = previous
+      .catch(() => undefined)
+      .then(async () => {
+        if (!job.workerToken) {
+          return undefined;
+        }
+        const existing = await this.readAuthenticatedCancellation(job);
+        if (existing) {
+          return existing;
+        }
+        const cancellation: BackgroundWorkerCancellation = {
+          token: job.workerToken,
+          requestedAt: Date.now(),
+          reason,
+        };
+        const target = backgroundWorkerProtocolPaths(job.jobFile).cancellation;
+        const temporary = `${target}.host.${process.pid}.${randomUUID()}.tmp`;
+        await writeFile(temporary, JSON.stringify(cancellation), "utf8");
+        try {
+          await rename(temporary, target);
+        } finally {
+          await unlink(temporary).catch(() => undefined);
+        }
+        return cancellation;
+      });
     this.stopRequestQueues.set(job.id, operation);
     try {
       return await operation;
@@ -525,55 +760,49 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
     if (!active && (job.status !== "completed" || reason === "orphan")) {
       return false;
     }
-    if (reason === "deadline") {
-      job.status = "error";
-      job.error = DEADLINE_ERROR;
-    } else if (reason === "unresponsive") {
-      job.status = "error";
-      job.error = UNRESPONSIVE_ERROR;
-    } else {
-      job.status = "cancelled";
-      job.error = undefined;
+    // The worker owns orphan terminal state until its exit is proven. Saving a
+    // stale active snapshot here could overwrite a concurrently completed job.
+    if (reason === "orphan") {
+      return false;
+    }
+    if (!this.applyStateTransition(job, { type: "cancel", reason })) {
+      return false;
     }
     await this.save(job);
     return true;
   }
 
-  private async recoverWorker(job: BackgroundJob): Promise<boolean> {
+  private async recoverWorker(job: BackgroundJob): Promise<BackgroundRecoveryResult> {
     const launched = this.launchedWorkers.get(job.id);
-    const authenticatedLaunch = launched && launched.token === job.workerToken
-      ? launched
-      : undefined;
+    const authenticatedLaunch =
+      launched && launched.token === job.workerToken ? launched : undefined;
     const launchedPid = authenticatedLaunch?.child.pid;
     if (!job.pid && launchedPid && Number.isSafeInteger(launchedPid) && launchedPid > 0) {
       // The retained ChildProcess handle is authoritative until the worker has
       // persisted its own identity. It is only adopted for this recovery pass.
       job.pid = launchedPid;
     }
-    let managedChild = authenticatedLaunch && authenticatedLaunch.child.pid === job.pid
-      ? authenticatedLaunch.child
-      : undefined;
-    const heartbeat = await this.readAuthenticatedHeartbeat(job);
-    if (
-      !job.pid
-      && heartbeat
-      && job.workerProcessStartId
-      && heartbeat.processStartId === job.workerProcessStartId
-      && isAuthenticatedWorkerInstance(
-        job.workerToken,
-        undefined,
-        job.workerStartedAt,
-        heartbeat,
-      )
-    ) {
-      job.pid = heartbeat.pid;
-      managedChild = authenticatedLaunch && authenticatedLaunch.child.pid === job.pid
+    let managedChild =
+      authenticatedLaunch && authenticatedLaunch.child.pid === job.pid
         ? authenticatedLaunch.child
         : undefined;
+    const heartbeat = await this.readAuthenticatedHeartbeat(job);
+    if (
+      !job.pid &&
+      heartbeat &&
+      job.workerProcessStartId &&
+      heartbeat.processStartId === job.workerProcessStartId &&
+      isAuthenticatedWorkerInstance(job.workerToken, undefined, job.workerStartedAt, heartbeat)
+    ) {
+      job.pid = heartbeat.pid;
+      managedChild =
+        authenticatedLaunch && authenticatedLaunch.child.pid === job.pid
+          ? authenticatedLaunch.child
+          : undefined;
     }
     let cancellation = await this.readAuthenticatedCancellation(job);
     const now = Date.now();
-    const active = ["starting", "running"].includes(job.status);
+    const active = isActiveBackgroundJobStatus(job.status);
     if (active && !vscode.workspace.isTrusted && !cancellation) {
       cancellation = await this.requestWorkerStop(job, "orphan");
     }
@@ -592,22 +821,28 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
     });
 
     if (decision.action === "none") {
-      return false;
+      return {
+        changed: false,
+        requiresSupervision: active || Boolean(heartbeat || managedChild),
+      };
     }
     if (decision.action === "request-stop") {
       cancellation = await this.requestWorkerStop(job, decision.reason);
       if (!cancellation) {
-        return false;
+        return { changed: false, requiresSupervision: true };
       }
       const statusChanged = await this.synchronizeCancellationStatus(job, cancellation);
-      return statusChanged || decision.reason === "orphan";
+      return {
+        changed: statusChanged || decision.reason === "orphan",
+        requiresSupervision: true,
+      };
     }
 
     let changed = cancellation
       ? await this.synchronizeCancellationStatus(job, cancellation)
       : false;
     if (decision.action === "await-grace") {
-      return changed;
+      return { changed, requiresSupervision: true };
     }
     if (!job.workerToken || !job.pid) {
       this.logRecoveryOnce(
@@ -615,25 +850,44 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
         "missing-identity",
         "Refused to hard-stop a background worker because its authenticated PID was unavailable.",
       );
-      return changed;
+      return { changed, requiresSupervision: true };
     }
 
-    const result = await hardStopBackgroundWorkerProcess({
-      pid: job.pid,
-      token: job.workerToken,
-      startedAt: job.workerStartedAt,
-      processStartId: job.workerProcessStartId,
-      workerFile: this.workerFile(),
-      jobFile: job.jobFile,
-      executableFile: process.execPath,
-    }, heartbeat, { managedChild });
+    const result = await hardStopBackgroundWorkerProcess(
+      {
+        pid: job.pid,
+        token: job.workerToken,
+        startedAt: job.workerStartedAt,
+        processStartId: job.workerProcessStartId,
+        workerFile: this.workerFile(),
+        jobFile: job.jobFile,
+        executableFile: process.execPath,
+      },
+      heartbeat,
+      { managedChild },
+    );
     if (result === "already-exited") {
       if (this.launchedWorkers.get(job.id)?.child === managedChild) {
         this.launchedWorkers.delete(job.id);
       }
+      if (cancellation?.reason === "orphan") {
+        const latest = await this.repository.read(job.jobFile);
+        Object.assign(job, latest);
+        if (
+          latest.workerToken === cancellation.token &&
+          isActiveBackgroundJobStatus(latest.status)
+        ) {
+          this.applyStateTransition(job, {
+            type: "cancel",
+            reason: "orphan",
+            workerExitConfirmed: true,
+          });
+          await this.save(job);
+        }
+      }
       await this.cleanupWorkerProtocol(job);
       this.recoveryWarnings.delete(`${job.id}:signalled`);
-      return true;
+      return { changed: true, requiresSupervision: false };
     }
     if (result === "signalled") {
       this.logRecoveryOnce(
@@ -641,15 +895,16 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
         "signalled",
         `Hard-stopped background worker ${job.pid} after its cancellation grace period.`,
       );
-      return true;
+      return { changed: true, requiresSupervision: true };
     }
-    const message = result === "identity-mismatch"
-      ? "Refused to hard-stop a background worker because its live process identity did not match the authenticated job."
-      : result === "inspection-unavailable"
-        ? "Could not safely inspect a restored background worker; it was left untouched."
-        : "Could not hard-stop the authenticated background worker after its cancellation grace period.";
+    const message =
+      result === "identity-mismatch"
+        ? "Refused to hard-stop a background worker because its live process identity did not match the authenticated job."
+        : result === "inspection-unavailable"
+          ? "Could not safely inspect a restored background worker; it was left untouched."
+          : "Could not hard-stop the authenticated background worker after its cancellation grace period.";
     this.logRecoveryOnce(job, result, message);
-    return changed;
+    return { changed, requiresSupervision: true };
   }
 
   /** Never delete a worktree or stop sidecars until worker exit is proven. */
@@ -674,8 +929,7 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
       return false;
     }
     return Boolean(
-      job.workerProcessStartId
-      && inspection.identity.startId !== job.workerProcessStartId
+      job.workerProcessStartId && inspection.identity.startId !== job.workerProcessStartId,
     );
   }
 
@@ -688,7 +942,9 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
     this.output.appendLine(`[${new Date().toISOString()}] ${message}`);
   }
 
-  private async readAuthenticatedHeartbeat(job: BackgroundJob): Promise<BackgroundWorkerHeartbeat | undefined> {
+  private async readAuthenticatedHeartbeat(
+    job: BackgroundJob,
+  ): Promise<BackgroundWorkerHeartbeat | undefined> {
     try {
       const raw = await readFile(backgroundWorkerProtocolPaths(job.jobFile).heartbeat, "utf8");
       const heartbeat = JSON.parse(raw) as BackgroundWorkerHeartbeat;
@@ -709,30 +965,47 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
   }
 
   private async save(job: BackgroundJob): Promise<void> {
-    const previous = this.saveQueues.get(job.id) ?? Promise.resolve();
-    const operation = previous.then(async () => {
-      job.updatedAt = Date.now();
-      const temporary = `${job.jobFile}.host.tmp`;
-      await writeFile(temporary, JSON.stringify(job, undefined, 2), "utf8");
-      await rename(temporary, job.jobFile);
-      this.jobs.set(job.id, job);
-    });
-    const queued = operation.catch(() => {});
-    this.saveQueues.set(job.id, queued);
-    try {
-      await operation;
-    } finally {
-      if (this.saveQueues.get(job.id) === queued) {
-        this.saveQueues.delete(job.id);
-      }
+    await this.repository.save(job);
+    this.jobs.set(job.id, job);
+    this.unchangedPolls = 0;
+    if (isActiveBackgroundJobStatus(job.status) || this.launchedWorkers.has(job.id)) {
+      this.requiresSupervision = true;
     }
+    this.requestPoll(false);
+  }
+
+  private applyStateTransition(job: BackgroundJob, event: BackgroundJobStateEvent): boolean {
+    const update = reduceBackgroundJobState(job, event, {
+      deadline: DEADLINE_ERROR,
+      unresponsive: UNRESPONSIVE_ERROR,
+    });
+    if (!update) {
+      return false;
+    }
+    job.status = update.status;
+    job.error = update.error;
+    return true;
   }
 
   private selectedModel(): ModelSelection {
     const id = this.context.globalState.get<string>(MODEL_KEY, "auto");
-    const params = this.context.globalState
-      .get<Record<string, ModelParameterValue[]>>(MODEL_PARAMS_KEY, {})[id];
+    const params = this.context.globalState.get<Record<string, ModelParameterValue[]>>(
+      MODEL_PARAMS_KEY,
+      {},
+    )[id];
     return { id, params: params?.length ? params : undefined };
+  }
+
+  private beginJobOperation(jobId: string): boolean {
+    if (this.activeJobOperations.has(jobId)) {
+      return false;
+    }
+    this.activeJobOperations.add(jobId);
+    return true;
+  }
+
+  private finishJobOperation(jobId: string): void {
+    this.activeJobOperations.delete(jobId);
   }
 
   private resolve(target?: BackgroundNode | string): BackgroundJob | undefined {
@@ -745,9 +1018,14 @@ export class BackgroundJobsController implements vscode.TreeDataProvider<Backgro
 
   private statusLabel(status: BackgroundJob["status"]): string {
     const labels: Record<BackgroundJob["status"], [string, string]> = {
-      starting: ["starting", "開始中"], running: ["running", "実行中"], completed: ["ready to apply", "適用待ち"],
-      applying: ["applying", "適用中"], applied: ["applied", "適用済み"], cancelled: ["cancelled", "中止済み"],
-      discarded: ["discarded", "破棄済み"], error: ["failed", "失敗"],
+      starting: ["starting", "開始中"],
+      running: ["running", "実行中"],
+      completed: ["ready to apply", "適用待ち"],
+      applying: ["applying", "適用中"],
+      applied: ["applied", "適用済み"],
+      cancelled: ["cancelled", "中止済み"],
+      discarded: ["discarded", "破棄済み"],
+      error: ["failed", "失敗"],
     };
     return labels[status][this.japanese ? 1 : 0];
   }

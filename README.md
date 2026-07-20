@@ -60,13 +60,17 @@ Change sessions distinguish your pre-existing uncommitted work from AI edits, so
 - Detached background agents that continue after VS Code closes and return isolated changes for review
 - Interactive audit timeline with optional team-shared JSONL logging and **Cursor: Export AI Audit Log**
 - Workspace Trust prevents loading project Rules / Skills / MCP and limits autonomous Supervisor, auto-repair, keep-all review, and background agents
+- Goal-first entry point: **Ask / Change / Delegate / Review and apply**, plus Safe / Balanced / Automation execution presets
+- **Run Center** for the current chat, Supervisor, or background run: plan, progress, changes, verification, errors, and recovery actions in one tree
+- Redacted diagnostic export with workspace trust, Git / `gh`, proxy, run IDs, recent failures, and audit context
+- Versioned, bounded conversation storage and managed attachment retention / orphan cleanup
 
 ## Sidebar views
 
 Activity Bar **Cursor** container:
 
 - **Agent** — chat, models, profiles, usage, and parallel agents
-- **Workspace** — one tree with groups for Sessions, Inbox, Rules / Skills / MCP, Background, and Audit (Keep/Restore, Supervisor apply/discard, integration toggles, detached workers, and the audit timeline)
+- **Workspace** — one tree with Run Center, Sessions, Inbox, Rules / Skills / MCP, Background, and Audit (live run/recovery state, Keep/Restore, Supervisor apply/discard, integration toggles, detached workers, and the audit timeline)
 
 ## Slash commands
 
@@ -78,6 +82,10 @@ Type `/` in the chat composer:
 - Project and user templates from `.cursor/commands/*.md` and `~/.cursor/commands/*.md`
 
 ## AI-native workflow
+
+Choose **Cursor: Choose What to Do** to enter through four stable goals instead of navigating individual implementation commands: **Ask**, **Change**, **Delegate**, or **Review and apply**. **Cursor: Choose Execution Profile** applies a documented Safe, Balanced, or Automation preset across the existing safety and automation controls. Automation remains trust-gated and requires explicit confirmation.
+
+The Workspace **Run Center** follows the most relevant chat, Supervisor, or background run and keeps its plan, live progress, changed files, verification gates, error details, and recovery actions together. Failed runs offer retry, logs, setup, or redacted diagnostic export where applicable. Shared-audit write failures are visible in the Audit group instead of being output-only.
 
 ### Parallel chat agents
 
@@ -129,7 +137,7 @@ Safe worktree mode requires the workspace to be a Git repository. Plan mode is r
 
 - Prompts and the context you explicitly include—such as selected code, referenced files, images, diagnostics, debug metadata, project memory, Skills, and MCP results—are sent to Cursor through the public Cursor SDK under your account and plan. Agent tools may read additional workspace files when needed for the task.
 - The Cursor API key is stored in VS Code SecretStorage. This extension does not read the Cursor desktop login session and does not add its own telemetry or analytics.
-- Conversation transcripts and aggregate token usage are stored in VS Code workspace state. Copies of external attachments, dirty-file checkpoints, isolated-run baselines, and Supervisor task data are stored in VS Code extension-private storage. Deleting a conversation removes its transcript and managed external-attachment copies; change-session history and checkpoint data are limited to the latest 20 sessions, while Supervisor data remains until its task is dismissed or extension storage is removed.
+- Conversation transcripts and aggregate token usage are stored in VS Code workspace state. Conversation state uses a versioned envelope and is bounded to 100 conversations / approximately 4 MiB by default, pruning the oldest transcript entries first. Copies of external attachments, dirty-file checkpoints, isolated-run baselines, and Supervisor task data are stored in VS Code extension-private storage. Attachments are limited by count and size, dangerous executable/link types are rejected, managed roots are identity-checked, and unreferenced roots are cleaned after the retention period. Deleting a conversation removes its transcript and managed external-attachment copies; change-session history and checkpoint data are limited to the latest 20 sessions, while Supervisor data remains until its task is dismissed or extension storage is removed.
 - Project MCP servers, detached background agents, and configured pre-edit, post-edit, and verification commands run locally with the permissions of the VS Code extension host or spawned process. In an untrusted (Restricted) workspace, project rules, project Skills, and project MCP configuration are not loaded; autonomous Supervisor execution, auto-repair, keep-all review policy, and background agents stay limited until you trust the folder.
 - Uninstalling the extension does not guarantee immediate deletion of VS Code extension storage. Use VS Code's profile/application-data controls when you need to remove all retained local data.
 
@@ -206,13 +214,17 @@ Anysphere / Cursor 非提携の**非公式**拡張機能です。公式 TypeScri
 - VS Code 終了後も継続し、隔離された変更をレビューに戻すバックグラウンド Agent
 - 対話的な AI 監査タイムライン、共有 JSONL ログ、**Cursor: AI監査ログをエクスポート**
 - Workspace Trust によりプロジェクトの Rules / Skills / MCP を読み込まず、自律 Supervisor・自動修復・すべて保持・バックグラウンド Agent を制限
+- **質問 / 変更 / 委譲 / 確認・適用**の目的別入口と、安全重視 / バランス / 自動化重視の実行プリセット
+- チャット・Supervisor・バックグラウンド実行の計画、進捗、変更、検証、エラー、復旧操作をまとめる **Run Center**
+- Trust、Git / `gh`、プロキシ、Run ID、直近エラー、監査情報を含む機密情報除外済み診断エクスポート
+- バージョン付き・容量制限付き会話保存と、管理対象添付の保持期限・孤児クリーンアップ
 
 ### サイドバービュー
 
 Activity Bar の **Cursor** コンテナ:
 
 - **エージェント** — チャット、モデル、プロファイル、使用量、並列 Agent
-- **ワークスペース** — Sessions / Inbox / Rules / Skills / MCP / Background / Audit をまとめた1本のツリー（保持/復元、Supervisor の適用・破棄、統合の有効/無効、分離ワーカー、監査タイムライン）
+- **ワークスペース** — Run Center / Sessions / Inbox / Rules / Skills / MCP / Background / Audit をまとめた1本のツリー（ライブ実行と復旧、保持/復元、Supervisor の適用・破棄、統合の有効/無効、分離ワーカー、監査タイムライン）
 
 ### スラッシュコマンド
 
@@ -224,6 +236,10 @@ Activity Bar の **Cursor** コンテナ:
 - `.cursor/commands/*.md` と `~/.cursor/commands/*.md` のテンプレート
 
 ### AIネイティブ機能
+
+**Cursor: 目的を選択**では、個別の内部コマンドを探さずに **質問する / 変更する / 任せる / 確認・適用する** の4つから開始できます。**Cursor: 実行プロファイルを選択**は既存の安全性・自動化設定へ、安全重視 / バランス / 自動化重視のプリセットを適用します。自動化重視はWorkspace Trustで制限され、明示確認が必要です。
+
+ワークスペースの **Run Center** は、現在もっとも関連するチャット、Supervisor、バックグラウンド実行を追跡し、計画、進捗、変更ファイル、検証、エラー詳細、復旧操作を同じ場所へ表示します。失敗時は再試行、ログ、セットアップ、機密情報を除外した診断エクスポートへ進めます。共有監査ログの書き込み失敗もAuditグループへ表示します。
 
 通常チャットは会話ごとに独立したCursor AgentとRunを持ちます。処理中に **並列Agent** バーの目立つ **並列Agentを起動** ボタンを押して別の指示を送ると、両方を同時実行できます。上限到達時はボタンが無効になり、現在数と上限を確認できます。バーには実行中・待機中の会話が常時表示され、クリックで即座に切り替え、×ボタンでそのAgentだけを停止できます。並列タスクが完了・失敗・停止した場合は「確認待ち」として残り、その会話を一度開いて別の会話または画面へ移動した時点で消えます。履歴にも **実行中** または **待機中** と表示され、会話へ戻ると途中の出力も復元されます。同一会話内のメッセージは従来どおり順番に処理しますが、送信待ちキューから選択して別Agentとして並列起動することもできます（同じ並列上限が適用されます）。同時数は `cursorSubscription.maxParallelChatAgents`（初期値3、最大8）で設定できます。同時呼び出しはCursorの利用枠を並行して消費する場合があります。同じファイルへの並行編集も、変更箇所が重ならなければ3-wayマージで自動統合します。テキスト変更が重なった場合は確認ダイアログからAIへ戻し、双方の意図を推測して解決できます。競合マーカーの除去と解決中の再変更を確認できたファイルだけを適用します。
 
@@ -261,7 +277,7 @@ WindowsではCursorローカルSDKのサンドボックスを利用できませ�
 
 - プロンプト、および選択コード、参照ファイル、画像、診断、デバッグ情報、プロジェクトメモリ、Skills、MCP結果など明示的に含めたコンテキストは、ご自身のアカウントとプランで公開Cursor SDKを通じてCursorへ送信されます。タスクの実行に必要な場合、Agentツールが追加のワークスペースファイルを読み取ることがあります。
 - Cursor APIキーは VS Code SecretStorageへ保存します。この拡張機能はCursorデスクトップのログイン情報を読み取らず、独自のテレメトリやアクセス解析も追加しません。
-- 会話本文と集計トークン使用量は VS Codeのworkspace stateへ保存します。外部添付ファイルのコピー、未コミットファイルのチェックポイント、隔離実行のbaseline、Supervisorタスク情報は VS Codeの拡張機能専用ストレージへ保存します。会話を削除すると本文と管理対象の外部添付コピーを削除します。変更セッションとチェックポイントは最新20件に制限され、Supervisorデータはタスクを破棄するか拡張機能ストレージを削除するまで残ります。
+- 会話本文と集計トークン使用量は VS Codeのworkspace stateへ保存します。会話はバージョン付き形式で、既定100会話・約4 MiBを上限に古い本文から整理します。外部添付ファイルのコピー、未コミットファイルのチェックポイント、隔離実行のbaseline、Supervisorタスク情報は VS Codeの拡張機能専用ストレージへ保存します。添付は件数・容量を制限し、危険な実行形式やリンク形式を拒否し、管理対象rootの同一性を確認して保持期間後の孤児を削除します。会話を削除すると本文と管理対象の外部添付コピーを削除します。変更セッションとチェックポイントは最新20件に制限され、Supervisorデータはタスクを破棄するか拡張機能ストレージを削除するまで残ります。
 - プロジェクトMCPサーバー、バックグラウンドAgent、および設定した編集前・編集後・検証コマンドは、VS Code拡張ホストまたは起動したプロセスの権限でローカル実行されます。信頼されていない（Restricted）ワークスペースでは、プロジェクトルール、プロジェクトSkills、プロジェクトMCP設定を読み込まず、自律 Supervisor、自動修復、すべて保持ポリシー、バックグラウンド Agent は、フォルダを信頼するまで制限されます。
 - 拡張機能をアンインストールしても、VS Codeの拡張機能ストレージが即時削除されるとは限りません。ローカル保存データをすべて削除する必要がある場合は、VS Codeのプロファイルまたはアプリケーションデータ管理を使用してください。
 

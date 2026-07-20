@@ -1,12 +1,13 @@
-import {
-  Agent,
-  type AgentDefinition,
-  type LocalAgentOptions,
-  type McpServerConfig,
-  type ModelSelection,
-  type SettingSource,
-} from "@cursor/sdk";
 import * as vscode from "vscode";
+import {
+  type AgentBackend,
+  type AgentBackendLocalOptions,
+  type AgentBackendMcpServerConfig,
+  type AgentBackendModelSelection,
+  type AgentBackendSettingSource,
+  backendSupports,
+  CursorSdkBackend,
+} from "./agentBackend.js";
 import type { Conversation } from "./chatTypes.js";
 import type { CursorAgent } from "./chatRuntime.js";
 import type { SafetyApprovalMode } from "./safety.js";
@@ -15,7 +16,7 @@ export interface AgentFactoryOptions {
   supportsLocalSandbox: boolean;
   isJapanese: boolean;
   selectedApprovalMode: () => SafetyApprovalMode;
-  selectedModel: () => ModelSelection;
+  selectedModel: () => AgentBackendModelSelection;
   saveConversations: () => Promise<void>;
   notifySandboxUnavailable: () => void;
 }
@@ -25,8 +26,8 @@ export interface CreateAgentRequest {
   roots: string[];
   workspaceName: string;
   conversation: Conversation;
-  settingSources?: SettingSource[];
-  mcpServers?: Record<string, McpServerConfig>;
+  settingSources?: AgentBackendSettingSource[];
+  mcpServers?: Record<string, AgentBackendMcpServerConfig>;
   /** Revalidates the trust/integration snapshot synchronously before each SDK connection. */
   assertIntegrationBoundary: () => void;
 }
@@ -35,7 +36,10 @@ export interface CreateAgentRequest {
 export class AgentFactory {
   private sandboxFallbackApproved = false;
 
-  public constructor(private readonly options: AgentFactoryOptions) {}
+  public constructor(
+    private readonly options: AgentFactoryOptions,
+    private readonly backend: AgentBackend = new CursorSdkBackend(),
+  ) {}
 
   public async createOrResume(request: CreateAgentRequest): Promise<CursorAgent> {
     const {
@@ -49,48 +53,60 @@ export class AgentFactory {
     } = request;
     const cwd = roots.length === 1 ? roots[0] : roots;
     const approvalMode = this.options.selectedApprovalMode();
-    const local: LocalAgentOptions = {
+    const sandboxSupported = backendSupports(this.backend, "sandbox");
+    const local: AgentBackendLocalOptions = {
       cwd,
       autoReview: approvalMode !== "full-access",
       // Be explicit even though current SDKs default this on for headless
       // embedders. Transport retries are especially important for the Windows
       // native runtime, where an interrupted pipe can surface as ECANCELED.
-      enableAgentRetries: true,
-      sandboxOptions: {
+      enableAgentRetries: backendSupports(this.backend, "agentRetries") ? true : undefined,
+      sandbox: sandboxSupported ? {
         enabled: this.options.supportsLocalSandbox && approvalMode !== "full-access",
-      },
-      settingSources,
+      } : undefined,
+      settingSources: backendSupports(this.backend, "settingSources")
+        ? settingSources
+        : undefined,
     };
-    if (approvalMode !== "full-access" && !this.options.supportsLocalSandbox) {
+    if (approvalMode !== "full-access"
+      && (!this.options.supportsLocalSandbox || !sandboxSupported)) {
       this.options.notifySandboxUnavailable();
     }
 
-    const agents = this.builtInSubagents();
-    const connect = async (localOptions: LocalAgentOptions): Promise<CursorAgent> => {
-      if (conversation.agentId) {
+    const subagents = backendSupports(this.backend, "subagents")
+      ? this.backend.builtInSubagents()
+      : undefined;
+    const negotiatedMcpServers = backendSupports(this.backend, "mcpServers")
+      ? mcpServers
+      : undefined;
+    const connect = async (localOptions: AgentBackendLocalOptions): Promise<CursorAgent> => {
+      if (conversation.agentId && backendSupports(this.backend, "resume")) {
         try {
           assertIntegrationBoundary();
-          return await Agent.resume(conversation.agentId, {
+          return await this.backend.resume(conversation.agentId, {
             apiKey,
             local: localOptions,
-            agents,
-            mcpServers,
+            subagents,
+            mcpServers: negotiatedMcpServers,
           });
         } catch (error) {
-          if (this.isSandboxUnavailableError(error)) {
+          if (this.backend.classifyResumeError(error) === "other") {
             throw error;
           }
           conversation.agentId = undefined;
         }
       }
+      if (conversation.agentId) {
+        conversation.agentId = undefined;
+      }
 
       assertIntegrationBoundary();
-      const agent = await Agent.create({
+      const agent = await this.backend.create({
         apiKey,
         model: this.options.selectedModel(),
         local: localOptions,
-        agents,
-        mcpServers,
+        subagents,
+        mcpServers: negotiatedMcpServers,
         name: `VS Code: ${workspaceName}`,
       });
       conversation.agentId = agent.agentId;
@@ -101,7 +117,7 @@ export class AgentFactory {
     try {
       return await connect(local);
     } catch (error) {
-      if (!local.sandboxOptions?.enabled || !this.isSandboxUnavailableError(error)) {
+      if (!local.sandbox?.enabled || !this.isSandboxUnavailableError(error)) {
         throw error;
       }
       if (!this.sandboxFallbackApproved && !await this.confirmUnsandboxedRun()) {
@@ -112,7 +128,7 @@ export class AgentFactory {
       }
       this.sandboxFallbackApproved = true;
       this.options.notifySandboxUnavailable();
-      return connect({ ...local, sandboxOptions: { enabled: false } });
+      return connect({ ...local, sandbox: { enabled: false } });
     }
   }
 
@@ -130,29 +146,7 @@ export class AgentFactory {
   }
 
   private isSandboxUnavailableError(error: unknown): boolean {
-    const message = error instanceof Error ? error.message : String(error);
-    return message.includes("sandboxing is not supported in this environment")
-      || message.includes("Local SDK sandboxing was requested");
-  }
-
-  private builtInSubagents(): Record<string, AgentDefinition> {
-    return {
-      researcher: {
-        description: "Read-only specialist for gathering codebase evidence and comparing approaches.",
-        prompt: "Investigate the assigned question. Read relevant files, gather concise evidence, and report findings. Do not edit files.",
-        model: "inherit",
-      },
-      implementer: {
-        description: "Implementation specialist for a clearly scoped independent code change.",
-        prompt: "Implement only the assigned scope, preserve unrelated work, and run focused validation. Report changed files and results.",
-        model: "inherit",
-      },
-      reviewer: {
-        description: "Review specialist for correctness, regressions, security, and missing validation.",
-        prompt: "Review the assigned work with evidence. Do not edit files unless explicitly instructed. Report actionable issues by priority.",
-        model: "inherit",
-      },
-    };
+    return this.backend.isSandboxUnavailableError(error);
   }
 
   private localize(english: string, japanese: string): string {

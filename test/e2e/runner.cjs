@@ -7,6 +7,9 @@ const WORKSPACE_TREE_VIEW_ID = "cursorSubscription.workspaceTree";
 const WEBVIEW_STATE_COMMAND = "cursorSubscription.__e2e.webviewState";
 const SET_API_KEY_COMMAND = "cursorSubscription.setApiKey";
 const START_BACKGROUND_JOB_COMMAND = "cursorSubscription.startBackgroundJob";
+const CREATE_PULL_REQUEST_COMMAND = "cursorSubscription.createPullRequest";
+const RUN_TASK_PIPELINE_COMMAND = "cursorSubscription.runTaskPipeline";
+const SCAN_SUPERVISOR_GITHUB_COMMAND = "cursorSubscription.scanSupervisorGitHub";
 const SUITE = process.env.CURSOR_EXTENSION_E2E_SUITE || "smoke";
 
 async function completesWithin(operation, description, milliseconds = 20_000) {
@@ -225,51 +228,40 @@ async function runUntrustedSuite() {
     );
   });
 
-  await check("untrusted workspace blocks background-agent command path", async () => {
+  async function assertTrustedWorkspaceGate(commandId) {
     const commands = new Set(await vscode.commands.getCommands(true));
     assert.ok(
-      commands.has(START_BACKGROUND_JOB_COMMAND),
-      `${START_BACKGROUND_JOB_COMMAND} must remain registered in Restricted Mode`,
+      commands.has(commandId),
+      `${commandId} must remain registered in Restricted Mode`,
     );
 
+    const result = await completesWithin(
+      vscode.commands.executeCommand(commandId),
+      `invoking ${commandId} in an untrusted workspace`,
+      10_000,
+    );
+    assert.equal(
+      result,
+      "workspace-trust-required",
+      `${commandId} must stop at the command-boundary trust gate`,
+    );
+  }
+
+  await check("untrusted workspace blocks background-agent command path", async () => {
     // Trust is checked before API key / prompts (BackgroundJobsController.create).
-    // Spy the warning so this fails if the trust gate is removed while SecretStorage
-    // is still empty (that path would show the API-key warning instead, or proceed).
-    const warnings = [];
-    const originalShowWarningMessage = vscode.window.showWarningMessage;
-    vscode.window.showWarningMessage = (...args) => {
-      warnings.push(String(args[0] ?? ""));
-      return originalShowWarningMessage.apply(vscode.window, args);
-    };
+    await assertTrustedWorkspaceGate(START_BACKGROUND_JOB_COMMAND);
+  });
 
-    try {
-      await completesWithin(
-        vscode.commands.executeCommand(START_BACKGROUND_JOB_COMMAND),
-        "invoking startBackgroundJob in an untrusted workspace",
-        10_000,
-      );
+  await check("untrusted workspace blocks create-pull-request command path", async () => {
+    await assertTrustedWorkspaceGate(CREATE_PULL_REQUEST_COMMAND);
+  });
 
-      const sawTrustedWorkspaceWarning = warnings.some((message) =>
-        /Background agents require a trusted workspace\.|バックグラウンドAgentには信頼済みワークスペースが必要です。/.test(
-          message,
-        ),
-      );
-      assert.ok(
-        sawTrustedWorkspaceWarning,
-        `Expected trusted-workspace warning from startBackgroundJob; got: ${JSON.stringify(warnings)}`,
-      );
-      assert.equal(
-        warnings.some((message) =>
-          /Set the Cursor API key before starting a background agent\.|バックグラウンドAgentの開始前にCursor APIキーを設定してください。/.test(
-            message,
-          ),
-        ),
-        false,
-        "Trust gate must run before the missing-API-key path",
-      );
-    } finally {
-      vscode.window.showWarningMessage = originalShowWarningMessage;
-    }
+  await check("untrusted workspace blocks task-pipeline command path", async () => {
+    await assertTrustedWorkspaceGate(RUN_TASK_PIPELINE_COMMAND);
+  });
+
+  await check("untrusted workspace blocks supervisor GitHub scan command path", async () => {
+    await assertTrustedWorkspaceGate(SCAN_SUPERVISOR_GITHUB_COMMAND);
   });
 }
 

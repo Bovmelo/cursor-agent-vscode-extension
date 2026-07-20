@@ -270,6 +270,18 @@ vscode.CodeLensProvider, vscode.Disposable {
     this.updateStatusBar();
   }
 
+  public snapshots(): readonly SupervisorTask[] {
+    return this.tasks
+      .map((task) => ({
+        ...task,
+        dependencyIds: task.dependencyIds ? [...task.dependencyIds] : undefined,
+        ownedFiles: task.ownedFiles ? [...task.ownedFiles] : undefined,
+        changes: task.changes?.map((change) => ({ ...change })),
+        blockedReasons: task.blockedReasons ? [...task.blockedReasons] : undefined,
+      }))
+      .sort((left, right) => right.updatedAt - left.updatedAt);
+  }
+
   public refresh(): void {
     this.changedEmitter.fire(undefined);
   }

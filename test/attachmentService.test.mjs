@@ -5,6 +5,15 @@ import {
   coerceUploadBytes,
   normalizeAttachedFilePath,
 } from "../out/attachmentUtils.js";
+import {
+  DEFAULT_ATTACHMENT_RETENTION_MS,
+  isDangerousAttachmentName,
+  isDirectChildPath,
+  MAX_ATTACHMENT_BATCH_BYTES,
+  MAX_ATTACHMENT_FILE_BYTES,
+  MAX_ATTACHMENT_FILES,
+  sanitizeAttachmentFileName,
+} from "../out/attachmentPolicy.js";
 
 test("normalizeAttachedFilePath keeps workspace paths and absolute clipboard staging paths", () => {
   const workspaceFile = path.resolve("/workspace/src/a.png");
@@ -40,4 +49,35 @@ test("coerceUploadBytes revives typed arrays, buffers, and plain byte arrays", (
   );
   assert.equal(coerceUploadBytes(undefined), undefined);
   assert.equal(coerceUploadBytes({ foo: 1 }), undefined);
+});
+
+test("attachment policy uses bounded batches and a backward-compatible denylist", () => {
+  assert.equal(MAX_ATTACHMENT_FILE_BYTES, 20 * 1024 * 1024);
+  assert.equal(MAX_ATTACHMENT_BATCH_BYTES, 80 * 1024 * 1024);
+  assert.equal(MAX_ATTACHMENT_FILES, 20);
+  assert.equal(DEFAULT_ATTACHMENT_RETENTION_MS, 30 * 24 * 60 * 60 * 1000);
+
+  for (const name of ["run.exe", "open.LNK", "setup.ps1", "payload.sh", "launch.command", "run.cmd. "]) {
+    assert.equal(isDangerousAttachmentName(name), true, name);
+  }
+  for (const name of ["report.pdf", "archive.zip", "photo.png", "source.ts", "README"]) {
+    assert.equal(isDangerousAttachmentName(name), false, name);
+  }
+});
+
+test("attachment names are portable path segments and preserve useful names", () => {
+  assert.equal(sanitizeAttachmentFileName("../../report?.pdf. "), "report_.pdf");
+  assert.equal(sanitizeAttachmentFileName("C:\\temp\\CON.txt"), "_CON.txt");
+  assert.equal(sanitizeAttachmentFileName("CON .txt"), "_CON .txt");
+  assert.equal(sanitizeAttachmentFileName(".."), "attachment");
+  assert.equal(sanitizeAttachmentFileName("photo.png"), "photo.png");
+  assert.ok(sanitizeAttachmentFileName(`${"a".repeat(300)}.txt`).length <= 180);
+});
+
+test("managed attachment roots must be immediate children", () => {
+  const root = path.resolve("/storage/attachments");
+  assert.equal(isDirectChildPath(root, path.join(root, "conversation-1")), true);
+  assert.equal(isDirectChildPath(root, root), false);
+  assert.equal(isDirectChildPath(root, path.join(root, "conversation-1", "nested")), false);
+  assert.equal(isDirectChildPath(root, path.resolve(root, "..", "elsewhere")), false);
 });
