@@ -57,6 +57,7 @@
   "command.applyBackgroundJob": "バックグラウンド変更を適用",
   "command.cancelBackgroundJob": "バックグラウンドAgentを中止",
   "command.discardBackgroundJob": "バックグラウンド変更を破棄",
+  "command.cleanupAppliedBackgroundJob": "適用済みバックグラウンドジョブをクリーンアップ",
   "command.refreshAuditTimeline": "AI監査タイムラインを更新",
   "view.agent": "エージェント",
   "view.workspaceTree": "ワークスペース",

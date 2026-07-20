@@ -329,7 +329,8 @@ export class RunCenterCoordinator {
 
   public backgroundRunCenterState(job: BackgroundRunSnapshot): RunCenterState {
     const active = BACKGROUND_ACTIVE.has(job.status);
-    const failed = job.status === "error";
+    const cleanupFailed = job.status === "applied" && Boolean(job.error);
+    const failed = job.status === "error" || cleanupFailed;
     const recoveryActions: Array<NonNullable<RunCenterState["recoveryActions"]>[number]> = [];
     if (job.status === "completed") {
       recoveryActions.push(
@@ -351,6 +352,18 @@ export class RunCenterCoordinator {
         id: `background-cancel:${job.id}`,
         label: this.localize("Cancel background agent", "バックグラウンドAgentを中止"),
         command: "cursorSubscription.cancelBackgroundJob",
+        arguments: [job.id],
+      });
+    } else if (job.status === "applied") {
+      recoveryActions.push({
+        id: `background-cleanup:${job.id}`,
+        label: this.localize(
+          cleanupFailed ? "Retry applied-job cleanup" : "Clean up applied background job",
+          cleanupFailed
+            ? "適用済みジョブのクリーンアップを再試行"
+            : "適用済みバックグラウンドジョブをクリーンアップ",
+        ),
+        command: "cursorSubscription.cleanupAppliedBackgroundJob",
         arguments: [job.id],
       });
     } else if (failed) {
@@ -378,7 +391,12 @@ export class RunCenterCoordinator {
       progress: {
         message: active
           ? this.localize("Background agent is working", "バックグラウンドAgentが実行中")
-          : failed
+          : cleanupFailed
+            ? this.localize(
+                "Applied background-job cleanup needs attention",
+                "適用済みバックグラウンドジョブのクリーンアップを確認してください",
+              )
+            : failed
             ? this.localize("Background agent failed", "バックグラウンドAgentが失敗")
             : this.localize("Background agent finished", "バックグラウンドAgentが完了"),
         status: active ? "running" : failed ? "paused" : "completed",
@@ -505,7 +523,11 @@ export class RunCenterCoordinator {
     jobs: readonly BackgroundRunSnapshot[],
   ): BackgroundRunSnapshot | undefined {
     return jobs
-      .filter((job) => BACKGROUND_VISIBLE.has(job.status))
+      .filter(
+        (job) =>
+          BACKGROUND_VISIBLE.has(job.status) ||
+          (job.status === "applied" && Boolean(job.error)),
+      )
       .sort((left, right) => right.updatedAt - left.updatedAt)[0];
   }
 

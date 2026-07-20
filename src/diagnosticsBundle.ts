@@ -44,14 +44,18 @@ export interface DiagnosticsBundle {
   configurationSnapshot?: readonly DiagnosticCheck[];
 }
 
-const SECRET_ASSIGNMENT = /\b(api[_-]?key|authorization|cookie|credential|gh[_-]?token|password|secret|token)\b\s*[:=]\s*([^\s,;]+)/giu;
+const SECRET_ASSIGNMENT = /\b(cursor[_-]?api[_-]?key|api[_-]?key|authorization|cookie|credential|gh[_-]?token|password|secret|token)\b(\s*[:=]\s*)(?!Bearer\b)([^\s,;]+)/giu;
+const API_KEY_WHITESPACE = /\b(api[_-]?key)([ \t]+)(?!is\b|was\b|missing\b|unset\b|undefined\b|null\b|none\b|configured\b|present\b|absent\b|required\b)([A-Za-z0-9][A-Za-z0-9._~+\/-]{6,}[A-Za-z0-9])/giu;
 const BEARER_TOKEN = /\bBearer\s+[A-Za-z0-9._~+\/-]{8,}/giu;
+const CURSOR_KEY_TOKEN = /(?<![A-Za-z0-9_])key_[A-Za-z0-9][A-Za-z0-9._-]{6,}[A-Za-z0-9](?![A-Za-z0-9_-]|\.[A-Za-z0-9])/giu;
 const URL_CREDENTIALS = /(https?:\/\/)[^\s/@:]+:[^\s/@]+@/giu;
 
 export function redactDiagnosticText(value: string): string {
   return value
     .replace(BEARER_TOKEN, "Bearer <redacted>")
-    .replace(SECRET_ASSIGNMENT, (_match, key: string) => `${key}=<redacted>`)
+    .replace(SECRET_ASSIGNMENT, (_match, key: string, separator: string) => `${key}${separator}<redacted>`)
+    .replace(API_KEY_WHITESPACE, (_match, key: string, separator: string) => `${key}${separator}<redacted>`)
+    .replace(CURSOR_KEY_TOKEN, "<redacted>")
     .replace(URL_CREDENTIALS, "$1<redacted>@");
 }
 

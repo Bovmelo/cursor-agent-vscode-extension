@@ -187,6 +187,35 @@ test("failed background recovery accurately offers a new agent", () => {
   );
 });
 
+test("applied cleanup failures stay fail closed and expose cleanup only", () => {
+  const job = {
+    id: "job",
+    title: "Background",
+    status: "applied",
+    updatedAt: 400,
+    error: "cleanup failed",
+  };
+  const state = buildRunCenterState({
+    conversations: [conversation("chat", "Current chat", 300)],
+    backgroundJobs: [job],
+  });
+  const applied = buildBackgroundRunCenterState({ ...job, error: undefined });
+
+  assert.equal(state.runId, "job");
+  assert.equal(state.progress.status, "paused");
+  assert.equal(state.error.message, "cleanup failed");
+  assert.deepEqual(
+    state.recoveryActions.map((action) => action.command),
+    ["cursorSubscription.cleanupAppliedBackgroundJob"],
+  );
+  assert.deepEqual(state.recoveryActions[0].arguments, ["job"]);
+  assert.equal(applied.progress.status, "completed");
+  assert.equal(
+    applied.recoveryActions[0].command,
+    "cursorSubscription.cleanupAppliedBackgroundJob",
+  );
+});
+
 test("older completed operational results yield to the current conversation", () => {
   const state = buildRunCenterState({
     conversations: [conversation("chat", "Current chat", 300)],

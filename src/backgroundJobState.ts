@@ -17,6 +17,8 @@ export type BackgroundJobStateEvent =
   | { type: "apply-succeeded" }
   | { type: "apply-failed"; error: string }
   | { type: "apply-uncertain"; error: string }
+  | { type: "recover-interrupted-apply"; error: string }
+  | { type: "applied-cleanup-succeeded" }
   | { type: "applied-cleanup-failed"; error: string }
   | { type: "discard" };
 
@@ -85,6 +87,10 @@ export function reduceBackgroundJobState(
         : undefined;
     case "apply-uncertain":
       return current.status === "applying" ? { status: "error", error: event.error } : undefined;
+    case "recover-interrupted-apply":
+      return current.status === "applying" ? { status: "error", error: event.error } : undefined;
+    case "applied-cleanup-succeeded":
+      return current.status === "applied" ? { status: "applied", error: undefined } : undefined;
     case "applied-cleanup-failed":
       return current.status === "applied" ? { status: "applied", error: event.error } : undefined;
     case "discard":

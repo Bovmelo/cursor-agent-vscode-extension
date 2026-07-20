@@ -541,6 +541,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("cursorSubscription.cancelBackgroundJob", (target) =>
       backgroundJobs.cancel(unwrapWorkspaceNode(target)),
     ),
+    vscode.commands.registerCommand("cursorSubscription.cleanupAppliedBackgroundJob", (target) =>
+      backgroundJobs.cleanupApplied(unwrapWorkspaceNode(target)),
+    ),
     vscode.commands.registerCommand("cursorSubscription.discardBackgroundJob", (target) =>
       backgroundJobs.discard(unwrapWorkspaceNode(target)),
     ),
@@ -6003,6 +6006,25 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     let progressState: "completed" | "stopped" | "error" = "completed";
     let verificationResult: VerificationResult | undefined;
     let resetInterruptedAgent = false;
+    let interruptedRuntimeError:
+      | { code: string | undefined; message: string }
+      | undefined;
+    const noteInterruptedRuntimeError = (error: unknown): void => {
+      const errorRecord =
+        typeof error === "object" && error !== null
+          ? (error as { code?: unknown; message?: unknown })
+          : undefined;
+      const code = typeof errorRecord?.code === "string" ? errorRecord.code : undefined;
+      const message =
+        error instanceof Error
+          ? error.message
+          : typeof errorRecord?.message === "string"
+            ? errorRecord.message
+            : String(error);
+      if (isLocalRuntimeWriteCancelled(code, message)) {
+        interruptedRuntimeError = { code, message };
+      }
+    };
     runtime.live = {
       userEntry,
       assistantText,
@@ -6214,6 +6236,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         run = await sendRun();
       } catch (error) {
         if (!this.isAgentBusyError(error)) {
+          noteInterruptedRuntimeError(error);
           throw error;
         }
         this.output.appendLine(
@@ -6234,7 +6257,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           },
         );
         runtime.rootsKey = recoveryRootsKey === currentRootsKey() ? recoveryRootsKey : undefined;
-        run = await sendRun();
+        try {
+          run = await sendRun();
+        } catch (error) {
+          noteInterruptedRuntimeError(error);
+          throw error;
+        }
       }
       runtime.run = run;
       runtime.forceNextRun = false;
@@ -6245,7 +6273,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
       updateStartupStep(localize("Waiting for Cursor response", "Cursorの応答を待機中"));
       const eventStream = run.stream();
-      const resultPromise = run.wait();
+      const resultPromise = run.wait().catch((error: unknown) => {
+        noteInterruptedRuntimeError(error);
+        throw error;
+      });
       const terminalSignal = resultPromise.then(async (result) => {
         // Give the stream a short grace period to deliver its final message.
         await new Promise<void>((resolve) => setTimeout(resolve, 500));
@@ -6284,6 +6315,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           break;
         }
         if (outcome.type === "streamError") {
+          noteInterruptedRuntimeError(outcome.error);
           throw outcome.error;
         }
         if (outcome.next.done) {
@@ -6793,10 +6825,18 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }
     } catch (error) {
       const preparationFailure = isRunPreparationError(error) ? error : undefined;
-      const wasCancelled = preparationFailure?.kind === "cancelled";
+      const runtimeInterruption = interruptedRuntimeError;
+      const runtimeWriteCancelled = runtimeInterruption !== undefined;
+      const requestedStop =
+        runtimeWriteCancelled &&
+        (preparationAbort.signal.aborted ||
+          runtime.pendingCancel ||
+          runtime.cancellation !== undefined);
+      const wasCancelled = preparationFailure?.kind === "cancelled" || requestedStop;
       const timedOut = preparationFailure?.kind === "timeout";
       failed = !wasCancelled;
       progressState = wasCancelled ? "stopped" : "error";
+      resetInterruptedAgent = runtimeWriteCancelled && !requestedStop;
       if (runtime.live) {
         runtime.live.progressState = progressState;
       }
@@ -6861,14 +6901,21 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               `Cursor did not respond within ${preparationTimeoutSeconds} seconds. The stalled run was discarded; check the network, VPN, proxy, or API key, then try again.`,
               `${preparationTimeoutSeconds}秒以内にCursorから応答がありませんでした。停止したRunは破棄しました。ネットワーク、VPN、プロキシ、APIキーを確認して再試行してください。`,
             )
-          : error instanceof CursorAgentError
-            ? localize(
+          : runtimeWriteCancelled
+            ? this.formatLocalRuntimeInterruption(
+                runtimeInterruption.message,
+                runtimeInterruption.code,
+                runtime.run?.id,
+                runtime.run?.requestId,
+              )
+            : error instanceof CursorAgentError
+              ? localize(
                 `Could not start the connection to Cursor: ${error.message}`,
                 `Cursorへの接続を開始できませんでした: ${error.message}`,
               )
-            : error instanceof Error
-              ? error.message
-              : String(error);
+              : error instanceof Error
+                ? error.message
+                : String(error);
       if (!wasCancelled) {
         this.postIfActive(conversationId, {
           type: "error",
@@ -7311,6 +7358,28 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     return `${relative} L${editor.selection.start.line + 1}-L${editor.selection.end.line + 1}`;
   }
 
+  private formatLocalRuntimeInterruption(
+    message: string | undefined,
+    code: string | undefined,
+    runId?: string,
+    requestId?: string,
+  ): string {
+    const rawDetail = message?.trim();
+    const detail = rawDetail?.replace(/^\[[^\]]+\]\s*/, "");
+    return [
+      localize(
+        "The connection to the local Cursor runtime was interrupted. The extension will reconnect automatically on the next run; try the message again.",
+        "ローカルのCursor Runtimeとの接続が中断されました。次の実行時に自動で再接続するため、メッセージをもう一度送信してください。",
+      ),
+      detail ? `${localize("Details", "詳細")}: ${detail}` : undefined,
+      code ? `${localize("Error code", "エラーコード")}: ${code}` : undefined,
+      requestId ? `Request: ${requestId}` : undefined,
+      runId ? `Run: ${runId}` : undefined,
+    ]
+      .filter((line): line is string => Boolean(line))
+      .join("\n");
+  }
+
   private formatRunFailure(result: RunResult): string {
     const rawDetail = result.error?.message?.trim();
     const detail = rawDetail?.replace(/^\[[^\]]+\]\s*/, "");
@@ -7352,9 +7421,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         "エージェントで別の処理が実行中です。停止するか完了を待ってから再試行してください。",
       );
     } else if (isLocalRuntimeWriteCancelled(result.error?.code, detail)) {
-      summary = localize(
-        "The connection to the local Cursor runtime was interrupted. The extension will reconnect automatically on the next run; try the message again.",
-        "ローカルのCursor Runtimeとの接続が中断されました。次の実行時に自動で再接続するため、メッセージをもう一度送信してください。",
+      return this.formatLocalRuntimeInterruption(
+        detail,
+        result.error?.code,
+        result.id,
+        result.requestId,
       );
     } else {
       summary = localize(

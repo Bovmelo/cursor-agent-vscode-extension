@@ -52,6 +52,8 @@ const WORKSPACE_TRUST_ERROR =
 const BACKGROUND_WORKTREES_HOME_SEGMENT = ".cursor-background/worktrees";
 const APPLY_RECOVERY_ERROR =
   "Applying background changes failed after workspace mutation began. Automatic retry is disabled; inspect the workspace and discard the background job when recovery is complete.";
+const INTERRUPTED_APPLY_RECOVERY_ERROR =
+  "The extension host stopped while background changes were being applied. The workspace may have been modified. Automatic retry is disabled; inspect the workspace and discard the background job when recovery is complete.";
 
 interface LaunchedBackgroundWorker {
   token: string;
@@ -412,6 +414,9 @@ export class BackgroundJobsController
       this.changed.fire(undefined);
     } finally {
       this.finishJobOperation(job.id);
+      // A post-apply persistence failure can leave the durable record at
+      // `applying`; reconcile it as soon as this host-owned operation ends.
+      this.requestPoll(false);
     }
   }
 
@@ -433,6 +438,66 @@ export class BackgroundJobsController
       this.applyStateTransition(job, { type: "cancel", reason: "user" });
       await this.save(job);
       await this.auditJob(job, "background.cancel");
+      this.changed.fire(undefined);
+    } finally {
+      this.finishJobOperation(job.id);
+    }
+  }
+
+  /** Retry cleanup only after changes were durably recorded as applied. */
+  public async cleanupApplied(target?: BackgroundNode | string): Promise<void> {
+    let job = this.resolve(target);
+    if (!job || job.status !== "applied") {
+      return;
+    }
+    if (!this.beginJobOperation(job.id)) {
+      return;
+    }
+    try {
+      job = await this.repository.read(job.jobFile);
+      this.jobs.set(job.id, job);
+      if (job.status !== "applied") {
+        return;
+      }
+      await this.recoverWorker(job);
+      if (job.status !== "applied") {
+        this.changed.fire(undefined);
+        return;
+      }
+      if (!(await this.isWorkerExitConfirmed(job))) {
+        void vscode.window.showWarningMessage(
+          this.text(
+            "The background worker is still finishing, so applied-job cleanup cannot run yet. Try again after it exits.",
+            "バックグラウンドワーカーは終了処理中のため、適用済みジョブをまだクリーンアップできません。終了後に再試行してください。",
+          ),
+        );
+        return;
+      }
+      try {
+        await this.repository.validateOperationalBoundaries(job);
+        await cleanupIsolatedWorktree(job.session, this.storageRoot, (message) =>
+          this.output.appendLine(message),
+        );
+        await this.cleanupWorkerProtocol(job);
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        this.applyStateTransition(job, {
+          type: "applied-cleanup-failed",
+          error: errorMessage,
+        });
+        await this.save(job);
+        void vscode.window.showErrorMessage(errorMessage);
+        this.changed.fire(undefined);
+        return;
+      }
+      this.applyStateTransition(job, { type: "applied-cleanup-succeeded" });
+      await this.save(job);
+      void vscode.window.showInformationMessage(
+        this.text(
+          "Applied background-job artifacts were cleaned up.",
+          "適用済みバックグラウンドジョブの成果物をクリーンアップしました。",
+        ),
+      );
       this.changed.fire(undefined);
     } finally {
       this.finishJobOperation(job.id);
@@ -555,6 +620,7 @@ export class BackgroundJobsController
     for (const [id, known] of this.jobs) {
       try {
         const current = await this.repository.read(known.jobFile);
+        const interruptedApplyRecovered = await this.recoverInterruptedApply(current);
         const recovered = await this.recoverWorker(current);
         requiresSupervision ||= recovered.requiresSupervision;
         if (current.updatedAt !== known.updatedAt || current.status !== known.status) {
@@ -571,11 +637,12 @@ export class BackgroundJobsController
             );
           }
         }
-        changed ||= recovered.changed;
+        changed ||= interruptedApplyRecovered || recovered.changed;
       } catch {
         // A worker replaces the JSON file atomically; retry on the next poll.
         requiresSupervision ||=
           isActiveBackgroundJobStatus(known.status) ||
+          known.status === "applying" ||
           this.launchedWorkers.has(id) ||
           this.stopRequestQueues.has(id);
       }
@@ -905,6 +972,27 @@ export class BackgroundJobsController
           : "Could not hard-stop the authenticated background worker after its cancellation grace period.";
     this.logRecoveryOnce(job, result, message);
     return { changed, requiresSupervision: true };
+  }
+
+  private async recoverInterruptedApply(job: BackgroundJob): Promise<boolean> {
+    if (job.status !== "applying" || this.activeJobOperations.has(job.id)) {
+      return false;
+    }
+    if (
+      !this.applyStateTransition(job, {
+        type: "recover-interrupted-apply",
+        error: INTERRUPTED_APPLY_RECOVERY_ERROR,
+      })
+    ) {
+      return false;
+    }
+    await this.save(job);
+    this.logRecoveryOnce(
+      job,
+      "interrupted-apply",
+      "Recovered an interrupted background apply as manual-recovery-required.",
+    );
+    return true;
   }
 
   /** Never delete a worktree or stop sidecars until worker exit is proven. */

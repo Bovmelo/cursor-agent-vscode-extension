@@ -119,6 +119,24 @@ test("background job state machine permits only ordered apply and discard transi
     { status: "error", error: "manual recovery required" },
     "a throwing apply callback may have mutated files and must not be retryable",
   );
+  assert.deepEqual(
+    reduceBackgroundJobState(
+      { status: "applying" },
+      { type: "recover-interrupted-apply", error: "manual recovery required" },
+      messages,
+    ),
+    { status: "error", error: "manual recovery required" },
+    "a durable applying state has uncertain workspace effects and must not become retryable",
+  );
+  assert.deepEqual(
+    reduceBackgroundJobState(
+      { status: "applied", error: "cleanup failed" },
+      { type: "applied-cleanup-succeeded" },
+      messages,
+    ),
+    { status: "applied", error: undefined },
+    "cleanup recovery must retain the applied terminal state",
+  );
   assert.equal(
     reduceBackgroundJobState({ status: "running" }, { type: "begin-apply" }, messages),
     undefined,
@@ -211,6 +229,32 @@ test("background apply, cancel, and discard claim the latest durable job", () =>
     /applyStarted = true[\s\S]*?applyJob\(job, applyable\)[\s\S]*?apply-uncertain/u,
   );
   assert.match(applySource, /validateOperationalBoundaries\(job\)/u);
+});
+
+test("interrupted apply recovery fails closed and applied cleanup never reapplies", () => {
+  const pollSource = backgroundJobsSource.slice(
+    backgroundJobsSource.indexOf("private async poll("),
+    backgroundJobsSource.indexOf("private requestPoll("),
+  );
+  const recoverySource = backgroundJobsSource.slice(
+    backgroundJobsSource.indexOf("private async recoverInterruptedApply("),
+    backgroundJobsSource.indexOf("/** Never delete a worktree"),
+  );
+  const cleanupSource = backgroundJobsSource.slice(
+    backgroundJobsSource.indexOf("public async cleanupApplied("),
+    backgroundJobsSource.indexOf("public async discard("),
+  );
+
+  assert.match(pollSource, /recoverInterruptedApply\(current\)/u);
+  assert.match(recoverySource, /job\.status !== "applying"/u);
+  assert.match(recoverySource, /activeJobOperations\.has\(job\.id\)/u);
+  assert.match(recoverySource, /recover-interrupted-apply[\s\S]*?await this\.save\(job\)/u);
+  assert.match(cleanupSource, /job\.status !== "applied"/u);
+  assert.match(cleanupSource, /isWorkerExitConfirmed\(job\)/u);
+  assert.match(cleanupSource, /validateOperationalBoundaries\(job\)/u);
+  assert.match(cleanupSource, /cleanupIsolatedWorktree[\s\S]*?cleanupWorkerProtocol/u);
+  assert.match(cleanupSource, /applied-cleanup-succeeded[\s\S]*?save\(job\)/u);
+  assert.doesNotMatch(cleanupSource, /applyJob\(/u);
 });
 
 test("orphan recovery reconciles the latest job only after confirmed worker exit", () => {

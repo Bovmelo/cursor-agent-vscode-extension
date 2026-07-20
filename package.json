@@ -333,6 +333,11 @@
         "icon": "$(discard)"
       },
       {
+        "command": "cursorSubscription.cleanupAppliedBackgroundJob",
+        "title": "%command.cleanupAppliedBackgroundJob%",
+        "icon": "$(clear-all)"
+      },
+      {
         "command": "cursorSubscription.refreshAuditTimeline",
         "title": "%command.refreshAuditTimeline%",
         "icon": "$(refresh)"
@@ -473,6 +478,11 @@
         {
           "command": "cursorSubscription.discardBackgroundJob",
           "when": "view == cursorSubscription.workspaceTree && (viewItem == cursorBackground.job.completed || viewItem == cursorBackground.job.error || viewItem == cursorBackground.job.cancelled)",
+          "group": "inline@2"
+        },
+        {
+          "command": "cursorSubscription.cleanupAppliedBackgroundJob",
+          "when": "view == cursorSubscription.workspaceTree && viewItem == cursorBackground.job.applied",
           "group": "inline@2"
         },
         {

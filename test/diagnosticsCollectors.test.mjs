@@ -42,7 +42,7 @@ test("summarizeBackgroundJobs redacts secrets and omits prompts", () => {
   assert.equal(summaries.length, 1);
   assert.equal(summaries[0].id, "job-1");
   assert.equal(summaries[0].title, "Fix api_key=<redacted>");
-  assert.equal(summaries[0].error, "Authorization=<redacted> <redacted>");
+  assert.equal(summaries[0].error, "Authorization: Bearer <redacted>");
   assert.equal(summaries[0].usage?.totalTokens, 15);
   assert.equal("prompt" in summaries[0], false);
   assert.doesNotMatch(JSON.stringify(summaries), /NEVER INCLUDE|super-secret|abcdefghijklmnop/u);

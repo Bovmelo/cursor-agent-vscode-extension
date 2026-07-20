@@ -57,8 +57,28 @@ const bundle = {
 };
 
 test("diagnostic redaction removes common credential forms", () => {
-  assert.equal(redactDiagnosticText("Authorization: Bearer abcdefghijklmnop"), "Authorization=<redacted> <redacted>");
+  assert.equal(redactDiagnosticText("Authorization: Bearer abcdefghijklmnop"), "Authorization: Bearer <redacted>");
   assert.equal(redactDiagnosticText("https://user:pass@example.com"), "https://<redacted>@example.com");
+});
+
+test("diagnostic redaction removes Cursor API key export forms", () => {
+  assert.equal(
+    redactDiagnosticText("CURSOR_API_KEY = cursor-secret-value"),
+    "CURSOR_API_KEY = <redacted>",
+  );
+  assert.equal(
+    redactDiagnosticText("request failed for key_0123456789abcdef."),
+    "request failed for <redacted>.",
+  );
+  assert.equal(redactDiagnosticText("apiKey cursor-secret-value"), "apiKey <redacted>");
+  assert.equal(redactDiagnosticText("APIKEY\tABCDEF0123456789"), "APIKEY\t<redacted>");
+});
+
+test("diagnostic redaction avoids ordinary API key labels and short identifiers", () => {
+  assert.equal(
+    redactDiagnosticText("API key is configured; apiKey missing; key_name is a field"),
+    "API key is configured; apiKey missing; key_name is a field",
+  );
 });
 
 test("diagnostic bundles are sanitized before Markdown export", () => {

@@ -57,6 +57,7 @@
   "command.applyBackgroundJob": "Apply Background Changes",
   "command.cancelBackgroundJob": "Cancel Background Agent",
   "command.discardBackgroundJob": "Discard Background Changes",
+  "command.cleanupAppliedBackgroundJob": "Clean Up Applied Background Job",
   "command.refreshAuditTimeline": "Refresh AI Audit Timeline",
   "view.agent": "Agent",
   "view.workspaceTree": "Workspace",
