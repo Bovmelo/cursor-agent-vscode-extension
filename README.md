@@ -197,6 +197,7 @@ The API key is stored in VS Code SecretStorage (not in settings, workspace state
 - [Issues](https://github.com/ark4ez/cursor-agent-vscode-extension/issues)
 - [Changelog](https://github.com/ark4ez/cursor-agent-vscode-extension/blob/master/CHANGELOG.md)
 - [License (MIT)](https://github.com/ark4ez/cursor-agent-vscode-extension/blob/master/LICENSE)
+- [Third-party notices](./THIRD_PARTY_NOTICES.md)
 
 ---
 
@@ -353,3 +354,4 @@ APIキーは設定・workspace state・ログには保存しません。設定�
 - [Issues](https://github.com/ark4ez/cursor-agent-vscode-extension/issues)
 - [Changelog](https://github.com/ark4ez/cursor-agent-vscode-extension/blob/master/CHANGELOG.md)
 - [License (MIT)](https://github.com/ark4ez/cursor-agent-vscode-extension/blob/master/LICENSE)
+- [サードパーティ通知](./THIRD_PARTY_NOTICES.md)
