@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.3.1 - 2026-07-26
+
+- Hardened shutdown so delayed sends cannot resume attachment staging, hooks, verification, isolated-worktree application, persistence, or follow-up orchestration after disposal
+- Made change-session checkpoints abort-aware and transactional, with bounded ignored-path snapshots that stream Git output and fall back to a fixed-size Bloom index
+- Prevented stopped or failed orchestrator planners from being relaunched after restart while preserving retry-response baselines
+- Expanded diagnostic redaction to cover complete inline AWS SigV4, Digest, Basic, folded, proxy, and JSON authorization values without hiding unrelated fields
+- Improved Change Court and Failure Time Machine baseline handling, canonical path matching, verification history, and safe rollback evidence
+
 ## 0.3.0 - 2026-07-20
 
 - Added **Review AI Change Evidence**, a read-only critical review of saved before/after session evidence with verdicts, counter-evidence, missing tests, and rollback guidance
