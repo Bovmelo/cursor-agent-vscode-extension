@@ -86,6 +86,8 @@ export const CHANGE_COURT_REVIEW_SCHEMA = {
 
 export interface ChangeCourtFileEvidence {
   readonly relative: string;
+  readonly beforeExists: boolean;
+  readonly afterExists: boolean;
   readonly before: string;
   readonly after: string;
 }
@@ -120,7 +122,7 @@ SESSION GOAL:
 
 const PROMPT_VERIFICATION_LABEL = "\n\nVERIFICATION SUMMARY:\n";
 const PROMPT_EVIDENCE_LABEL =
-  "\n\nFILE EVIDENCE (zero or more complete JSON records; before/after may be empty):\n";
+  "\n\nFILE EVIDENCE (zero or more complete JSON records; beforeExists/afterExists distinguish missing files from empty before/after content):\n";
 const PROMPT_EPILOGUE =
   "\nEnd of supplied evidence. Base the verdict only on evidence above and return JSON only.";
 const TRUNCATION_MARKER = "\n[context truncated to prompt budget]";
@@ -347,6 +349,8 @@ function sanitizeEvidenceFile(
     || `(unnamed file ${index + 1})`;
   return {
     relative,
+    beforeExists: file?.beforeExists === true,
+    afterExists: file?.afterExists === true,
     before: typeof file?.before === "string" ? file.before : "",
     after: typeof file?.after === "string" ? file.after : "",
   };

@@ -44,7 +44,40 @@ export interface DiagnosticsBundle {
   configurationSnapshot?: readonly DiagnosticCheck[];
 }
 
-const SECRET_ASSIGNMENT = /\b(cursor[_-]?api[_-]?key|api[_-]?key|authorization|cookie|credential|gh[_-]?token|password|secret|token)\b(\s*[:=]\s*)(?!Bearer\b)([^\s,;]+)/giu;
+const AUTHORIZATION_SCHEME = "Basic|Bearer|Digest|Negotiate|NTLM|Token|AWS4-HMAC-SHA256";
+const AUTHORIZATION_KEY = "proxy-authorization|authorization";
+const JSON_AUTHORIZATION_PROPERTY = new RegExp(
+  `(["'])(${AUTHORIZATION_KEY})\\1(\\s*:\\s*)(["'])((?:${AUTHORIZATION_SCHEME})\\b[ \\t]*)?(?:\\\\.|(?!\\4)[^\\\\\\r\\n])*\\4`,
+  "giu",
+);
+const AUTHORIZATION_HEADER = new RegExp(
+  `^([ \\t]*)(${AUTHORIZATION_KEY})\\b([ \\t]*:[ \\t]*)([^\\r\\n]*(?:\\r?\\n[ \\t]+[^\\r\\n]*)*)`,
+  "gimu",
+);
+const AUTHORIZATION_SCHEME_PREFIX = new RegExp(`^(${AUTHORIZATION_SCHEME})\\b`, "iu");
+const INLINE_QUOTED_AUTHORIZATION = new RegExp(
+  `(?<![A-Za-z0-9_-])(["']?)(${AUTHORIZATION_KEY})\\1([ \\t]*[:=][ \\t]*)(["'])((?:${AUTHORIZATION_SCHEME})\\b[ \\t]*)?(?:\\\\.|(?!\\4)[^\\\\\\r\\n])*\\4`,
+  "giu",
+);
+const AWS4_PARAMETER_VALUE =
+  String.raw`(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s,;}\]"']+)`;
+const AWS4_SIGNED_HEADERS_VALUE =
+  String.raw`(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s,}\]"']+)`;
+const INLINE_AWS4_AUTHORIZATION = new RegExp(
+  `(?<![A-Za-z0-9_-])(["']?)(${AUTHORIZATION_KEY})\\1([ \\t]*[:=][ \\t]*)(AWS4-HMAC-SHA256)\\b[ \\t]+Credential\\b[ \\t]*=[ \\t]*${AWS4_PARAMETER_VALUE}[ \\t]*,[ \\t]*SignedHeaders\\b[ \\t]*=[ \\t]*${AWS4_SIGNED_HEADERS_VALUE}[ \\t]*,[ \\t]*Signature\\b[ \\t]*=[ \\t]*${AWS4_PARAMETER_VALUE}`,
+  "giu",
+);
+const DIGEST_PARAMETER =
+  String.raw`[A-Za-z][A-Za-z0-9_-]*[ \t]*=[ \t]*(?:"(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|[^\s,;}\]"']+)`;
+const INLINE_DIGEST_AUTHORIZATION = new RegExp(
+  `(?<![A-Za-z0-9_-])(["']?)(${AUTHORIZATION_KEY})\\1([ \\t]*[:=][ \\t]*)(Digest)\\b[ \\t]+${DIGEST_PARAMETER}(?:[ \\t]*,[ \\t]*${DIGEST_PARAMETER})*`,
+  "giu",
+);
+const INLINE_AUTHORIZATION = new RegExp(
+  `(?<![A-Za-z0-9_-])(["']?)(${AUTHORIZATION_KEY})\\1([ \\t]*[:=][ \\t]*)(?:(${AUTHORIZATION_SCHEME})\\b[ \\t]+)?[^\\s,;}\\]"']+`,
+  "giu",
+);
+const SECRET_ASSIGNMENT = /\b(cursor[_-]?api[_-]?key|api[_-]?key|cookie|credential|gh[_-]?token|password|secret|token)\b(\s*[:=]\s*)(?!Bearer\b)([^\s,;]+)/giu;
 const API_KEY_WHITESPACE = /\b(cursor[_-]?api[_-]?key|api[_-]?key)([ \t]+)(?!is\b|was\b|missing\b|unset\b|undefined\b|null\b|none\b|configured\b|present\b|absent\b|required\b)(?:(["'])([A-Za-z0-9][A-Za-z0-9._~+\/-]{6,}[A-Za-z0-9])\3|[A-Za-z0-9][A-Za-z0-9._~+\/-]{6,}[A-Za-z0-9])/giu;
 const BEARER_TOKEN = /\bBearer\s+[A-Za-z0-9._~+\/-]{8,}/giu;
 const CURSOR_KEY_TOKEN = /(?<![A-Za-z0-9_])key_[A-Za-z0-9][A-Za-z0-9._-]{6,}[A-Za-z0-9](?![A-Za-z0-9_-]|\.[A-Za-z0-9])/giu;
@@ -52,6 +85,67 @@ const URL_CREDENTIALS = /(https?:\/\/)[^\s/@:]+:[^\s/@]+@/giu;
 
 export function redactDiagnosticText(value: string): string {
   return value
+    .replace(
+      JSON_AUTHORIZATION_PROPERTY,
+      (
+        _match,
+        keyQuote: string,
+        key: string,
+        separator: string,
+        valueQuote: string,
+        scheme: string | undefined,
+      ) =>
+        `${keyQuote}${key}${keyQuote}${separator}${valueQuote}${scheme ?? ""}<redacted>${valueQuote}`,
+    )
+    .replace(
+      AUTHORIZATION_HEADER,
+      (
+        _match,
+        indentation: string,
+        key: string,
+        separator: string,
+        rawValue: string,
+      ) => {
+        const unfoldedValue = rawValue.replace(/\r?\n[ \t]+/gu, " ").trim();
+        const scheme = AUTHORIZATION_SCHEME_PREFIX.exec(unfoldedValue)?.[1];
+        const foldedSeparator =
+          rawValue.includes("\n") && !/[ \t]$/u.test(separator) ? " " : "";
+        return `${indentation}${key}${separator}${foldedSeparator}${scheme ? `${scheme} ` : ""}<redacted>`;
+      },
+    )
+    .replace(
+      INLINE_QUOTED_AUTHORIZATION,
+      (
+        _match,
+        keyQuote: string,
+        key: string,
+        separator: string,
+        valueQuote: string,
+        scheme: string | undefined,
+      ) =>
+        `${keyQuote}${key}${keyQuote}${separator}${valueQuote}${scheme ?? ""}<redacted>${valueQuote}`,
+    )
+    .replace(
+      INLINE_AWS4_AUTHORIZATION,
+      (_match, keyQuote: string, key: string, separator: string, scheme: string) =>
+        `${keyQuote}${key}${keyQuote}${separator}${scheme} <redacted>`,
+    )
+    .replace(
+      INLINE_DIGEST_AUTHORIZATION,
+      (_match, keyQuote: string, key: string, separator: string, scheme: string) =>
+        `${keyQuote}${key}${keyQuote}${separator}${scheme} <redacted>`,
+    )
+    .replace(
+      INLINE_AUTHORIZATION,
+      (
+        _match,
+        keyQuote: string,
+        key: string,
+        separator: string,
+        scheme: string | undefined,
+      ) =>
+        `${keyQuote}${key}${keyQuote}${separator}${scheme ? `${scheme} ` : ""}<redacted>`,
+    )
     .replace(BEARER_TOKEN, "Bearer <redacted>")
     .replace(SECRET_ASSIGNMENT, (_match, key: string, separator: string) => `${key}${separator}<redacted>`)
     .replace(API_KEY_WHITESPACE, (_match, key: string, separator: string) => `${key}${separator}<redacted>`)

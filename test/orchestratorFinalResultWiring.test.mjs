@@ -44,3 +44,39 @@ test("orchestrator tasks open the synthesis conversation through the existing li
   assert.match(controllerSource, /orchestratorOpenFinalResult: "最終結果を開く"/u);
   assert.match(controllerSource, /orchestratorOpenFinalResult: "Open final result"/u);
 });
+
+test("resumed orchestrator planners retain the plan execution profile", () => {
+  assert.match(
+    extensionSource,
+    /launch\.kind === "plan" \? "plan" : "agent"/u,
+  );
+});
+
+test("recreated planner conversations persist their prior-response baseline", () => {
+  assert.match(
+    extensionSource,
+    /planResponseBaseline: Math\.max\(0, \(experiment\.planAttempts \?\? 1\) - 1\)/u,
+  );
+});
+
+test("resumed terminal planners are finalized instead of re-launched", () => {
+  assert.match(
+    extensionSource,
+    /planResponseOutcome: \(conversationId, expectedResponseCount\)[\s\S]*?classifyOrchestratorPlanResponse\(/u,
+  );
+  assert.match(
+    extensionSource,
+    /for \(const terminal of pending\.terminalPlans\)[\s\S]*?terminal\.progressState,[\s\S]*?terminal\.assistantText/u,
+  );
+});
+
+test("terminal transcript state is persisted even without tool progress", () => {
+  assert.match(
+    extensionSource,
+    /progress: storedProgress\.length > 0 \? storedProgress : undefined,[\s\S]*?progressState,/u,
+  );
+  assert.doesNotMatch(
+    extensionSource,
+    /progressState: storedProgress\.length > 0 \? progressState : undefined/u,
+  );
+});

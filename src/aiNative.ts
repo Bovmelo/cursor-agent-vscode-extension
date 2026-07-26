@@ -1,4 +1,4 @@
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
@@ -64,6 +64,30 @@ export interface VerificationRunSnapshot extends VerificationResult {
   at: number;
 }
 
+export interface ExactIgnoredPathIndexSnapshot {
+  version: 1;
+  /** Exact files, plus ignored directory prefixes marked by a trailing slash. */
+  entries: string[];
+}
+
+export interface BloomIgnoredPathIndexSnapshot {
+  version: 2;
+  algorithm: "sha256-double-hash-v1";
+  bitCount: number;
+  hashCount: number;
+  entryCount: number;
+  bits: string;
+}
+
+export type IgnoredPathIndexSnapshot =
+  | ExactIgnoredPathIndexSnapshot
+  | BloomIgnoredPathIndexSnapshot;
+
+export const MAX_PERSISTED_IGNORED_INDEX_BYTES = 96 * 1024;
+const MAX_EXACT_IGNORED_INDEX_BYTES = 64 * 1024;
+const IGNORED_BLOOM_BYTES = 64 * 1024;
+const IGNORED_BLOOM_HASH_COUNT = 4;
+
 export interface ChangeSessionSnapshot {
   id: string;
   goal: string;
@@ -77,6 +101,9 @@ export interface ChangeSessionSnapshot {
   files: string[];
   fileDecisions?: Record<string, "pending" | "kept" | "restored">;
   baselineFiles?: Record<string, BaselineFileSnapshot>;
+  ignoredPathIndexAtCheckpoint?: IgnoredPathIndexSnapshot;
+  /** Legacy exact-file index retained for persisted session compatibility. */
+  ignoredFilesAtCheckpoint?: string[];
   proposedFiles?: Record<string, ProposedFileSnapshot>;
   nonRestorableFiles?: string[];
   verification?: VerificationResult;
@@ -170,6 +197,257 @@ async function isTrackedInHead(root: string, relative: string): Promise<boolean>
   }
 }
 
+export interface KnownRevisionPaths {
+  readonly known: true;
+  readonly exact: ReadonlyMap<string, string>;
+  readonly folded?: ReadonlyMap<string, string>;
+}
+
+interface UnknownRevisionPaths {
+  readonly known: false;
+}
+
+type RevisionPaths = KnownRevisionPaths | UnknownRevisionPaths;
+
+const UNKNOWN_REVISION_PATHS: UnknownRevisionPaths = { known: false };
+
+export function createRevisionPathIndex(
+  revisionPaths: readonly string[],
+  caseInsensitive = process.platform === "win32",
+): KnownRevisionPaths {
+  const exact = new Map<string, string>();
+  const folded = caseInsensitive ? new Map<string, string>() : undefined;
+  for (const candidate of revisionPaths) {
+    exact.set(candidate, candidate);
+    if (folded && !folded.has(candidate.toLowerCase())) {
+      folded.set(candidate.toLowerCase(), candidate);
+    }
+  }
+  return {
+    known: true,
+    exact,
+    ...(folded ? { folded } : {}),
+  };
+}
+
+async function listRevisionPaths(root: string, revision: string): Promise<KnownRevisionPaths> {
+  const { stdout } = await execFileAsync(
+    "git",
+    ["ls-tree", "-r", "--name-only", "-z", revision],
+    gitExecOptions(root, { maxBuffer: 64 * 1024 * 1024 }),
+  );
+  return createRevisionPathIndex(stdout.split("\0").filter(Boolean));
+}
+
+function ignoredEntryToken(entry: string): string | undefined {
+  const normalized = entry.replaceAll("\\", "/");
+  const directory = normalized.endsWith("/");
+  const key = baselineKey(directory ? normalized.replace(/\/+$/u, "") : normalized);
+  return key ? `${directory ? "directory" : "file"}\0${key}` : undefined;
+}
+
+function forEachBloomPosition(
+  token: string,
+  bitCount: number,
+  hashCount: number,
+  visit: (position: number) => void,
+): void {
+  const digest = createHash("sha256").update(token).digest();
+  const first = digest.readUInt32LE(0);
+  const rawSecond = digest.readUInt32LE(4);
+  const second = rawSecond % 2 === 0 ? rawSecond + 1 : rawSecond;
+  for (let index = 0; index < hashCount; index += 1) {
+    visit((first + index * second) % bitCount);
+  }
+}
+
+function addBloomToken(bits: Uint8Array, token: string, hashCount: number): void {
+  forEachBloomPosition(token, bits.byteLength * 8, hashCount, (position) => {
+    bits[position >>> 3] |= 1 << (position & 7);
+  });
+}
+
+function bloomHasToken(
+  bits: Uint8Array,
+  token: string,
+  hashCount: number,
+): boolean {
+  let present = true;
+  forEachBloomPosition(token, bits.byteLength * 8, hashCount, (position) => {
+    if ((bits[position >>> 3] & (1 << (position & 7))) === 0) {
+      present = false;
+    }
+  });
+  return present;
+}
+
+function createIgnoredIndexAccumulator(): {
+  add(entry: string): void;
+  snapshot(): IgnoredPathIndexSnapshot;
+} {
+  let entries: string[] | undefined = [];
+  let exactBytes = Buffer.byteLength('{"version":1,"entries":[]}');
+  let bloomBits: Buffer | undefined;
+  let entryCount = 0;
+
+  const addToBloom = (entry: string) => {
+    const token = ignoredEntryToken(entry);
+    if (token && bloomBits) {
+      addBloomToken(bloomBits, token, IGNORED_BLOOM_HASH_COUNT);
+    }
+  };
+
+  return {
+    add(entry) {
+      if (!entry) {
+        return;
+      }
+      entryCount += 1;
+      if (entries) {
+        const addedBytes = Buffer.byteLength(JSON.stringify(entry)) + (entries.length > 0 ? 1 : 0);
+        if (exactBytes + addedBytes <= MAX_EXACT_IGNORED_INDEX_BYTES) {
+          entries.push(entry);
+          exactBytes += addedBytes;
+          return;
+        }
+        bloomBits = Buffer.alloc(IGNORED_BLOOM_BYTES);
+        for (const exactEntry of entries) {
+          addToBloom(exactEntry);
+        }
+        entries = undefined;
+      }
+      addToBloom(entry);
+    },
+    snapshot() {
+      if (entries) {
+        return { version: 1, entries };
+      }
+      const bits = bloomBits ?? Buffer.alloc(IGNORED_BLOOM_BYTES);
+      const snapshot: BloomIgnoredPathIndexSnapshot = {
+        version: 2,
+        algorithm: "sha256-double-hash-v1",
+        bitCount: bits.byteLength * 8,
+        hashCount: IGNORED_BLOOM_HASH_COUNT,
+        entryCount,
+        bits: bits.toString("base64"),
+      };
+      if (Buffer.byteLength(JSON.stringify(snapshot)) > MAX_PERSISTED_IGNORED_INDEX_BYTES) {
+        throw new Error("The bounded ignored-path index exceeded its storage limit.");
+      }
+      return snapshot;
+    },
+  };
+}
+
+function createBoundedIgnoredPathIndex(
+  entries: Iterable<string>,
+): IgnoredPathIndexSnapshot {
+  const accumulator = createIgnoredIndexAccumulator();
+  for (const entry of entries) {
+    accumulator.add(entry);
+  }
+  return accumulator.snapshot();
+}
+
+async function captureIgnoredWorkspaceIndex(
+  root: string,
+  signal?: AbortSignal,
+): Promise<IgnoredPathIndexSnapshot> {
+  signal?.throwIfAborted();
+  // --directory collapses trees such as node_modules/ to one prefix. Reading
+  // incrementally avoids turning a large set of exact ignore matches into a
+  // fixed-maxBuffer failure that would make every new path unknowable.
+  const child = spawn(
+    "git",
+    [
+      "ls-files",
+      "--others",
+      "--ignored",
+      "--exclude-standard",
+      "--directory",
+      "-z",
+    ],
+    {
+      cwd: root,
+      windowsHide: true,
+      env: minimalShellEnv(),
+      signal,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+
+  return await new Promise<IgnoredPathIndexSnapshot>((resolve, reject) => {
+    const index = createIgnoredIndexAccumulator();
+    let pending = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: string) => {
+      pending += chunk;
+      let separator = pending.indexOf("\0");
+      while (separator >= 0) {
+        const entry = pending.slice(0, separator);
+        if (entry) {
+          index.add(entry);
+        }
+        pending = pending.slice(separator + 1);
+        separator = pending.indexOf("\0");
+      }
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr = `${stderr}${chunk}`.slice(-16_000);
+    });
+    child.once("error", reject);
+    child.once("close", (code, closeSignal) => {
+      try {
+        signal?.throwIfAborted();
+      } catch (error) {
+        reject(error);
+        return;
+      }
+      if (code === 0) {
+        resolve(index.snapshot());
+        return;
+      }
+      reject(new Error(
+        `git ls-files exited with ${code ?? closeSignal ?? "an unknown status"}${stderr.trim() ? `: ${stderr.trim()}` : ""}`,
+      ));
+    });
+  });
+}
+
+export function trackedRelativePath(
+  relative: string,
+  revisionPaths: RevisionPaths,
+): string | undefined {
+  if (!revisionPaths.known) {
+    return undefined;
+  }
+  const normalized = relative.replaceAll("\\", "/");
+  return revisionPaths.exact.get(normalized)
+    ?? revisionPaths.folded?.get(normalized.toLowerCase());
+}
+
+interface RevisionPathCacheEntry {
+  readonly root: string;
+  readonly revision: string;
+  readonly pending: Promise<KnownRevisionPaths>;
+}
+
+interface ExactIgnoredPathIndex {
+  readonly kind: "exact";
+  readonly exact: ReadonlySet<string>;
+  readonly directories: ReadonlySet<string>;
+}
+
+interface BloomIgnoredPathIndex {
+  readonly kind: "bloom";
+  readonly bits: Uint8Array;
+  readonly hashCount: number;
+}
+
+type IgnoredPathIndex = ExactIgnoredPathIndex | BloomIgnoredPathIndex;
+
 async function readIndexEntry(
   root: string,
   relative: string,
@@ -207,6 +485,8 @@ async function readWorktreeState(file: string): Promise<{
 export class ChangeSessionController implements vscode.TreeDataProvider<SessionNode>, vscode.Disposable {
   private readonly changedEmitter = new vscode.EventEmitter<SessionNode | undefined>();
   private readonly sessions: ChangeSessionSnapshot[];
+  private readonly revisionPathCache = new Map<string, RevisionPathCacheEntry>();
+  private readonly ignoredPathIndexCache = new Map<string, IgnoredPathIndex>();
 
   public readonly onDidChangeTreeData = this.changedEmitter.event;
 
@@ -220,11 +500,38 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     const history = state.get<ChangeSessionSnapshot[]>(SESSION_HISTORY_KEY);
     const legacy = state.get<ChangeSessionSnapshot>(LAST_SESSION_KEY);
     this.sessions = history?.length ? history : legacy ? [legacy] : [];
+    let normalizedIgnoredIndexes = false;
+    for (const session of this.sessions) {
+      const current = session.ignoredPathIndexAtCheckpoint;
+      const currentEntries = current?.version === 1 && Array.isArray(current.entries)
+        ? current.entries
+        : undefined;
+      const legacyEntries = Array.isArray(session.ignoredFilesAtCheckpoint)
+        ? session.ignoredFilesAtCheckpoint
+        : undefined;
+      if (
+        (!current || currentEntries)
+        && (
+          legacyEntries
+          || (
+            currentEntries
+            && Buffer.byteLength(JSON.stringify(current)) > MAX_EXACT_IGNORED_INDEX_BYTES
+          )
+        )
+      ) {
+        session.ignoredPathIndexAtCheckpoint = createBoundedIgnoredPathIndex([
+          ...(currentEntries ?? []),
+          ...(legacyEntries ?? []),
+        ]);
+        delete session.ignoredFilesAtCheckpoint;
+        normalizedIgnoredIndexes = true;
+      }
+    }
     const removed = this.sessions.splice(MAX_SESSION_HISTORY);
     for (const session of removed) {
       void this.deleteCheckpoint(session.id);
     }
-    if (removed.length > 0) {
+    if (removed.length > 0 || normalizedIgnoredIndexes) {
       void this.persist();
     }
   }
@@ -294,7 +601,14 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     return new TextDecoder().decode(bytes);
   }
 
-  public async begin(goal: string, root: string): Promise<ChangeSessionSnapshot> {
+  public async begin(
+    goal: string,
+    root: string,
+    signal?: AbortSignal,
+  ): Promise<ChangeSessionSnapshot> {
+    signal?.throwIfAborted();
+    const baselineClean = await gitStatusIsClean(root);
+    signal?.throwIfAborted();
     const firstLine = goal.split(/\r?\n/).find((line) => line.trim().length > 0)?.trim()
       ?? (this.japanese ? "AI変更セッション" : "AI change session");
     const snapshot: ChangeSessionSnapshot = {
@@ -303,19 +617,56 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       root,
       startedAt: Date.now(),
       phase: "observe",
-      baselineClean: await gitStatusIsClean(root),
+      baselineClean,
       checkpointReady: false,
       files: [],
       fileDecisions: {},
       baselineFiles: {},
     };
-    snapshot.checkpointReady = await this.captureCheckpoint(snapshot);
-    this.sessions.unshift(snapshot);
-    const removed = this.sessions.splice(MAX_SESSION_HISTORY);
-    for (const session of removed) {
-      await this.deleteCheckpoint(session.id);
+    try {
+      snapshot.checkpointReady = await this.captureCheckpoint(snapshot, signal);
+      signal?.throwIfAborted();
+    } catch (error) {
+      await this.deleteCheckpoint(snapshot.id);
+      throw error;
     }
-    await this.persist();
+
+    const previousSessions = [...this.sessions];
+    const nextSessions = [snapshot, ...previousSessions].slice(0, MAX_SESSION_HISTORY);
+    const removed = previousSessions.slice(MAX_SESSION_HISTORY - 1);
+    let persistenceStarted = false;
+    try {
+      signal?.throwIfAborted();
+      persistenceStarted = true;
+      await this.state.update(SESSION_HISTORY_KEY, nextSessions);
+      signal?.throwIfAborted();
+      await this.state.update(LAST_SESSION_KEY, snapshot);
+      signal?.throwIfAborted();
+    } catch (error) {
+      if (persistenceStarted) {
+        try {
+          await Promise.all([
+            this.state.update(SESSION_HISTORY_KEY, previousSessions),
+            this.state.update(LAST_SESSION_KEY, previousSessions[0]),
+          ]);
+        } catch (rollbackError) {
+          this.output.appendLine(
+            `[${new Date().toISOString()}] Could not roll back an interrupted change session: ${String(rollbackError)}`,
+          );
+        }
+      }
+      await this.deleteCheckpoint(snapshot.id);
+      throw error;
+    }
+
+    this.sessions.splice(0, this.sessions.length, ...nextSessions);
+    this.changedEmitter.fire(undefined);
+    // Persistence is the commit point. Do not turn a signal racing with
+    // retired-checkpoint cleanup into a rejected begin after the new session
+    // is already durable.
+    for (const retired of removed) {
+      await this.deleteCheckpoint(retired.id);
+    }
     return snapshot;
   }
 
@@ -445,10 +796,23 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     const postRunChanges = restrict ? [] : await listWorkspaceChanges(session.root);
     const postRunIdentities = new Set(postRunChanges.map((file) => fileIdentity(file)));
     const hintIdentities = new Set(candidateHints.map((file) => fileIdentity(file)));
+    const revisionPaths = candidateHints.length > 0
+      ? await this.revisionPathsAtCheckpoint(session)
+      : UNKNOWN_REVISION_PATHS;
     const candidates = new Map<string, string>();
-    for (const file of [...postRunChanges, ...candidateHints]) {
+    // Insert hints first so Git/status paths, which retain the repository's
+    // canonical spelling, win when both identify the same Windows file.
+    for (const file of [...candidateHints, ...postRunChanges]) {
       if (isInside(session.root, file)) {
-        candidates.set(fileIdentity(file), path.resolve(file));
+        const absolute = path.resolve(file);
+        const relative = path.relative(session.root, absolute).replaceAll("\\", "/");
+        const baselineRelative = session.baselineFiles?.[baselineKey(relative)]?.relative;
+        const canonicalRelative = baselineRelative
+          ?? trackedRelativePath(relative, revisionPaths);
+        const canonicalFile = canonicalRelative
+          ? path.resolve(session.root, canonicalRelative)
+          : absolute;
+        candidates.set(fileIdentity(canonicalFile), canonicalFile);
       }
     }
     if (!restrict) {
@@ -508,8 +872,7 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       };
       if (
         !session.baselineFiles?.[baselineKey(relative)]
-        && !(await this.isTrackedAtCheckpoint(session, relative))
-        && await this.isIgnored(session.root, relative)
+        && (await this.baselineFileExists(session.id, file)) === undefined
       ) {
         session.nonRestorableFiles.push(file);
       }
@@ -550,16 +913,52 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       );
       return new TextDecoder().decode(bytes);
     }
+    const revisionPaths = await this.revisionPathsAtCheckpoint(session);
+    const trackedRelative = revisionPaths.known
+      ? trackedRelativePath(relative, revisionPaths)
+      : relative;
+    if (!trackedRelative) {
+      return "";
+    }
     try {
       const { stdout } = await execFileAsync(
         "git",
-        ["show", `${session.headOid ?? "HEAD"}:${relative}`],
+        ["show", `${session.headOid ?? "HEAD"}:${trackedRelative}`],
         gitExecOptions(session.root, { maxBuffer: 8 * 1024 * 1024 }),
       );
       return stdout;
     } catch {
       return "";
     }
+  }
+
+  public async baselineFileExists(
+    sessionId: string,
+    file: string,
+  ): Promise<boolean | undefined> {
+    const session = this.session(sessionId);
+    if (!session || !isInside(session.root, file)) {
+      return undefined;
+    }
+    const relative = path.relative(session.root, file).replaceAll("\\", "/");
+    const baseline = session.baselineFiles?.[baselineKey(relative)];
+    if (baseline) {
+      return baseline.worktreeExisted;
+    }
+    if (!(session.checkpointReady ?? session.baselineClean)) {
+      return undefined;
+    }
+    const revisionPaths = await this.revisionPathsAtCheckpoint(session);
+    if (!revisionPaths.known) {
+      return undefined;
+    }
+    if (trackedRelativePath(relative, revisionPaths)) {
+      return true;
+    }
+    if (this.wasIgnoredAtCheckpoint(session, relative) !== false) {
+      return undefined;
+    }
+    return false;
   }
 
   public keep(file: string, sessionId = this.snapshot()?.id): void {
@@ -683,21 +1082,31 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
       if (baseline) {
         await this.restoreBaselineFile(session, file, baseline);
         (baseline.worktreeExisted ? restored : removed).push(file);
-      } else if (await this.isTrackedAtCheckpoint(session, relative)) {
-        await execFileAsync(
-          "git",
-          ["restore", `--source=${session.headOid ?? "HEAD"}`, "--staged", "--worktree", "--", relative],
-          gitExecOptions(session.root),
-        );
-        restored.push(file);
       } else {
-        await execFileAsync(
-          "git",
-          ["rm", "--cached", "--ignore-unmatch", "--", relative],
-          gitExecOptions(session.root),
-        );
-        await this.deleteWorktreeFile(file);
-        removed.push(file);
+        const trackedRelative = await this.trackedRelativeAtCheckpoint(session, relative);
+        if (trackedRelative) {
+          await execFileAsync(
+            "git",
+            [
+              "restore",
+              `--source=${session.headOid ?? "HEAD"}`,
+              "--staged",
+              "--worktree",
+              "--",
+              trackedRelative,
+            ],
+            gitExecOptions(session.root),
+          );
+          restored.push(file);
+        } else {
+          await execFileAsync(
+            "git",
+            ["rm", "--cached", "--ignore-unmatch", "--", relative],
+            gitExecOptions(session.root),
+          );
+          await this.deleteWorktreeFile(file);
+          removed.push(file);
+        }
       }
       session.fileDecisions ??= {};
       session.fileDecisions[file] = "restored";
@@ -707,6 +1116,8 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
   }
 
   public dispose(): void {
+    this.revisionPathCache.clear();
+    this.ignoredPathIndexCache.clear();
     this.changedEmitter.dispose();
   }
 
@@ -1033,31 +1444,56 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
     return labels[decision][this.japanese ? 1 : 0];
   }
 
-  private async captureCheckpoint(session: ChangeSessionSnapshot): Promise<boolean> {
+  private async captureCheckpoint(
+    session: ChangeSessionSnapshot,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     try {
+      signal?.throwIfAborted();
       const { stdout: headOid } = await execFileAsync(
         "git",
         ["rev-parse", "HEAD"],
         gitExecOptions(session.root),
       );
+      signal?.throwIfAborted();
       session.headOid = headOid.trim();
       const { stdout: unmerged } = await execFileAsync(
         "git",
         ["ls-files", "--unmerged"],
         gitExecOptions(session.root, { maxBuffer: 1024 * 1024 }),
       );
+      signal?.throwIfAborted();
       if (unmerged.trim()) {
         throw new Error("Cannot checkpoint an unmerged Git index.");
       }
+      try {
+        session.ignoredPathIndexAtCheckpoint = await captureIgnoredWorkspaceIndex(
+          session.root,
+          signal,
+        );
+        signal?.throwIfAborted();
+      } catch (error) {
+        signal?.throwIfAborted();
+        // The restore checkpoint remains useful, but an untracked file cannot
+        // later be claimed as newly created without this baseline-time index.
+        session.ignoredPathIndexAtCheckpoint = undefined;
+        this.output.appendLine(
+          `[${new Date().toISOString()}] Could not index ignored paths at checkpoint: ${String(error)}`,
+        );
+      }
       const changedFiles = await listWorkspaceChanges(session.root);
+      signal?.throwIfAborted();
       const checkpointFolder = vscode.Uri.joinPath(this.storageRoot, "change-sessions", session.id);
       await vscode.workspace.fs.createDirectory(checkpointFolder);
+      signal?.throwIfAborted();
       for (const file of changedFiles) {
+        signal?.throwIfAborted();
         if (!isInside(session.root, file)) {
           continue;
         }
         const relative = path.relative(session.root, file).replaceAll("\\", "/");
         const indexEntry = await readIndexEntry(session.root, relative);
+        signal?.throwIfAborted();
         const baseline: BaselineFileSnapshot = {
           relative,
           worktreeExisted: false,
@@ -1065,7 +1501,9 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
           indexOid: indexEntry?.oid,
           trackedInHead: await isTrackedInHead(session.root, relative),
         };
+        signal?.throwIfAborted();
         const worktree = await readWorktreeState(file);
+        signal?.throwIfAborted();
         if (worktree.existed && worktree.bytes) {
           baseline.worktreeExisted = true;
           baseline.backupName = `${randomUUID()}.bin`;
@@ -1073,11 +1511,13 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
             vscode.Uri.joinPath(checkpointFolder, baseline.backupName),
             worktree.bytes,
           );
+          signal?.throwIfAborted();
         }
         session.baselineFiles![baselineKey(relative)] = baseline;
       }
       return true;
     } catch (error) {
+      signal?.throwIfAborted();
       this.output.appendLine(
         `[${new Date().toISOString()}] Could not create change-session checkpoint: ${String(error)}`,
       );
@@ -1134,6 +1574,7 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
   }
 
   private async deleteCheckpoint(sessionId: string): Promise<void> {
+    this.evictSessionCaches(sessionId);
     try {
       await vscode.workspace.fs.delete(
         vscode.Uri.joinPath(this.storageRoot, "change-sessions", sessionId),
@@ -1176,46 +1617,147 @@ export class ChangeSessionController implements vscode.TreeDataProvider<SessionN
 
       const relative = path.relative(session.root, file).replaceAll("\\", "/");
       const baseline = session.baselineFiles?.[baselineKey(relative)];
-      if (!baseline && !(await this.isTrackedAtCheckpoint(session, relative))) {
-        if (await this.isIgnored(session.root, relative)) {
-          throw new Error(this.japanese
-            ? `${vscode.workspace.asRelativePath(file)} は開始時の状態を確認できない除外ファイルのため、自動復元できません。`
-            : `${vscode.workspace.asRelativePath(file)} is ignored and has no known starting state, so it cannot be restored automatically.`);
-        }
+      if (!baseline && (await this.baselineFileExists(session.id, file)) === undefined) {
+        throw new Error(this.japanese
+          ? `${vscode.workspace.asRelativePath(file)} は開始時の状態を確認できないため、自動復元できません。`
+          : `${vscode.workspace.asRelativePath(file)} has no known starting state, so it cannot be restored automatically.`);
       }
     }
   }
 
-  private async isTrackedAtCheckpoint(
+  private async trackedRelativeAtCheckpoint(
     session: ChangeSessionSnapshot,
     relative: string,
-  ): Promise<boolean> {
+  ): Promise<string | undefined> {
+    return trackedRelativePath(relative, await this.revisionPathsAtCheckpoint(session));
+  }
+
+  private async revisionPathsAtCheckpoint(
+    session: ChangeSessionSnapshot,
+  ): Promise<RevisionPaths> {
+    const revision = session.headOid ?? "HEAD";
+    let entry = this.revisionPathCache.get(session.id);
+    if (entry?.root !== session.root || entry.revision !== revision) {
+      entry = {
+        root: session.root,
+        revision,
+        pending: listRevisionPaths(session.root, revision),
+      };
+      this.revisionPathCache.set(session.id, entry);
+    }
     try {
-      await execFileAsync(
-        "git",
-        ["cat-file", "-e", `${session.headOid ?? "HEAD"}:${relative}`],
-        gitExecOptions(session.root),
-      );
-      return true;
+      return await entry.pending;
     } catch {
-      return false;
+      if (this.revisionPathCache.get(session.id) === entry) {
+        this.revisionPathCache.delete(session.id);
+      }
+      return UNKNOWN_REVISION_PATHS;
     }
   }
 
-  private async isIgnored(root: string, relative: string): Promise<boolean> {
-    try {
-      await execFileAsync(
-        "git",
-        ["check-ignore", "-q", "--", relative],
-        gitExecOptions(root),
-      );
-      return true;
-    } catch (error) {
-      if ((error as { code?: number }).code === 1) {
-        return false;
-      }
-      throw error;
+  private ignoredPathIndexAtCheckpoint(
+    session: ChangeSessionSnapshot,
+  ): IgnoredPathIndex | undefined {
+    const cached = this.ignoredPathIndexCache.get(session.id);
+    if (cached) {
+      return cached;
     }
+    const current = session.ignoredPathIndexAtCheckpoint;
+    const currentEntries = current?.version === 1 && Array.isArray(current.entries)
+      ? current.entries
+      : undefined;
+    const legacyEntries = Array.isArray(session.ignoredFilesAtCheckpoint)
+      ? session.ignoredFilesAtCheckpoint
+      : undefined;
+    if (
+      current?.version === 2
+      && current.algorithm === "sha256-double-hash-v1"
+      && Number.isInteger(current.hashCount)
+      && current.hashCount > 0
+      && current.hashCount <= 16
+      && current.bits.length <= MAX_PERSISTED_IGNORED_INDEX_BYTES
+    ) {
+      const bits = Buffer.from(current.bits, "base64");
+      if (
+        bits.byteLength > 0
+        && bits.byteLength <= IGNORED_BLOOM_BYTES
+        && current.bitCount === bits.byteLength * 8
+        && bits.toString("base64") === current.bits
+      ) {
+        for (const entry of legacyEntries ?? []) {
+          addBloomToken(
+            bits,
+            `file\0${baselineKey(entry)}`,
+            current.hashCount,
+          );
+        }
+        const index: BloomIgnoredPathIndex = {
+          kind: "bloom",
+          bits,
+          hashCount: current.hashCount,
+        };
+        this.ignoredPathIndexCache.set(session.id, index);
+        return index;
+      }
+    }
+    if (!currentEntries && !legacyEntries) {
+      return undefined;
+    }
+    const exact = new Set<string>();
+    const directories = new Set<string>();
+    for (const entry of currentEntries ?? []) {
+      const normalized = entry.replaceAll("\\", "/");
+      if (normalized.endsWith("/")) {
+        const directory = baselineKey(normalized.replace(/\/+$/u, ""));
+        if (directory) {
+          directories.add(directory);
+        }
+      } else {
+        exact.add(baselineKey(normalized));
+      }
+    }
+    for (const entry of legacyEntries ?? []) {
+      exact.add(baselineKey(entry));
+    }
+    const index: ExactIgnoredPathIndex = { kind: "exact", exact, directories };
+    this.ignoredPathIndexCache.set(session.id, index);
+    return index;
+  }
+
+  private wasIgnoredAtCheckpoint(
+    session: ChangeSessionSnapshot,
+    relative: string,
+  ): boolean | undefined {
+    const index = this.ignoredPathIndexAtCheckpoint(session);
+    if (!index) {
+      return undefined;
+    }
+    const key = baselineKey(relative).replace(/\/+$/u, "");
+    if (
+      index.kind === "exact"
+        ? index.exact.has(key) || index.directories.has(key)
+        : bloomHasToken(index.bits, `file\0${key}`, index.hashCount)
+          || bloomHasToken(index.bits, `directory\0${key}`, index.hashCount)
+    ) {
+      return true;
+    }
+    let separator = key.length;
+    while ((separator = key.lastIndexOf("/", separator - 1)) >= 0) {
+      const directory = key.slice(0, separator);
+      if (
+        index.kind === "exact"
+          ? index.directories.has(directory)
+          : bloomHasToken(index.bits, `directory\0${directory}`, index.hashCount)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private evictSessionCaches(sessionId: string): void {
+    this.revisionPathCache.delete(sessionId);
+    this.ignoredPathIndexCache.delete(sessionId);
   }
 
   private async deleteWorktreeFile(file: string): Promise<void> {
@@ -1288,7 +1830,9 @@ export async function runVerification(
   root: string,
   configuredCommands: readonly string[],
   output: vscode.OutputChannel,
+  signal?: AbortSignal,
 ): Promise<VerificationResult> {
+  signal?.throwIfAborted();
   if (!vscode.workspace.isTrusted) {
     output.appendLine(
       `[${new Date().toISOString()}] Skipping verification in an untrusted workspace.`,
@@ -1298,6 +1842,7 @@ export async function runVerification(
   const commands = configuredCommands.length > 0
     ? [...configuredCommands]
     : await detectVerificationCommands(root);
+  signal?.throwIfAborted();
   if (commands.length === 0) {
     return { success: true, skipped: true, steps: [] };
   }
@@ -1306,6 +1851,7 @@ export async function runVerification(
   const maxCommands = 20;
   const totalStartedAt = Date.now();
   for (const command of commands.slice(0, maxCommands)) {
+    signal?.throwIfAborted();
     if (typeof command !== "string" || !command.trim()) {
       continue;
     }
@@ -1339,7 +1885,9 @@ export async function runVerification(
         cwd: root,
         timeout: 180_000,
         maxBuffer: 8 * 1024 * 1024,
+        signal,
       });
+      signal?.throwIfAborted();
       steps.push({
         command,
         stage: verificationStage(command),
@@ -1348,6 +1896,7 @@ export async function runVerification(
         durationMs: Date.now() - startedAt,
       });
     } catch (error) {
+      signal?.throwIfAborted();
       const failure = error as Error & { stdout?: string; stderr?: string };
       steps.push({
         command,

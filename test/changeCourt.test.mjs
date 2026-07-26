@@ -118,9 +118,17 @@ test("parseChangeCourtReview rejects malformed or non-object JSON clearly", () =
 });
 
 test("buildChangeCourtPrompt keeps complete file boundaries within its budget", () => {
-  const small = { relative: "src/small.ts", before: "old", after: "new" };
+  const small = {
+    relative: "src/small.ts",
+    beforeExists: true,
+    afterExists: true,
+    before: "old",
+    after: "new",
+  };
   const huge = {
     relative: "src/huge.ts",
+    beforeExists: true,
+    afterExists: true,
     before: "x".repeat(10_000),
     after: "y".repeat(10_000),
   };
@@ -145,6 +153,56 @@ test("buildChangeCourtPrompt keeps complete file boundaries within its budget", 
     (result.prompt.match(/END COMPLETE FILE EVIDENCE/g) ?? []).length,
   );
   assert.ok(CHANGE_COURT_MAX_PROMPT_CHARACTERS > budget);
+});
+
+test("buildChangeCourtPrompt distinguishes tracked, created, and deleted empty files", () => {
+  const result = buildChangeCourtPrompt({
+    goal: "Review empty-file changes.",
+    verification: "Not run.",
+    files: [{
+      relative: "tracked.txt",
+      beforeExists: true,
+      afterExists: true,
+      before: "",
+      after: "",
+    }, {
+      relative: "created.txt",
+      beforeExists: false,
+      afterExists: true,
+      before: "",
+      after: "",
+    }, {
+      relative: "deleted.txt",
+      beforeExists: true,
+      afterExists: false,
+      before: "",
+      after: "",
+    }],
+  });
+
+  const records = [...result.prompt.matchAll(
+    /--- BEGIN COMPLETE FILE EVIDENCE ---\n(.+)\n--- END COMPLETE FILE EVIDENCE ---/gu,
+  )].map((match) => JSON.parse(match[1]));
+
+  assert.deepEqual(records, [{
+    relative: "tracked.txt",
+    beforeExists: true,
+    afterExists: true,
+    before: "",
+    after: "",
+  }, {
+    relative: "created.txt",
+    beforeExists: false,
+    afterExists: true,
+    before: "",
+    after: "",
+  }, {
+    relative: "deleted.txt",
+    beforeExists: true,
+    afterExists: false,
+    before: "",
+    after: "",
+  }]);
 });
 
 test("formatChangeCourtMarkdown renders English sections and escapes evidence", () => {

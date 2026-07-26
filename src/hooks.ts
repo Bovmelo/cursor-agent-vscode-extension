@@ -11,6 +11,7 @@ export async function runConfiguredHooks(
   phase: HookPhase,
   root: string,
   output: vscode.OutputChannel,
+  signal?: AbortSignal,
 ): Promise<void> {
   if (!vscode.workspace.isTrusted) {
     output.appendLine(
@@ -25,9 +26,24 @@ export async function runConfiguredHooks(
   if (!Array.isArray(commands) || commands.length === 0) {
     return;
   }
+  const stopIfAborted = (): boolean => {
+    if (!signal?.aborted) {
+      return false;
+    }
+    output.appendLine(
+      `[${new Date().toISOString()}] Stopping remaining ${phase} hooks because the run was cancelled.`,
+    );
+    return true;
+  };
+  if (stopIfAborted()) {
+    return;
+  }
   const startedAt = Date.now();
   let ran = 0;
   for (const command of commands) {
+    if (stopIfAborted()) {
+      return;
+    }
     if (typeof command !== "string") {
       continue;
     }
@@ -59,6 +75,7 @@ export async function runConfiguredHooks(
         cwd: root,
         timeout: 120_000,
         maxBuffer: 2 * 1024 * 1024,
+        signal,
       });
       if (stdout.trim()) {
         output.appendLine(stdout.trimEnd());
@@ -67,6 +84,9 @@ export async function runConfiguredHooks(
         output.appendLine(stderr.trimEnd());
       }
     } catch (error) {
+      if (stopIfAborted()) {
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       output.appendLine(
         `[${new Date().toISOString()}] ${phase} hook failed: ${message}`,

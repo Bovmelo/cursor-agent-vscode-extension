@@ -33,7 +33,7 @@ test("send, wait, and stream rejections tag local-runtime write interruption", (
   );
   assert.match(
     sendSource,
-    /try \{\s*run = await sendRun\(\);\s*\} catch \(error\) \{\s*noteInterruptedRuntimeError\(error\);\s*throw error;/u,
+    /try \{\s*run = await sendRun\(\);\s*assertPreparationActive\("restarting the Cursor run"\);\s*\} catch \(error\) \{\s*noteInterruptedRuntimeError\(error\);\s*throw error;/u,
   );
   assert.match(
     sendSource,
@@ -57,7 +57,7 @@ test("thrown ECANCELED shares cancellation semantics, reconnect guidance, and di
   );
   assert.match(
     sendSource,
-    /const wasCancelled = preparationFailure\?\.kind === "cancelled" \|\| requestedStop;[\s\S]*?resetInterruptedAgent = runtimeWriteCancelled && !requestedStop;/u,
+    /const wasCancelled =[\s\S]*?preparationFailure\?\.kind === "cancelled"[\s\S]*?preparationAbort\.signal\.aborted[\s\S]*?this\.lifecycle\.isDisposing[\s\S]*?requestedStop;[\s\S]*?resetInterruptedAgent = runtimeWriteCancelled && !requestedStop;/u,
   );
   assert.match(
     sendSource,

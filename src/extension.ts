@@ -105,7 +105,11 @@ import {
 } from "./projectCommands.js";
 import { isLocalRuntimeWriteCancelled } from "./pureUtils.js";
 import { RunningSoundController } from "./runningSound.js";
-import { isRunPreparationError, waitForRunPreparation } from "./runPreparation.js";
+import {
+  isRunPreparationError,
+  RunPreparationError,
+  waitForRunPreparation,
+} from "./runPreparation.js";
 import {
   AiSupervisorController,
   type SupervisorTask,
@@ -141,6 +145,7 @@ import {
   buildOrchestratorDetail,
   buildOrchestratorPlanPrompt,
   buildSynthesisPrompt,
+  classifyOrchestratorPlanResponse,
   createOrchestratorExperiment,
   extractSubagentName,
   formatTranscriptForHandoff,
@@ -296,6 +301,7 @@ const IS_JAPANESE = vscode.env.language.toLowerCase().startsWith("ja");
 const MAX_DROPPED_FILE_BYTES = 20 * 1024 * 1024;
 const MAX_EDITOR_GENERATION_CONTEXT = 60_000;
 const WORKSPACE_INDEX_DEBOUNCE_MS = 300;
+const SHUTDOWN_CLEANUP_TIMEOUT_MS = 5_000;
 const SUPPORTS_LOCAL_SANDBOX = process.platform !== "win32";
 const extensionDeactivation = new ExtensionDeactivation();
 type AiFeatureSetting =
@@ -851,6 +857,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private readonly diagnosticsController: DiagnosticsController<vscode.Uri>;
   private readonly runCenterCoordinator = new RunCenterCoordinator(IS_JAPANESE);
   private readonly chatRuntimes = new Map<string, ChatRuntime>();
+  private readonly activeSendOperations = new Set<Promise<void>>();
+  private readonly pendingPreparationOperations = new Set<Promise<void>>();
   private showingHome = true;
   private workspaceFileCache: PromiseLike<WorkspaceFileItem[]> | undefined;
   private workspaceFileCacheKey: string | undefined;
@@ -1785,16 +1793,34 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           : undefined,
     });
 
-    if (apiKey === undefined) {
+    if (apiKey === undefined || this.lifecycle.isDisposing) {
       return;
     }
 
     await this.cancelAllChats();
+    if (this.lifecycle.isDisposing) {
+      return;
+    }
     await this.disposeAgent();
+    if (this.lifecycle.isDisposing) {
+      return;
+    }
     await this.context.secrets.store(API_KEY_SECRET, apiKey.trim());
+    if (this.lifecycle.isDisposing) {
+      return;
+    }
     await this.revokeStoredCredentials();
+    if (this.lifecycle.isDisposing) {
+      return;
+    }
     await this.publishAuthState();
+    if (this.lifecycle.isDisposing) {
+      return;
+    }
     await this.publishSetupChecklistState();
+    if (this.lifecycle.isDisposing) {
+      return;
+    }
     void vscode.window.showInformationMessage(
       localize("The Cursor API key was stored securely.", "Cursor APIキーを安全に保存しました。"),
     );
@@ -2478,8 +2504,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     experiment.planConversationId = planConversation.id;
     this.conversations.unshift(planConversation);
     this.orchestratorExperiments = [experiment, ...this.orchestratorExperiments].slice(0, 20);
-    await this.saveOrchestratorExperiments();
+    // Persist the conversation first. A crash after this write leaves only an
+    // unreferenced conversation; the inverse order leaves planning stuck on a
+    // conversation id that never reached storage.
     await this.saveConversations();
+    await this.saveOrchestratorExperiments();
 
     this.activeId = planConversation.id;
     this.showingHome = false;
@@ -2638,11 +2667,72 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         conversationExists,
         isBusy,
         isQueued,
+        planResponseOutcome: (conversationId, expectedResponseCount) => {
+          const conversation = this.conversations.find(
+            (candidate) => candidate.id === conversationId,
+          );
+          // The expected count is relative to this conversation, so a
+          // replacement conversation does not need responses that only
+          // existed in its missing predecessor.
+          return classifyOrchestratorPlanResponse(
+            conversation?.transcript ?? [],
+            expectedResponseCount,
+          );
+        },
       });
       this.orchestratorExperiments = prepared.experiments;
 
       const launches = [...prepared.launches];
-      let createdSynthesis = false;
+      let createdConversation = false;
+      for (const experimentId of prepared.needsPlanConversation) {
+        const index = this.orchestratorExperiments.findIndex(
+          (experiment) => experiment.id === experimentId,
+        );
+        if (index < 0) {
+          continue;
+        }
+        let experiment = this.orchestratorExperiments[index];
+        if (
+          experiment.status !== "planning"
+          || (
+            experiment.planConversationId
+            && conversationExists(experiment.planConversationId)
+          )
+        ) {
+          continue;
+        }
+        const workspaceFolderUri = this.resolveChatWorkspace()?.uri.toString();
+        const planConversation: Conversation = {
+          id: randomUUID(),
+          title: makeConversationTitle(`[Plan] ${experiment.prompt}`),
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          workspaceFolderUri,
+          orchestratorExperimentId: experiment.id,
+          orchestratorRole: "plan",
+          transcript: [],
+        };
+        this.conversations.unshift(planConversation);
+        experiment = {
+          ...experiment,
+          planConversationId: planConversation.id,
+          // The replacement transcript starts empty. Account for completed
+          // attempts that belonged to the missing conversation so the active
+          // retry is reconciled after its first persisted response.
+          planResponseBaseline: Math.max(0, (experiment.planAttempts ?? 1) - 1),
+        };
+        this.orchestratorExperiments[index] = experiment;
+        createdConversation = true;
+        launches.push({
+          prompt: buildOrchestratorPlanPrompt(
+            experiment.prompt,
+            (experiment.planAttempts ?? 1) > 1,
+            experiment.sourceTranscriptExcerpt,
+          ),
+          conversationId: planConversation.id,
+          kind: "plan",
+        });
+      }
       for (const experimentId of prepared.needsSynthesisConversation) {
         const index = this.orchestratorExperiments.findIndex(
           (experiment) => experiment.id === experimentId,
@@ -2671,7 +2761,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           synthesisConversationId: synthesisConversation.id,
         };
         this.orchestratorExperiments[index] = experiment;
-        createdSynthesis = true;
+        createdConversation = true;
         launches.push({
           prompt: buildSynthesisPrompt(experiment),
           conversationId: synthesisConversation.id,
@@ -2679,14 +2769,38 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         });
       }
 
-      await this.saveOrchestratorExperiments();
-      if (createdSynthesis) {
+      if (createdConversation) {
+        // Write the materialized conversation before publishing its id from
+        // the experiment record, making restart repair crash-safe as well.
         await this.saveConversations();
       }
-      return launches;
+      await this.saveOrchestratorExperiments();
+      return {
+        launches,
+        completedPlans: prepared.completedPlans,
+        terminalPlans: prepared.terminalPlans,
+      };
     });
-    for (const launch of pending) {
-      this.deferOrchestratorMessage(launch.prompt, "agent", launch.conversationId);
+    for (const terminal of pending.terminalPlans) {
+      await this.handleOrchestratorConversationComplete(
+        terminal.conversationId,
+        terminal.progressState,
+        terminal.assistantText,
+      );
+    }
+    for (const completed of pending.completedPlans) {
+      await this.handleOrchestratorConversationComplete(
+        completed.conversationId,
+        "completed",
+        completed.assistantText,
+      );
+    }
+    for (const launch of pending.launches) {
+      this.deferOrchestratorMessage(
+        launch.prompt,
+        launch.kind === "plan" ? "plan" : "agent",
+        launch.conversationId,
+      );
     }
   }
 
@@ -3161,7 +3275,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           const isExcluded = createExcludedPathMatcher(vscode.Uri.file(session.root));
           for (const file of session.files) {
             const relative = path.relative(session.root, file).replaceAll("\\", "/");
-            if (isExcluded(relative) || !session.proposedFiles?.[file]?.contentCaptured) {
+            const proposed = session.proposedFiles?.[file];
+            if (isExcluded(relative) || !proposed?.contentCaptured) {
+              unavailableFiles.push(relative);
+              continue;
+            }
+            const beforeExists = await this.changeSessions.baselineFileExists(session.id, file);
+            if (beforeExists === undefined) {
               unavailableFiles.push(relative);
               continue;
             }
@@ -3173,7 +3293,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               unavailableFiles.push(relative);
               continue;
             }
-            files.push({ relative, before, after });
+            files.push({
+              relative,
+              beforeExists,
+              afterExists: proposed.worktreeExisted,
+              before,
+              after,
+            });
           }
           if (files.length === 0) {
             void vscode.window.showInformationMessage(
@@ -4815,8 +4941,19 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       this.workspaceIndexRefreshTimer = undefined;
     }
     this.messageQueue.splice(0, this.messageQueue.length);
-    await this.cancelAllChats();
-    await this.disposeAgent();
+    await this.waitForShutdownOperation(
+      this.cancelAllChats(),
+      "cancelling active Cursor runs",
+    );
+    await this.disposeAgentsForShutdown();
+    await this.waitForShutdownOperation(
+      Promise.allSettled(this.activeSendOperations),
+      "waiting for active Cursor sends",
+    );
+    await this.waitForPendingPreparationOperations();
+    // A send that was still acquiring or recovering an agent when shutdown
+    // began may have installed a handle after the first disposal pass.
+    await this.disposeAgentsForShutdown();
     try {
       await this.conversationStore.flush();
     } catch (error) {
@@ -5985,6 +6122,17 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (this.lifecycle.isDisposing) {
       return false;
     }
+    let finishTrackedSend: (() => void) | undefined;
+    const trackedSend = new Promise<void>((resolve) => {
+      finishTrackedSend = resolve;
+    });
+    const finishSend = (): void => {
+      finishTrackedSend?.();
+      finishTrackedSend = undefined;
+      this.activeSendOperations.delete(trackedSend);
+    };
+    this.activeSendOperations.add(trackedSend);
+    try {
     const commandCandidate = commandId
       ? this.projectCommands.find((command) => command.id === commandId)
       : undefined;
@@ -5998,7 +6146,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return false;
     }
 
-    if (!(await this.ensureTokenBudgetAllows())) {
+    const tokenBudgetAllowed = await this.ensureTokenBudgetAllows();
+    if (this.lifecycle.isDisposing) {
+      return false;
+    }
+    if (!tokenBudgetAllowed) {
       this.post({
         type: "error",
         text: localize(
@@ -6010,18 +6162,30 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     }
 
     await this.ensureWindowsSafeModeMigrated();
-    if (!SUPPORTS_LOCAL_SANDBOX && !(await this.ensureSandboxWarningAcknowledged())) {
-      this.post({
-        type: "error",
-        text: localize(
-          "Acknowledge the Windows sandbox warning before starting an agent run.",
-          "エージェントを実行する前に、Windowsのサンドボックス警告を確認してください。",
-        ),
-      });
+    if (this.lifecycle.isDisposing) {
       return false;
+    }
+    if (!SUPPORTS_LOCAL_SANDBOX) {
+      const sandboxWarningAcknowledged = await this.ensureSandboxWarningAcknowledged();
+      if (this.lifecycle.isDisposing) {
+        return false;
+      }
+      if (!sandboxWarningAcknowledged) {
+        this.post({
+          type: "error",
+          text: localize(
+            "Acknowledge the Windows sandbox warning before starting an agent run.",
+            "エージェントを実行する前に、Windowsのサンドボックス警告を確認してください。",
+          ),
+        });
+        return false;
+      }
     }
 
     const apiKey = await this.context.secrets.get(API_KEY_SECRET);
+    if (this.lifecycle.isDisposing) {
+      return false;
+    }
     if (!apiKey) {
       this.post({ type: "authRequired" });
       await this.promptForApiKey();
@@ -6038,6 +6202,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     let workspace = conversation
       ? await this.bindConversationWorkspace(conversation)
       : this.resolveChatWorkspace();
+    if (this.lifecycle.isDisposing) {
+      return false;
+    }
     if (!workspace) {
       this.post({
         type: "error",
@@ -6052,11 +6219,17 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (!conversation) {
       conversation = this.ensureConversation(effectivePrompt);
       workspace = (await this.bindConversationWorkspace(conversation)) ?? workspace;
+      if (this.lifecycle.isDisposing) {
+        return false;
+      }
     }
     if (this.activeId === conversation.id) {
       this.postWorkspaceLabel();
     }
 
+    if (this.lifecycle.isDisposing) {
+      return false;
+    }
     const conversationId = conversation.id;
     const runtime = this.runtimeFor(conversationId);
     if (runtime.busy) {
@@ -6083,6 +6256,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     this.viewedRetainedParallelTasks.delete(conversationId);
     runtime.busy = true;
     runtime.pendingCancel = false;
+    const preparationAbort = new AbortController();
+    runtime.preparationAbort = preparationAbort;
+    const assertPreparationActive = (phase: string): void => {
+      if (!this.lifecycle.isDisposing && !preparationAbort.signal.aborted) {
+        return;
+      }
+      preparationAbort.abort();
+      throw new RunPreparationError("cancelled", phase);
+    };
     runtime.mutating = profile !== "plan";
     // A queued orchestrator task becomes running only after it has reserved a
     // real chat-agent slot, keeping persisted/UI state aligned with execution.
@@ -6093,6 +6275,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         }`,
       );
     });
+    if (this.lifecycle.isDisposing || preparationAbort.signal.aborted) {
+      runtime.busy = false;
+      if (runtime.preparationAbort === preparationAbort) {
+        runtime.preparationAbort = undefined;
+      }
+      runtime.pendingCancel = false;
+      runtime.mutating = false;
+      return true;
+    }
     if (queue?.fromQueue) {
       this.postIfActive(conversationId, {
         type: "queuedStarted",
@@ -6173,12 +6364,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       !bestOfNCandidate &&
       this.featureEnabled("enableChangeSessions");
     try {
+      assertPreparationActive("preparing local run resources");
       if (useIsolatedWorktree) {
         if (runtime.isolatedWorktree) {
           await cleanupIsolatedWorktree(runtime.isolatedWorktree, storageRoot, (message) =>
             this.output.appendLine(message),
           );
           runtime.isolatedWorktree = undefined;
+          assertPreparationActive("cleaning the previous isolated worktree");
         }
         runtime.isolatedWorktree = await prepareIsolatedWorktree({
           id: `${conversationId.slice(0, 8)}-${randomUUID().slice(0, 8)}`,
@@ -6196,13 +6389,21 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           isExcluded: createExcludedPathMatcher(workspace.uri),
           onLog: (message) => this.output.appendLine(message),
           beforeCaptureBaseline: (worktreePath) =>
-            runConfiguredHooks("preEdit", worktreePath, this.output),
+            runConfiguredHooks(
+              "preEdit",
+              worktreePath,
+              this.output,
+              preparationAbort.signal,
+            ),
         });
+        assertPreparationActive("preparing the isolated worktree");
       }
       const attachedFiles = await this.attachmentService.resolveAttachedFiles(
         requestedFiles,
         workspace,
+        preparationAbort.signal,
       );
+      assertPreparationActive("resolving attached files");
       if (requestedFiles.length > 0 && attachedFiles.length === 0) {
         void vscode.window.showWarningMessage(
           localize(
@@ -6215,7 +6416,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         attachedFiles,
         workspace,
         conversation,
+        preparationAbort.signal,
       );
+      assertPreparationActive("staging attached files");
       ({ composed, contextLabel } = this.composePrompt(
         effectivePrompt,
         attachContext,
@@ -6226,7 +6429,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         includeProjectMemory,
         workspace,
       ));
-      images = await this.attachmentService.loadAttachedImages(attachedFiles, workspace);
+      images = await this.attachmentService.loadAttachedImages(
+        attachedFiles,
+        workspace,
+        preparationAbort.signal,
+      );
+      assertPreparationActive("loading attached images");
       const attachedVisionCount = attachedFiles.filter((file) =>
         /\.(gif|jfif|jpe?g|png|webp)$/i.test(file),
       ).length;
@@ -6240,11 +6448,23 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }
       if (shouldStartChangeSession) {
         if (!runtime.isolatedWorktree) {
-          await runConfiguredHooks("preEdit", workspace.uri.fsPath, this.output);
+          await runConfiguredHooks(
+            "preEdit",
+            workspace.uri.fsPath,
+            this.output,
+            preparationAbort.signal,
+          );
+          assertPreparationActive("running pre-edit hooks");
         }
-        changeSessionId = (await this.changeSessions.begin(effectivePrompt, workspace.uri.fsPath))
-          .id;
+        changeSessionId = (
+          await this.changeSessions.begin(
+            effectivePrompt,
+            workspace.uri.fsPath,
+            preparationAbort.signal,
+          )
+        ).id;
         runtime.changeSessionId = changeSessionId;
+        assertPreparationActive("creating the change-session checkpoint");
         this.repairAttempts.set(conversationId, 0);
         this.changeSessions.setRepairBudget(
           {
@@ -6256,6 +6476,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         );
       }
     } catch (error) {
+      const preparationCancelled =
+        preparationAbort.signal.aborted
+        || (isRunPreparationError(error) && error.kind === "cancelled");
       runtime.ownershipLease?.release();
       runtime.ownershipLease = undefined;
       this.fileOwnership.releaseOwner(conversationId);
@@ -6266,19 +6489,29 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         runtime.isolatedWorktree = undefined;
       }
       runtime.busy = false;
+      if (runtime.preparationAbort === preparationAbort) {
+        runtime.preparationAbort = undefined;
+      }
       runtime.pendingCancel = false;
       runtime.mutating = false;
       runtime.overlappedMutation = false;
       runtime.isolationKind = undefined;
-      this.retainFinishedParallelTask(conversationId, "error");
-      this.postParallelState();
-      this.postIfActive(conversationId, {
-        type: "error",
-        text: error instanceof Error ? error.message : String(error),
-        recoveryActions: RUN_FAILURE_RECOVERY_ACTIONS,
-      });
-      // Run was reserved then aborted during prep — drain any waiting messages.
-      this.deferQueueDrain();
+      if (!this.lifecycle.isDisposing) {
+        this.retainFinishedParallelTask(
+          conversationId,
+          preparationCancelled ? "stopped" : "error",
+        );
+        this.postParallelState();
+        if (!preparationCancelled) {
+          this.postIfActive(conversationId, {
+            type: "error",
+            text: error instanceof Error ? error.message : String(error),
+            recoveryActions: RUN_FAILURE_RECOVERY_ACTIONS,
+          });
+        }
+        // Run was reserved then aborted during prep — drain any waiting messages.
+        this.deferQueueDrain();
+      }
       return true;
     }
 
@@ -6358,8 +6591,6 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       this.postIfActive(conversationId, { type: "chunk", text: assistantText });
     }
 
-    const preparationAbort = new AbortController();
-    runtime.preparationAbort = preparationAbort;
     if (runtime.pendingCancel) {
       preparationAbort.abort();
     }
@@ -6383,12 +6614,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       startupStep.text = text;
       startupStep.status = status;
       progressSteps.set(startupStep.id, { ...startupStep });
-      this.postIfActive(conversationId, {
-        type: "toolStatus",
-        callId: startupStep.id,
-        text,
-        status,
-      });
+      if (!this.lifecycle.isDisposing) {
+        this.postIfActive(conversationId, {
+          type: "toolStatus",
+          callId: startupStep.id,
+          text,
+          status,
+        });
+      }
     };
     updateStartupStep(startupStep.text);
 
@@ -6450,6 +6683,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
                 signal: preparationAbort.signal,
                 timeoutMs: preparationTimeoutMs,
                 phase: "resetting the Cursor agent",
+                onOperationSettled: (completion) =>
+                  this.trackPreparationOperation(completion),
               });
             }
             updateStartupStep(localize("Connecting to Cursor", "Cursorへ接続中"));
@@ -6460,6 +6695,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
                 timeoutMs: preparationTimeoutMs,
                 phase: "connecting to Cursor",
                 onLateResolve: disposeLateAgent,
+                onOperationSettled: (completion) =>
+                  this.trackPreparationOperation(completion),
               },
             );
             runtime.rootsKey = desiredRootsKey;
@@ -6539,11 +6776,14 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
                 await lateRun.cancel();
               }
             },
+            onOperationSettled: (completion) =>
+              this.trackPreparationOperation(completion),
           },
         );
       };
       try {
         run = await sendRun();
+        assertPreparationActive("starting the Cursor run");
       } catch (error) {
         if (!this.isAgentBusyError(error)) {
           noteInterruptedRuntimeError(error);
@@ -6564,11 +6804,15 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             timeoutMs: preparationTimeoutMs,
             phase: "recovering a stalled Cursor run",
             onLateResolve: disposeLateAgent,
+            onOperationSettled: (completion) =>
+              this.trackPreparationOperation(completion),
           },
         );
+        assertPreparationActive("recovering a stalled Cursor run");
         runtime.rootsKey = recoveryRootsKey === currentRootsKey() ? recoveryRootsKey : undefined;
         try {
           run = await sendRun();
+          assertPreparationActive("restarting the Cursor run");
         } catch (error) {
           noteInterruptedRuntimeError(error);
           throw error;
@@ -6579,6 +6823,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       if (runtime.pendingCancel && run.supports("cancel")) {
         runtime.pendingCancel = false;
         await run.cancel();
+        assertPreparationActive("cancelling the Cursor run");
       }
 
       updateStartupStep(localize("Waiting for Cursor response", "Cursorの応答を待機中"));
@@ -6610,8 +6855,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               onLateResolve: () => {
                 void eventStream.return(undefined).catch(() => {});
               },
+              onOperationSettled: (completion) =>
+                this.trackPreparationOperation(completion),
             })
           : await nextOutcome;
+        assertPreparationActive("streaming the Cursor response");
         if (waitingForFirstResponse) {
           waitingForFirstResponse = false;
           updateStartupStep(localize("Cursor responded", "Cursorから応答あり"), "completed");
@@ -6656,6 +6904,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       }
 
       result ??= await resultPromise;
+      assertPreparationActive("finalizing the Cursor run");
       if (
         result.status === "finished" &&
         editedFiles.size > 0 &&
@@ -6663,7 +6912,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         runtime.isolatedWorktree
       ) {
         try {
-          await runConfiguredHooks("postEdit", runtime.isolatedWorktree.worktreePath, this.output);
+          await runConfiguredHooks(
+            "postEdit",
+            runtime.isolatedWorktree.worktreePath,
+            this.output,
+            preparationAbort.signal,
+          );
+          assertPreparationActive("running isolated post-edit hooks");
         } catch (error) {
           const text = error instanceof Error ? error.message : String(error);
           this.postIfActive(conversationId, { type: "error", text });
@@ -6684,6 +6939,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               `${relative} の隔離チャットベースラインを利用できません。`,
             ),
         });
+        assertPreparationActive("collecting isolated changes");
         const excludedChanges = changes.filter((change) => change.excluded);
         if (excludedChanges.length > 0) {
           const excludedSummary = localize(
@@ -6703,6 +6959,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         const applyableChanges = changes.filter((change) => !change.excluded);
         if (bestOfNCandidate) {
           await this.cleanupBestOfNArtifact(conversationId);
+          assertPreparationActive("preparing the isolated candidate");
           let candidateVerification: VerificationResult | undefined;
           if (
             applyableChanges.length > 0 &&
@@ -6728,7 +6985,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               session.worktreePath,
               this.alertConfiguration().get<string[]>("verificationCommands", []),
               this.output,
+              preparationAbort.signal,
             );
+            assertPreparationActive("verifying the isolated candidate");
             verificationStep.status = candidateVerification.success ? "completed" : "error";
             const verificationSummary = this.formatVerificationSummary(candidateVerification);
             this.postIfActive(conversationId, {
@@ -6762,11 +7021,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           runtime.ownershipLease?.release();
           runtime.ownershipLease = undefined;
           const { applied, merged, conflicts } = await this.parallelApplyQueue.run(async () => {
+            assertPreparationActive("waiting to apply isolated changes");
             const applyLease = await this.fileOwnership.acquire(conversationId, [
               path.join(workspaceRoot, ".cursor-parallel-workspace-owner"),
               ...applyableChanges.map((change) => path.join(workspaceRoot, change.relative)),
             ]);
             try {
+              assertPreparationActive("applying isolated changes");
               return await applyIsolatedChanges(session, storageRoot, applyableChanges, {
                 pathEscapeLabel: isolationPathLabel,
                 unavailableMessage: localize(
@@ -6788,6 +7049,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               applyLease.release();
             }
           });
+          assertPreparationActive("applying isolated changes");
           editedFiles.clear();
           for (const relative of applied) {
             const absolute = path.join(workspaceRoot, relative);
@@ -6830,6 +7092,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               agentRoots,
               priorAssistantText: assistantText,
               model: runModel,
+              signal: preparationAbort.signal,
               pathEscapeLabel: isolationPathLabel,
               missingBaselineMessage: (relative) =>
                 localize(
@@ -6838,6 +7101,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
                 ),
               progressSteps,
             });
+            assertPreparationActive("resolving isolated-change conflicts");
             remainingConflicts = resolution.unresolved;
             if (resolution.text) {
               assistantText = assistantText
@@ -6861,6 +7125,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             }
             if (changeSessionId && editedFiles.size > 0) {
               await this.changeSessions.markPending([...editedFiles], changeSessionId);
+              assertPreparationActive("saving isolated changes for review");
             }
           }
           if (remainingConflicts.length > 0) {
@@ -6893,6 +7158,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           changeSessionId,
           runtime.overlappedMutation,
         );
+        assertPreparationActive("detecting changed files");
         editedFiles.clear();
         for (const changedFile of changedFiles) {
           editedFiles.add(changedFile);
@@ -6902,6 +7168,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       if (result.usage) {
         conversation.tokenUsage = addTokenUsage(conversation.tokenUsage, result.usage);
         await this.recordUsage("chat", result.usage);
+        assertPreparationActive("recording token usage");
       }
       if (result.status === "error") {
         const runtimeWriteCancelled = isLocalRuntimeWriteCancelled(
@@ -6956,7 +7223,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         !runtime.isolatedWorktree
       ) {
         try {
-          await runConfiguredHooks("postEdit", workspace.uri.fsPath, this.output);
+          await runConfiguredHooks(
+            "postEdit",
+            workspace.uri.fsPath,
+            this.output,
+            preparationAbort.signal,
+          );
+          assertPreparationActive("running post-edit hooks");
         } catch (error) {
           const text = error instanceof Error ? error.message : String(error);
           this.postIfActive(conversationId, { type: "error", text });
@@ -6965,7 +7238,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
       if (result.status === "finished" && reviewEdits && editedFiles.size > 0) {
         await this.changeSessions.markPending([...editedFiles], changeSessionId);
+        assertPreparationActive("saving edits for review");
         await this.reviewAutopilotEdits(changeSessionId);
+        assertPreparationActive("reviewing edits");
         const identity = (file: string) =>
           process.platform === "win32" ? path.resolve(file).toLowerCase() : path.resolve(file);
         const keptFiles = new Set(this.changeSessions.keptFiles(changeSessionId).map(identity));
@@ -7006,7 +7281,9 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           workspace.uri.fsPath,
           this.alertConfiguration().get<string[]>("verificationCommands", []),
           this.output,
+          preparationAbort.signal,
         );
+        assertPreparationActive("running automatic verification");
         if (changeSessionId) {
           this.changeSessions.setVerification(verificationResult, changeSessionId);
         }
@@ -7101,6 +7378,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             true,
             conversationId,
           );
+          assertPreparationActive("queuing automatic repair");
         } else if (!verificationResult.success && autoRepair && changeSessionId) {
           const failures = verificationResult.steps
             .filter((step) => !step.success)
@@ -7142,7 +7420,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         (preparationAbort.signal.aborted ||
           runtime.pendingCancel ||
           runtime.cancellation !== undefined);
-      const wasCancelled = preparationFailure?.kind === "cancelled" || requestedStop;
+      const wasCancelled =
+        preparationFailure?.kind === "cancelled"
+        || preparationAbort.signal.aborted
+        || this.lifecycle.isDisposing
+        || requestedStop;
       const timedOut = preparationFailure?.kind === "timeout";
       failed = !wasCancelled;
       progressState = wasCancelled ? "stopped" : "error";
@@ -7226,7 +7508,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               : error instanceof Error
                 ? error.message
                 : String(error);
-      if (!wasCancelled) {
+      if (!wasCancelled && !this.lifecycle.isDisposing) {
         this.postIfActive(conversationId, {
           type: "error",
           text,
@@ -7317,10 +7599,12 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         }
       }
       runningSound.dispose();
-      if (progressState === "completed") {
-        this.runningSound.playCompletion();
-      } else if (progressState === "error") {
-        this.runningSound.playError();
+      if (!this.lifecycle.isDisposing) {
+        if (progressState === "completed") {
+          this.runningSound.playCompletion();
+        } else if (progressState === "error") {
+          this.runningSound.playError();
+        }
       }
       if (runtime.live) {
         runtime.live.assistantText = assistantText;
@@ -7375,7 +7659,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             );
           }
         }
-        if (!preserveIsolatedWorktree) {
+        if (!preserveIsolatedWorktree || this.lifecycle.isDisposing) {
           await cleanupIsolatedWorktree(isolated, storageRoot, (message) =>
             this.output.appendLine(message),
           );
@@ -7388,71 +7672,89 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       runtime.ownershipLease?.release();
       runtime.ownershipLease = undefined;
       this.fileOwnership.releaseOwner(conversationId);
-      this.retainFinishedParallelTask(conversationId, progressState);
-      this.clearOrchestratorActivity(conversationId);
-      this.postParallelState();
-      this.postIfActive(conversationId, {
-        type: "idle",
-        activeRuns: this.activeRunCount(),
-      });
-
-      if (profile !== "plan") {
-        if (progressState === "error" && changeSessionId) {
-          this.changeSessions.setPhase("failed", changeSessionId);
-        } else if (progressState === "stopped" && changeSessionId) {
-          this.changeSessions.setPhase("stopped", changeSessionId);
-        } else if (
-          changeSessionId &&
-          !verificationResult &&
-          this.changeSessions.snapshot(changeSessionId)?.phase !== "complete"
-        ) {
-          this.changeSessions.setPhase("review", changeSessionId);
-        }
-      }
-
-      const storedProgress = [...progressSteps.values()].map((step): ToolProgressEntry =>
-        step.status === "running"
-          ? {
-              ...step,
-              status: progressState === "completed" ? "completed" : progressState,
-            }
-          : step,
-      );
-
-      conversation.transcript.push(userEntry, {
-        role: "assistant",
-        text: assistantText,
-        error: failed || undefined,
-        files: editedFiles.size > 0 ? [...editedFiles] : undefined,
-        progress: storedProgress.length > 0 ? storedProgress : undefined,
-        progressState: storedProgress.length > 0 ? progressState : undefined,
-      });
-      conversation.updatedAt = Date.now();
       runtime.live = undefined;
       runtime.mutating = false;
       runtime.overlappedMutation = false;
-      await this.saveConversations();
-      if (!this.conversations.some((candidate) => candidate.id === conversationId)) {
+      // Shutdown may deliberately stop waiting for a misbehaving SDK send.
+      // Late completion must only release local resources; storage, UI, hooks,
+      // and follow-up orchestration may already have been disposed.
+      if (!this.lifecycle.isDisposing) {
+        this.retainFinishedParallelTask(conversationId, progressState);
+        this.clearOrchestratorActivity(conversationId);
+        this.postParallelState();
+        this.postIfActive(conversationId, {
+          type: "idle",
+          activeRuns: this.activeRunCount(),
+        });
+
+        if (profile !== "plan") {
+          if (progressState === "error" && changeSessionId) {
+            this.changeSessions.setPhase("failed", changeSessionId);
+          } else if (progressState === "stopped" && changeSessionId) {
+            this.changeSessions.setPhase("stopped", changeSessionId);
+          } else if (
+            changeSessionId &&
+            !verificationResult &&
+            this.changeSessions.snapshot(changeSessionId)?.phase !== "complete"
+          ) {
+            this.changeSessions.setPhase("review", changeSessionId);
+          }
+        }
+
+        const storedProgress = [...progressSteps.values()].map((step): ToolProgressEntry =>
+          step.status === "running"
+            ? {
+                ...step,
+                status: progressState === "completed" ? "completed" : progressState,
+              }
+            : step,
+        );
+
+        conversation.transcript.push(userEntry, {
+          role: "assistant",
+          text: assistantText,
+          error: failed || undefined,
+          files: editedFiles.size > 0 ? [...editedFiles] : undefined,
+          progress: storedProgress.length > 0 ? storedProgress : undefined,
+          // Terminal state is recovery data, not merely tool-progress metadata.
+          // Persist it even when the run emitted no tool steps.
+          progressState,
+        });
+        conversation.updatedAt = Date.now();
+        await this.saveConversations();
+        if (!this.lifecycle.isDisposing) {
+          if (!this.conversations.some((candidate) => candidate.id === conversationId)) {
+            this.chatRuntimes.delete(conversationId);
+          }
+          if (this.showingHome) {
+            this.postView();
+          }
+          if (profile === "plan" && progressState === "completed") {
+            await this.captureExecutionPlan(effectivePrompt, conversationId, assistantText);
+          }
+          if (!this.lifecycle.isDisposing) {
+            await this.handleOrchestratorConversationComplete(
+              conversationId,
+              progressState,
+              assistantText,
+            );
+          }
+          if (!this.lifecycle.isDisposing) {
+            if (conversation.experimentGroupId) {
+              void this.maybeAutoSelectBestOfNWinner(conversation.experimentGroupId);
+            }
+            this.notifyRunComplete(conversation, progressState);
+            this.deferQueueDrain();
+          }
+        }
+      } else if (this.chatRuntimes.get(conversationId) === runtime) {
         this.chatRuntimes.delete(conversationId);
       }
-      if (this.showingHome) {
-        this.postView();
-      }
-      if (profile === "plan" && progressState === "completed") {
-        await this.captureExecutionPlan(effectivePrompt, conversationId, assistantText);
-      }
-      await this.handleOrchestratorConversationComplete(
-        conversationId,
-        progressState,
-        assistantText,
-      );
-      if (conversation.experimentGroupId) {
-        void this.maybeAutoSelectBestOfNWinner(conversation.experimentGroupId);
-      }
-      this.notifyRunComplete(conversation, progressState);
-      this.deferQueueDrain();
     }
     return true;
+    } finally {
+      finishSend();
+    }
   }
 
   private async reviewAutopilotEdits(sessionId?: string): Promise<void> {
@@ -8326,6 +8628,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     agentRoots: string[];
     priorAssistantText: string;
     model?: ModelSelection;
+    signal?: AbortSignal;
     pathEscapeLabel: string;
     missingBaselineMessage: (relative: string) => string;
     progressSteps: Map<string, ToolProgressEntry>;
@@ -8334,6 +8637,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     unresolved: Array<{ relative: string; error: string }>;
     text: string;
   }> {
+    const assertActive = (phase: string): void => {
+      if (!this.lifecycle.isDisposing && !input.signal?.aborted) {
+        return;
+      }
+      throw new RunPreparationError("cancelled", phase);
+    };
+    assertActive("preparing AI conflict resolution");
     const prepared: PreparedAiConflict[] = [];
     const unresolved: Array<{ relative: string; error: string }> = [];
     const originalByPath = new Map(
@@ -8341,6 +8651,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     );
     for (const conflict of input.conflicts) {
       try {
+        assertActive("preparing AI conflict resolution");
         const candidate = await prepareAiConflictResolution(
           input.session,
           input.storageRoot,
@@ -8350,6 +8661,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
             missingBaselineMessage: input.missingBaselineMessage,
           },
         );
+        assertActive("preparing AI conflict resolution");
         if (candidate) {
           prepared.push(candidate);
         } else {
@@ -8362,6 +8674,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           });
         }
       } catch (error) {
+        assertActive("preparing AI conflict resolution");
         unresolved.push({
           relative: conflict.relative,
           error: error instanceof Error ? error.message : String(error),
@@ -8389,6 +8702,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       resolveLabel,
       leaveLabel,
     );
+    assertActive("confirming AI conflict resolution");
     if (answer !== resolveLabel) {
       return { resolved: [], unresolved: [...input.conflicts], text: "" };
     }
@@ -8410,6 +8724,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const listedFiles = prepared.map((candidate) => `- ${candidate.relative}`).join("\n");
 
     try {
+      assertActive("starting AI conflict resolution");
       const trustSnapshot = vscode.workspace.isTrusted;
       const desiredRootsKey = [
         ...input.agentRoots.map((root) => path.resolve(root).toLowerCase()),
@@ -8461,6 +8776,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         listedFiles,
       ].join("\n");
       const resolutionRun = await (() => {
+        assertActive("starting AI conflict resolution");
         if (!agentSendBoundaryMatches(expectedBoundary, currentBoundary())) {
           throw new Error(
             localize(
@@ -8474,6 +8790,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           mode: "agent",
         });
       })();
+      assertActive("starting AI conflict resolution");
       input.runtime.run = resolutionRun;
       const resolutionEditedFiles = new Set<string>();
       const eventStream = resolutionRun.stream();
@@ -8491,6 +8808,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           ),
           terminalSignal,
         ]);
+        assertActive("streaming AI conflict resolution");
         if (outcome.type === "result") {
           result = outcome.result;
           void eventStream.return(undefined).catch(() => {});
@@ -8525,9 +8843,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         }
       }
       result ??= await resultPromise;
+      assertActive("finalizing AI conflict resolution");
       if (result.usage) {
         input.conversation.tokenUsage = addTokenUsage(input.conversation.tokenUsage, result.usage);
         await this.recordUsage("chat", result.usage);
+        assertActive("recording AI conflict-resolution usage");
       }
       if (result.status !== "finished") {
         const error =
@@ -8550,6 +8870,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       const resolved: string[] = [];
       for (const candidate of prepared) {
         try {
+          assertActive("applying AI conflict resolution");
           await applyAiConflictResolution(input.session, candidate, {
             pathEscapeLabel: input.pathEscapeLabel,
             changedMessage: localize(
@@ -8561,8 +8882,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
               "AIがファイル内に競合マーカーを残しました。",
             ),
           });
+          assertActive("applying AI conflict resolution");
           resolved.push(candidate.relative);
         } catch (error) {
+          assertActive("applying AI conflict resolution");
           unresolved.push({
             relative: candidate.relative,
             error: error instanceof Error ? error.message : String(error),
@@ -8578,6 +8901,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       this.postIfActive(input.conversationId, { type: "chunk", text: `\n\n${summary}` });
       return { resolved, unresolved, text };
     } catch (error) {
+      assertActive("handling AI conflict resolution");
       const message = error instanceof Error ? error.message : String(error);
       for (const candidate of prepared) {
         const original = originalByPath.get(candidate.relative);
@@ -8914,6 +9238,82 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private async cancelAllChats(clearQueues = true): Promise<void> {
     const conversationIds = [...this.chatRuntimes.keys()];
     await Promise.all(conversationIds.map((id) => this.cancelConversation(id, clearQueues)));
+  }
+
+  private trackPreparationOperation(operation: Promise<void>): void {
+    this.pendingPreparationOperations.add(operation);
+    void operation.then(
+      () => this.pendingPreparationOperations.delete(operation),
+      () => this.pendingPreparationOperations.delete(operation),
+    );
+  }
+
+  private async waitForShutdownOperation(
+    operation: Promise<unknown>,
+    label: string,
+  ): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      operation.then(
+        () => ({ kind: "completed" as const }),
+        (error: unknown) => ({ kind: "failed" as const, error }),
+      ),
+      new Promise<{ kind: "timeout" }>((resolve) => {
+        timer = setTimeout(
+          () => resolve({ kind: "timeout" }),
+          SHUTDOWN_CLEANUP_TIMEOUT_MS,
+        );
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) {
+      clearTimeout(timer);
+    }
+    if (outcome.kind === "failed") {
+      this.output.appendLine(
+        `[${new Date().toISOString()}] Shutdown cleanup failed while ${label}: ${
+          outcome.error instanceof Error ? outcome.error.message : String(outcome.error)
+        }`,
+      );
+    } else if (outcome.kind === "timeout") {
+      this.output.appendLine(
+        `[${new Date().toISOString()}] Shutdown cleanup timed out while ${label}.`,
+      );
+    }
+  }
+
+  private async waitForPendingPreparationOperations(): Promise<void> {
+    if (this.pendingPreparationOperations.size === 0) {
+      return;
+    }
+    await this.waitForShutdownOperation(
+      Promise.allSettled(this.pendingPreparationOperations),
+      "waiting for late Cursor runtime cleanup",
+    );
+  }
+
+  private async disposeAgentsForShutdown(): Promise<void> {
+    const disposals: Promise<void>[] = [];
+    for (const [id, runtime] of this.chatRuntimes) {
+      const agent = runtime.agent;
+      runtime.agent = undefined;
+      runtime.rootsKey = undefined;
+      if (agent) {
+        // Normalize synchronous throws as a rejected promise so one broken
+        // SDK handle cannot prevent the remaining agents from being cleaned up.
+        const disposal = Promise.resolve().then(() => agent[Symbol.asyncDispose]());
+        disposals.push(
+          this.waitForShutdownOperation(
+            disposal,
+            `disposing Cursor agent for conversation ${id}`,
+          ),
+        );
+      }
+      if (!runtime.busy) {
+        this.chatRuntimes.delete(id);
+      }
+    }
+    await Promise.allSettled(disposals);
   }
 
   private async disposeAgent(conversationId?: string): Promise<void> {

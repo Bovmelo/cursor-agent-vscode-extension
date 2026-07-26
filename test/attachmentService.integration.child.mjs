@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -55,6 +57,15 @@ try {
   }), undefined);
 
   await assertExternalBatchLimits(context, workspaceFolder, externalRoot, globalStorage);
+  await assertResolutionAbort(service, workspaceFolder, externalRoot);
+  await assertImageLoadingAbort(service, workspaceFolder, externalRoot);
+  await assertExternalStagingAbort(context, workspaceFolder, externalRoot, globalStorage);
+  await assertAbortPreservesExistingAttachments(
+    context,
+    workspaceFolder,
+    externalRoot,
+    globalStorage,
+  );
   await assertCleanupScope(service, globalStorage, tempRoot, conversation);
   await assertRecoveryRootValidation(service, globalStorage, tempRoot);
   await assertConversationDeletion(service, globalStorage, tempRoot);
@@ -79,6 +90,243 @@ async function assertExternalBatchLimits(context, workspaceFolder, externalRoot,
   const references = await service.stageExternalAttachments(files, workspaceFolder, conversation);
   assert.equal(references.length, 4, "only the configured aggregate byte limit is staged");
   assert.equal(conversation.attachmentRoot, path.join(globalStorage, "attachments", "batch-limit"));
+}
+
+async function assertResolutionAbort(service, workspaceFolder, externalRoot) {
+  const first = path.resolve(externalRoot, "resolve-abort-first.txt");
+  const second = path.resolve(externalRoot, "resolve-abort-second.txt");
+  await Promise.all([writeFile(first, "first"), writeFile(second, "second")]);
+  const controller = new AbortController();
+  const originalUriFile = Uri.file;
+  const originalStat = workspace.fs.stat;
+  let firstStats = 0;
+  let secondStats = 0;
+  Uri.file = (candidate) => {
+    const resolved = path.resolve(candidate);
+    return resolved === first || resolved === second
+      ? new Uri(candidate, "test-provider")
+      : originalUriFile(candidate);
+  };
+  workspace.fs.stat = async (uri) => {
+    const stat = await originalStat(uri);
+    const resolved = path.resolve(uri.fsPath);
+    if (resolved === first) {
+      firstStats += 1;
+      controller.abort();
+    } else if (resolved === second) {
+      secondStats += 1;
+    }
+    return stat;
+  };
+  try {
+    assert.deepEqual(
+      await service.resolveAttachedFiles(
+        [first, second],
+        workspaceFolder,
+        controller.signal,
+      ),
+      [],
+    );
+  } finally {
+    Uri.file = originalUriFile;
+    workspace.fs.stat = originalStat;
+  }
+  assert.equal(firstStats, 1, "the in-flight stat completes before cancellation");
+  assert.equal(secondStats, 0, "cancellation prevents the next file stat");
+}
+
+async function assertImageLoadingAbort(service, workspaceFolder, externalRoot) {
+  const first = path.resolve(externalRoot, "image-abort-first.png");
+  const second = path.resolve(externalRoot, "image-abort-second.png");
+  await Promise.all([
+    writeFile(first, Buffer.from([137, 80, 78, 71])),
+    writeFile(second, Buffer.from([137, 80, 78, 71, 1])),
+  ]);
+  const controller = new AbortController();
+  const originalUriFile = Uri.file;
+  const originalReadFile = workspace.fs.readFile;
+  const originalStat = workspace.fs.stat;
+  let firstReads = 0;
+  let firstStats = 0;
+  let secondReads = 0;
+  let secondStats = 0;
+  Uri.file = (candidate) => {
+    const resolved = path.resolve(candidate);
+    return resolved === first || resolved === second
+      ? new Uri(candidate, "test-provider")
+      : originalUriFile(candidate);
+  };
+  workspace.fs.stat = async (uri) => {
+    const stat = await originalStat(uri);
+    const resolved = path.resolve(uri.fsPath);
+    if (resolved === first) firstStats += 1;
+    if (resolved === second) secondStats += 1;
+    return stat;
+  };
+  workspace.fs.readFile = async (uri) => {
+    const data = await originalReadFile(uri);
+    const resolved = path.resolve(uri.fsPath);
+    if (resolved === first) {
+      firstReads += 1;
+      controller.abort();
+    } else if (resolved === second) {
+      secondReads += 1;
+    }
+    return data;
+  };
+  try {
+    assert.deepEqual(
+      await service.loadAttachedImages(
+        [first, second],
+        workspaceFolder,
+        controller.signal,
+      ),
+      [],
+    );
+  } finally {
+    Uri.file = originalUriFile;
+    workspace.fs.readFile = originalReadFile;
+    workspace.fs.stat = originalStat;
+  }
+  assert.equal(firstReads, 1, "the in-flight image read completes before cancellation");
+  assert.equal(firstStats, 1, "no post-read stability stat runs after cancellation");
+  assert.equal(secondReads, 0, "cancellation prevents the next image read");
+  assert.equal(secondStats, 0, "cancellation prevents the next image stat");
+}
+
+async function assertExternalStagingAbort(context, workspaceFolder, externalRoot, globalStorage) {
+  const first = path.resolve(externalRoot, "stage-abort-first.txt");
+  const second = path.resolve(externalRoot, "stage-abort-second.txt");
+  await Promise.all([writeFile(first, "first"), writeFile(second, "second")]);
+  const conversation = conversationRecord("stage-abort");
+  const attachmentRoot = path.join(globalStorage, "attachments", conversation.id);
+  const stagedFirst = path.join(
+    attachmentRoot,
+    `${createHash("sha256").update(first).digest("hex").slice(0, 12)}-${path.basename(first)}`,
+  );
+  const controller = new AbortController();
+  const signal = {
+    get aborted() {
+      if (!controller.signal.aborted && existsSync(stagedFirst)) controller.abort();
+      return controller.signal.aborted;
+    },
+  };
+  const originalUriFile = Uri.file;
+  const originalReadFile = workspace.fs.readFile;
+  let secondReads = 0;
+  Uri.file = (candidate) => path.resolve(candidate) === second
+    ? new Uri(candidate, "test-provider")
+    : originalUriFile(candidate);
+  workspace.fs.readFile = async (uri) => {
+    if (path.resolve(uri.fsPath) === second) secondReads += 1;
+    return originalReadFile(uri);
+  };
+  let saves = 0;
+  const service = new AttachmentService(context, false, async () => { saves += 1; });
+  try {
+    assert.deepEqual(
+      await service.stageExternalAttachments(
+        [first, second],
+        workspaceFolder,
+        conversation,
+        signal,
+      ),
+      [],
+    );
+  } finally {
+    Uri.file = originalUriFile;
+    workspace.fs.readFile = originalReadFile;
+  }
+  assert.equal(controller.signal.aborted, true, "the signal aborts after the first write");
+  assert.equal(secondReads, 0, "cancellation prevents reading the next external file");
+  assert.equal(saves, 0, "an aborted staging pass does not save conversations");
+  assert.equal(conversation.attachmentRoot, undefined);
+  assert.equal(
+    await exists(attachmentRoot),
+    false,
+    "a newly created staging root is removed after cancellation",
+  );
+}
+
+async function assertAbortPreservesExistingAttachments(
+  context,
+  workspaceFolder,
+  externalRoot,
+  globalStorage,
+) {
+  const source = path.resolve(externalRoot, "stage-abort-existing.txt");
+  await writeFile(source, "new");
+  const conversation = conversationRecord("stage-abort-existing");
+  const attachmentRoot = path.join(globalStorage, "attachments", conversation.id);
+  const existing = path.join(attachmentRoot, "existing.txt");
+  await mkdir(attachmentRoot);
+  await writeFile(existing, "keep");
+  const stagedSource = path.join(
+    attachmentRoot,
+    `${createHash("sha256").update(source).digest("hex").slice(0, 12)}-${path.basename(source)}`,
+  );
+  const controller = new AbortController();
+  const signal = {
+    get aborted() {
+      if (!controller.signal.aborted && existsSync(stagedSource)) controller.abort();
+      return controller.signal.aborted;
+    },
+  };
+  let saves = 0;
+  const service = new AttachmentService(context, false, async () => { saves += 1; });
+  assert.deepEqual(
+    await service.stageExternalAttachments(
+      [source],
+      workspaceFolder,
+      conversation,
+      signal,
+    ),
+    [],
+  );
+  assert.equal(saves, 0);
+  assert.equal(conversation.attachmentRoot, undefined);
+  assert.equal(await readFile(existing, "utf8"), "keep");
+  assert.equal(
+    await exists(stagedSource),
+    false,
+    "a file created by the aborted call is removed from an existing root",
+  );
+
+  const sameNameSource = path.resolve(externalRoot, "stage-abort-same-name.txt");
+  await writeFile(sameNameSource, "replacement");
+  const sameNameTarget = path.join(
+    attachmentRoot,
+    `${createHash("sha256").update(sameNameSource).digest("hex").slice(0, 12)}-${
+      path.basename(sameNameSource)
+    }`,
+  );
+  await writeFile(sameNameTarget, "original");
+  const sameNameController = new AbortController();
+  const sameNameSignal = {
+    get aborted() {
+      if (!sameNameController.signal.aborted
+        && readFileSync(sameNameTarget, "utf8") === "replacement") {
+        sameNameController.abort();
+      }
+      return sameNameController.signal.aborted;
+    },
+  };
+  assert.deepEqual(
+    await service.stageExternalAttachments(
+      [sameNameSource],
+      workspaceFolder,
+      conversationRecord(conversation.id),
+      sameNameSignal,
+    ),
+    [],
+  );
+  assert.equal(
+    await readFile(sameNameTarget, "utf8"),
+    "replacement",
+    "a same-name attachment that existed before the call is never deleted",
+  );
+  assert.equal(saves, 0);
+  await rm(attachmentRoot, { recursive: true });
 }
 
 async function assertWorkspaceImageBoundary(service, workspaceFolder, workspaceRoot, externalRoot) {

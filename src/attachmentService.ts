@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { Buffer } from "node:buffer";
+import type { BigIntStats } from "node:fs";
+import { lstat, realpath, unlink } from "node:fs/promises";
 import * as path from "node:path";
 import type { SDKImage } from "@cursor/sdk";
 import * as vscode from "vscode";
@@ -61,6 +63,13 @@ export interface AttachmentServiceLimits {
   maxBatchBytes?: number;
 }
 
+interface CreatedLocalAttachment {
+  root: vscode.Uri;
+  target: vscode.Uri;
+  rootIdentity: StableDirectoryIdentity;
+  fileIdentity: BigIntStats;
+}
+
 /** Owns attachment validation, staging, image loading, recovery, and cleanup. */
 export class AttachmentService {
   private pendingAttachmentRoot: Promise<vscode.Uri> | undefined;
@@ -87,10 +96,14 @@ export class AttachmentService {
   public async resolveAttachedFiles(
     requestedFiles: string[],
     workspace: vscode.WorkspaceFolder,
+    signal?: AbortSignal,
   ): Promise<string[]> {
+    if (signal?.aborted) return [];
     const resolved: string[] = [];
     for (const requested of [...new Set(requestedFiles)].slice(0, this.maxFiles)) {
+      if (signal?.aborted) return [];
       const workspaceAbsolute = await resolveAbsoluteInWorkspaceResolved(requested, workspace);
+      if (signal?.aborted) return [];
       const absolute = normalizeAttachedFilePath(requested, workspaceAbsolute);
       if (!absolute) continue;
       try {
@@ -98,17 +111,21 @@ export class AttachmentService {
         const folder = vscode.workspace.getWorkspaceFolder(uri);
         const allowedRoot = folder?.uri.fsPath ?? path.dirname(absolute);
         if (this.isLocalFile(uri)) {
-          if (!await validateStableLocalFile(
+          const valid = await validateStableLocalFile(
             allowedRoot,
             absolute,
             this.maxFileBytes,
-          )) continue;
+          );
+          if (signal?.aborted) return [];
+          if (!valid) continue;
         } else {
           const stat = await vscode.workspace.fs.stat(uri);
+          if (signal?.aborted) return [];
           if (!this.isRegularFile(stat) || stat.size > this.maxFileBytes) continue;
         }
         resolved.push((folder ? vscode.workspace.asRelativePath(uri, true) : absolute).replaceAll("\\", "/"));
       } catch {
+        if (signal?.aborted) return [];
         // Ignore stale or invalid file selections.
       }
     }
@@ -118,14 +135,18 @@ export class AttachmentService {
   public async loadAttachedImages(
     files: string[],
     workspace: vscode.WorkspaceFolder,
+    signal?: AbortSignal,
   ): Promise<SDKImage[]> {
+    if (signal?.aborted) return [];
     const images: SDKImage[] = [];
     let skippedLargeImages = 0;
     let totalBytes = 0;
     for (const file of files.slice(0, this.maxFiles)) {
+      if (signal?.aborted) return [];
       const format = IMAGE_FORMATS[path.extname(file).toLowerCase()];
       if (!format?.vision || images.length >= 8) continue;
       const workspaceAbsolute = await resolveAbsoluteInWorkspaceResolved(file, workspace);
+      if (signal?.aborted) return [];
       const absolute = normalizeAttachedFilePath(file, workspaceAbsolute);
       if (!absolute) continue;
       try {
@@ -137,7 +158,8 @@ export class AttachmentService {
             absolute,
             this.maxFileBytes,
           )
-          : await this.readProviderFile(uri);
+          : await this.readProviderFile(uri, signal);
+        if (signal?.aborted) return [];
         if (data.byteLength > this.maxFileBytes
           || totalBytes + data.byteLength > this.maxBatchBytes) {
           skippedLargeImages += 1;
@@ -146,9 +168,11 @@ export class AttachmentService {
         totalBytes += data.byteLength;
         images.push({ data: Buffer.from(data).toString("base64"), mimeType: format.mimeType });
       } catch {
+        if (signal?.aborted) return [];
         // Invalid or stale attachments are already omitted from the file list.
       }
     }
+    if (signal?.aborted) return [];
     if (skippedLargeImages > 0) {
       void vscode.window.showWarningMessage(this.localize(
         `${skippedLargeImages} image(s) exceeded the 20 MB image limit and were attached as files only.`,
@@ -241,12 +265,29 @@ export class AttachmentService {
     files: string[],
     workspace: vscode.WorkspaceFolder,
     conversation: Conversation,
+    signal?: AbortSignal,
   ): Promise<AttachedFileReference[]> {
+    if (signal?.aborted) return [];
     const root = path.resolve(workspace.uri.fsPath);
     const references: AttachedFileReference[] = [];
     let attachmentRootUri: vscode.Uri | undefined;
+    let attachmentRootCreatedForCall = false;
+    let createdAttachmentRootIdentity: StableDirectoryIdentity | undefined;
+    const createdLocalAttachments: CreatedLocalAttachment[] = [];
     let totalExternalBytes = 0;
+    const abortStaging = async (): Promise<AttachedFileReference[]> => {
+      await this.cleanupCreatedLocalAttachments(createdLocalAttachments);
+      if (attachmentRootUri && attachmentRootCreatedForCall) {
+        await this.cleanupAbortedExternalAttachmentRoot(
+          attachmentRootUri,
+          createdAttachmentRootIdentity,
+          conversation,
+        );
+      }
+      return [];
+    };
     for (const file of [...new Set(files)].slice(0, this.maxFiles)) {
+      if (signal?.aborted) return abortStaging();
       if (!path.isAbsolute(file)) {
         references.push({ displayPath: file, agentPath: file, external: false });
         continue;
@@ -271,35 +312,76 @@ export class AttachmentService {
             absolute,
             this.maxFileBytes,
           )
-          : await this.readProviderFile(sourceUri);
+          : await this.readProviderFile(sourceUri, signal);
       } catch {
+        if (signal?.aborted) return abortStaging();
         continue;
       }
+      if (signal?.aborted) return abortStaging();
       if (data.byteLength > this.maxFileBytes) continue;
       if (totalExternalBytes + data.byteLength > this.maxBatchBytes) break;
       totalExternalBytes += data.byteLength;
 
       if (!attachmentRootUri) {
         const candidateRoot = this.conversationAttachmentRoot(conversation.id);
-        if (!await this.ensureRegularManagedRoot(candidateRoot)) break;
         attachmentRootUri = candidateRoot;
+        const existed = await this.isExistingRegularManagedRoot(candidateRoot, signal);
+        if (signal?.aborted) return abortStaging();
+        attachmentRootCreatedForCall = !existed;
+        if (!await this.ensureRegularManagedRoot(candidateRoot, signal)) {
+          if (signal?.aborted) return abortStaging();
+          attachmentRootUri = undefined;
+          attachmentRootCreatedForCall = false;
+          break;
+        }
+        if (attachmentRootCreatedForCall && this.isLocalFile(candidateRoot)) {
+          createdAttachmentRootIdentity =
+            await this.captureLocalManagedAttachmentRoot(candidateRoot);
+          if (signal?.aborted) return abortStaging();
+        }
       }
       const hash = createHash("sha256").update(absolute).digest("hex").slice(0, 12);
       const safeName = sanitizeAttachmentFileName(absolute);
       const stagedUri = vscode.Uri.joinPath(attachmentRootUri, `${hash}-${safeName}`);
       if (!isDirectChildPath(attachmentRootUri.fsPath, stagedUri.fsPath)) continue;
+      if (signal?.aborted) return abortStaging();
       let written: boolean;
       if (this.isLocalFile(stagedUri)) {
         const stableRoot = await this.captureLocalManagedAttachmentRoot(attachmentRootUri);
+        if (signal?.aborted) return abortStaging();
+        const targetExisted = !stableRoot
+          || await this.localManagedTargetExists(
+            attachmentRootUri,
+            stagedUri,
+            stableRoot,
+          );
+        if (signal?.aborted) return abortStaging();
         written = Boolean(stableRoot) && await writeStableLocalFile(
           attachmentRootUri.fsPath,
           stagedUri.fsPath,
           data,
           stableRoot,
         );
+        const abortedAfterWrite = signal?.aborted === true;
+        if (written && stableRoot && !targetExisted) {
+          const created = await this.captureCreatedLocalAttachment(
+            attachmentRootUri,
+            stagedUri,
+            stableRoot,
+            data.byteLength,
+          );
+          if (created) createdLocalAttachments.push(created);
+        }
+        if (abortedAfterWrite || signal?.aborted) return abortStaging();
       } else {
-        written = await this.writeProviderManagedFile(attachmentRootUri, stagedUri, data);
+        written = await this.writeProviderManagedFile(
+          attachmentRootUri,
+          stagedUri,
+          data,
+          signal,
+        );
       }
+      if (signal?.aborted) return abortStaging();
       if (!written) break;
       const pendingLabel = this.pendingAttachmentLabels.get(this.canonicalPath(absolute));
       references.push({
@@ -309,8 +391,10 @@ export class AttachmentService {
       });
     }
     if (attachmentRootUri) {
+      if (signal?.aborted) return abortStaging();
       conversation.attachmentRoot = attachmentRootUri.fsPath;
       await this.saveConversations();
+      if (signal?.aborted) return [];
     }
     return references;
   }
@@ -582,46 +666,172 @@ export class AttachmentService {
     return isDirectChildPath(this.attachmentsRoot().fsPath, candidate);
   }
 
-  private async ensureRegularManagedRoot(candidate: vscode.Uri): Promise<boolean> {
+  private async localManagedTargetExists(
+    root: vscode.Uri,
+    target: vscode.Uri,
+    expectedRoot: StableDirectoryIdentity,
+  ): Promise<boolean> {
+    if (!isDirectChildPath(root.fsPath, target.fsPath)) return true;
+    try {
+      const currentRoot = await this.captureLocalManagedAttachmentRoot(root);
+      if (!currentRoot || !sameDirectoryIdentity(expectedRoot, currentRoot)) return true;
+      await lstat(target.fsPath, { bigint: true });
+      return true;
+    } catch (error) {
+      return !isNodeError(error, "ENOENT");
+    }
+  }
+
+  private async captureCreatedLocalAttachment(
+    root: vscode.Uri,
+    target: vscode.Uri,
+    expectedRoot: StableDirectoryIdentity,
+    expectedSize: number,
+  ): Promise<CreatedLocalAttachment | undefined> {
+    if (!isDirectChildPath(root.fsPath, target.fsPath)) return undefined;
+    try {
+      const currentRoot = await this.captureLocalManagedAttachmentRoot(root);
+      if (!currentRoot || !sameDirectoryIdentity(expectedRoot, currentRoot)) return undefined;
+      const [fileIdentity, canonicalFile] = await Promise.all([
+        lstat(target.fsPath, { bigint: true }),
+        realpath(target.fsPath),
+      ]);
+      if (!fileIdentity.isFile()
+        || fileIdentity.isSymbolicLink()
+        || fileIdentity.nlink !== 1n
+        || fileIdentity.size !== BigInt(expectedSize)
+        || !isDirectChildPath(currentRoot.canonicalPath, canonicalFile)) return undefined;
+      return { root, target, rootIdentity: currentRoot, fileIdentity };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async cleanupCreatedLocalAttachments(
+    created: readonly CreatedLocalAttachment[],
+  ): Promise<void> {
+    for (const attachment of [...created].reverse()) {
+      try {
+        if (!isDirectChildPath(attachment.root.fsPath, attachment.target.fsPath)) continue;
+        const currentRoot = await this.captureLocalManagedAttachmentRoot(attachment.root);
+        if (!currentRoot
+          || !sameDirectoryIdentity(attachment.rootIdentity, currentRoot)) continue;
+        const [current, canonicalFile] = await Promise.all([
+          lstat(attachment.target.fsPath, { bigint: true }),
+          realpath(attachment.target.fsPath),
+        ]);
+        if (!sameLocalFileSnapshot(attachment.fileIdentity, current)
+          || current.isSymbolicLink()
+          || !current.isFile()
+          || current.nlink !== 1n
+          || !isDirectChildPath(currentRoot.canonicalPath, canonicalFile)) continue;
+        const final = await lstat(attachment.target.fsPath, { bigint: true });
+        if (!sameLocalFileSnapshot(current, final)
+          || final.isSymbolicLink()
+          || !final.isFile()
+          || final.nlink !== 1n) continue;
+        await unlink(attachment.target.fsPath);
+      } catch {
+        // A replaced or concurrently used file must be retained.
+      }
+    }
+  }
+
+  private async cleanupAbortedExternalAttachmentRoot(
+    candidate: vscode.Uri,
+    expectedCandidate: StableDirectoryIdentity | undefined,
+    conversation: Conversation,
+  ): Promise<void> {
+    if (!this.isLocalFile(candidate)
+      || !this.isManagedAttachmentRoot(candidate.fsPath)
+      || (conversation.attachmentRoot
+        && this.canonicalPath(conversation.attachmentRoot)
+          === this.canonicalPath(candidate.fsPath))) return;
+    try {
+      const entries = await vscode.workspace.fs.readDirectory(candidate);
+      // Every file created by this call was identity-checked and removed
+      // above. Anything left may belong to another actor, so retain the root.
+      if (entries.length > 0) return;
+      const managedParent = await captureStableDirectChildDirectory(
+        this.context.globalStorageUri.fsPath,
+        this.attachmentsRoot().fsPath,
+      );
+      const managedCandidate = await captureStableDirectChildDirectory(
+        this.attachmentsRoot().fsPath,
+        candidate.fsPath,
+      );
+      if (!sameDirectoryIdentity(managedParent.candidate, managedCandidate.parent)
+        || (expectedCandidate
+          && !sameDirectoryIdentity(expectedCandidate, managedCandidate.candidate))) return;
+      await removeStableLocalDirectory(
+        this.attachmentsRoot().fsPath,
+        candidate.fsPath,
+        managedParent.candidate,
+        managedCandidate.candidate,
+      );
+    } catch {
+      // A changed or concurrently used root is safer to retain for orphan cleanup.
+    }
+  }
+
+  private async ensureRegularManagedRoot(
+    candidate: vscode.Uri,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     const attachmentsRoot = this.attachmentsRoot();
-    if (!this.isManagedAttachmentRoot(candidate.fsPath)) return false;
+    if (signal?.aborted || !this.isManagedAttachmentRoot(candidate.fsPath)) return false;
     try {
       await vscode.workspace.fs.createDirectory(attachmentsRoot);
+      if (signal?.aborted) return false;
       await vscode.workspace.fs.createDirectory(candidate);
+      if (signal?.aborted) return false;
       if (this.isLocalFile(candidate)) {
         const managedParent = await captureStableDirectChildDirectory(
           this.context.globalStorageUri.fsPath,
           attachmentsRoot.fsPath,
         );
+        if (signal?.aborted) return false;
         const managedCandidate = await captureStableDirectChildDirectory(
           attachmentsRoot.fsPath,
           candidate.fsPath,
         );
+        if (signal?.aborted) return false;
         return sameDirectoryIdentity(managedParent.candidate, managedCandidate.parent);
       }
-      if (!this.isRegularDirectory(await vscode.workspace.fs.stat(attachmentsRoot))) return false;
-      return this.isRegularDirectory(await vscode.workspace.fs.stat(candidate));
+      const rootStat = await vscode.workspace.fs.stat(attachmentsRoot);
+      if (signal?.aborted || !this.isRegularDirectory(rootStat)) return false;
+      const candidateStat = await vscode.workspace.fs.stat(candidate);
+      if (signal?.aborted) return false;
+      return this.isRegularDirectory(candidateStat);
     } catch {
       return false;
     }
   }
 
-  private async isExistingRegularManagedRoot(candidate: vscode.Uri): Promise<boolean> {
-    if (!this.isManagedAttachmentRoot(candidate.fsPath)) return false;
+  private async isExistingRegularManagedRoot(
+    candidate: vscode.Uri,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    if (signal?.aborted || !this.isManagedAttachmentRoot(candidate.fsPath)) return false;
     try {
       if (this.isLocalFile(candidate)) {
         const managedParent = await captureStableDirectChildDirectory(
           this.context.globalStorageUri.fsPath,
           this.attachmentsRoot().fsPath,
         );
+        if (signal?.aborted) return false;
         const managedCandidate = await captureStableDirectChildDirectory(
           this.attachmentsRoot().fsPath,
           candidate.fsPath,
         );
+        if (signal?.aborted) return false;
         return sameDirectoryIdentity(managedParent.candidate, managedCandidate.parent);
       }
-      return this.isRegularDirectory(await vscode.workspace.fs.stat(this.attachmentsRoot()))
-        && this.isRegularDirectory(await vscode.workspace.fs.stat(candidate));
+      const rootStat = await vscode.workspace.fs.stat(this.attachmentsRoot());
+      if (signal?.aborted || !this.isRegularDirectory(rootStat)) return false;
+      const candidateStat = await vscode.workspace.fs.stat(candidate);
+      if (signal?.aborted) return false;
+      return this.isRegularDirectory(candidateStat);
     } catch {
       return false;
     }
@@ -660,13 +870,20 @@ export class AttachmentService {
       && (stat.type & vscode.FileType.SymbolicLink) === 0;
   }
 
-  private async readProviderFile(uri: vscode.Uri): Promise<Uint8Array> {
+  private async readProviderFile(
+    uri: vscode.Uri,
+    signal?: AbortSignal,
+  ): Promise<Uint8Array> {
+    if (signal?.aborted) throw new Error("Attachment read was aborted.");
     const before = await vscode.workspace.fs.stat(uri);
+    if (signal?.aborted) throw new Error("Attachment read was aborted.");
     if (!this.isRegularFile(before) || before.size > this.maxFileBytes) {
       throw new Error("Attachment source is not a permitted regular file.");
     }
     const data = await vscode.workspace.fs.readFile(uri);
+    if (signal?.aborted) throw new Error("Attachment read was aborted.");
     const after = await vscode.workspace.fs.stat(uri);
+    if (signal?.aborted) throw new Error("Attachment read was aborted.");
     if (!this.isRegularFile(after)
       || before.type !== after.type
       || before.size !== after.size
@@ -683,16 +900,20 @@ export class AttachmentService {
     root: vscode.Uri,
     target: vscode.Uri,
     data: Uint8Array,
+    signal?: AbortSignal,
   ): Promise<boolean> {
-    if (!isDirectChildPath(root.fsPath, target.fsPath)) return false;
+    if (signal?.aborted || !isDirectChildPath(root.fsPath, target.fsPath)) return false;
     try {
       const before = await vscode.workspace.fs.stat(root);
+      if (signal?.aborted) return false;
       if (!this.isRegularDirectory(before)) return false;
       await vscode.workspace.fs.writeFile(target, data);
+      if (signal?.aborted) return false;
       const [rootAfter, targetAfter] = await Promise.all([
         vscode.workspace.fs.stat(root),
         vscode.workspace.fs.stat(target),
       ]);
+      if (signal?.aborted) return false;
       return this.isRegularDirectory(rootAfter)
         && this.isRegularFile(targetAfter)
         && targetAfter.size === data.byteLength;
@@ -719,4 +940,23 @@ function positiveLimit(value: number | undefined, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0
     ? Math.floor(value)
     : fallback;
+}
+
+function sameLocalFileSnapshot(left: BigIntStats, right: BigIntStats): boolean {
+  const sameIdentity = left.ino !== 0n
+    && right.ino !== 0n
+    && left.ino === right.ino
+    && (process.platform !== "win32"
+      ? left.dev === right.dev
+      : left.dev === right.dev || left.dev === 0n || right.dev === 0n);
+  return sameIdentity
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+function isNodeError(error: unknown, code: string): boolean {
+  return error instanceof Error
+    && "code" in error
+    && (error as NodeJS.ErrnoException).code === code;
 }

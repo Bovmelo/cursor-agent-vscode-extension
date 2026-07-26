@@ -22,6 +22,7 @@ export interface RunExecutableCommandOptions {
   timeout?: number;
   maxBuffer: number;
   env?: NodeJS.ProcessEnv;
+  signal?: AbortSignal;
 }
 
 /**
@@ -173,6 +174,7 @@ export async function runExecutableCommand(
     timeout: options.timeout,
     maxBuffer: options.maxBuffer,
     env: options.env ?? minimalShellEnv(),
+    signal: options.signal,
     encoding: "utf8",
   });
 }
@@ -183,6 +185,7 @@ export async function runConfiguredCommand(
     cwd: string;
     timeout: number;
     maxBuffer: number;
+    signal?: AbortSignal;
   },
 ): Promise<{ stdout: string; stderr: string }> {
   const parsed = parseCommandLine(command);
@@ -190,5 +193,6 @@ export async function runConfiguredCommand(
     cwd: options.cwd,
     timeout: options.timeout,
     maxBuffer: options.maxBuffer,
+    signal: options.signal,
   });
 }

@@ -22,6 +22,8 @@ export interface OrchestratorExperiment {
   prompt: string;
   createdAt: number;
   planAttempts?: number;
+  /** Completed plan attempts that predate the current plan conversation. */
+  planResponseBaseline?: number;
   planConversationId?: string;
   synthesisConversationId?: string;
   /** Conversation that invoked /orchestrate (normal chat only). */
@@ -92,6 +94,7 @@ export function createOrchestratorExperiment(
     prompt,
     createdAt: Date.now(),
     planAttempts: 1,
+    planResponseBaseline: 0,
     subtasks: [],
     status: "planning",
     sourceConversationId: options?.sourceConversationId,
@@ -431,13 +434,114 @@ export function buildSynthesisPrompt(experiment: OrchestratorExperiment): string
 export interface OrchestratorResumeLaunch {
   prompt: string;
   conversationId: string;
-  kind: "subtask" | "synthesis";
+  kind: "plan" | "subtask" | "synthesis";
+}
+
+export interface OrchestratorCompletedPlan {
+  conversationId: string;
+  assistantText: string;
+}
+
+export interface OrchestratorTerminalPlan {
+  conversationId: string;
+  progressState: "stopped" | "error";
+  assistantText: string;
 }
 
 /**
- * After an extension-host restart, chat queues are empty. Reset stuck
- * `running` subtasks to `pending` and collect launches for pending subtasks
- * plus mid-synthesis runs that already have a synthesis conversation.
+ * Number of assistant responses the current plan conversation must contain
+ * before its latest response belongs to the active attempt.
+ */
+export function expectedPlanConversationResponses(
+  experiment: OrchestratorExperiment,
+): number {
+  const attempts = Math.max(1, Math.trunc(experiment.planAttempts ?? 1));
+  const baseline = Math.min(
+    attempts - 1,
+    Math.max(0, Math.trunc(experiment.planResponseBaseline ?? 0)),
+  );
+  return attempts - baseline;
+}
+
+export interface OrchestratorPlanResponseEntry {
+  role: "user" | "assistant";
+  text: string;
+  error?: boolean;
+  progressState?: "completed" | "stopped" | "error";
+}
+
+export type OrchestratorPlanResponseOutcome =
+  | { kind: "pending" }
+  | { kind: "completed"; assistantText: string }
+  | {
+      kind: "terminal";
+      progressState: "stopped" | "error";
+      assistantText: string;
+    };
+
+function isLegacyStoppedPlanResponse(text: string): boolean {
+  const normalized = text.trim();
+  return normalized === "(Stopped)" || normalized === "（停止しました）";
+}
+
+/**
+ * Classify the latest planner response for the active attempt. Terminal
+ * responses count toward the attempt baseline, but remain distinct from both
+ * a completed response and an unanswered attempt.
+ */
+export function classifyOrchestratorPlanResponse(
+  entries: readonly OrchestratorPlanResponseEntry[],
+  expectedResponseCount: number,
+): OrchestratorPlanResponseOutcome {
+  const assistantResponses = entries.filter((entry) => entry.role === "assistant");
+  if (assistantResponses.length < Math.max(1, Math.trunc(expectedResponseCount))) {
+    return { kind: "pending" };
+  }
+  const latest = assistantResponses.at(-1);
+  if (!latest) {
+    return { kind: "pending" };
+  }
+  if (latest.progressState === "stopped") {
+    return {
+      kind: "terminal",
+      progressState: "stopped",
+      assistantText: latest.text,
+    };
+  }
+  if (latest.progressState === "error" || latest.error) {
+    return {
+      kind: "terminal",
+      progressState: "error",
+      assistantText: latest.text,
+    };
+  }
+  if (isLegacyStoppedPlanResponse(latest.text)) {
+    return {
+      kind: "terminal",
+      progressState: "stopped",
+      assistantText: latest.text,
+    };
+  }
+  return { kind: "completed", assistantText: latest.text };
+}
+
+/**
+ * Return the latest successful response once the current conversation has
+ * produced enough responses for the active plan attempt.
+ */
+export function completedOrchestratorPlanResponse(
+  entries: readonly OrchestratorPlanResponseEntry[],
+  expectedResponseCount: number,
+): string | undefined {
+  const outcome = classifyOrchestratorPlanResponse(entries, expectedResponseCount);
+  return outcome.kind === "completed" ? outcome.assistantText : undefined;
+}
+
+/**
+ * After an extension-host restart, chat queues are empty. Collect launches
+ * for planning runs, reset stuck `running` subtasks to `pending`, and collect
+ * launches for pending subtasks plus mid-synthesis runs whose conversations
+ * still exist.
  * Experiments stuck in `synthesizing` without a conversation id are left for
  * the caller to materialize (conversation creation is side-effectful).
  */
@@ -447,15 +551,81 @@ export function prepareOrchestratorResume(
     conversationExists: (conversationId: string) => boolean;
     isBusy: (conversationId: string) => boolean;
     isQueued: (conversationId: string) => boolean;
+    completedPlanResponse?: (
+      conversationId: string,
+      expectedResponseCount: number,
+    ) => string | undefined;
+    planResponseOutcome?: (
+      conversationId: string,
+      expectedResponseCount: number,
+    ) => OrchestratorPlanResponseOutcome;
   },
 ): {
   experiments: OrchestratorExperiment[];
   launches: OrchestratorResumeLaunch[];
+  completedPlans: OrchestratorCompletedPlan[];
+  terminalPlans: OrchestratorTerminalPlan[];
+  needsPlanConversation: string[];
   needsSynthesisConversation: string[];
 } {
   const launches: OrchestratorResumeLaunch[] = [];
+  const completedPlans: OrchestratorCompletedPlan[] = [];
+  const terminalPlans: OrchestratorTerminalPlan[] = [];
+  const needsPlanConversation: string[] = [];
   const needsSynthesisConversation: string[] = [];
   const updated = experiments.map((experiment) => {
+    if (experiment.status === "planning") {
+      const planId = experiment.planConversationId;
+      if (!planId || !options.conversationExists(planId)) {
+        needsPlanConversation.push(experiment.id);
+        return experiment;
+      }
+      if (options.isBusy(planId) || options.isQueued(planId)) {
+        return experiment;
+      }
+      const expectedAttempt = experiment.planAttempts ?? 1;
+      const expectedResponseCount = expectedPlanConversationResponses(experiment);
+      const outcome = options.planResponseOutcome?.(planId, expectedResponseCount);
+      if (outcome?.kind === "completed") {
+        completedPlans.push({
+          conversationId: planId,
+          assistantText: outcome.assistantText,
+        });
+        return experiment;
+      }
+      if (outcome?.kind === "terminal") {
+        terminalPlans.push({
+          conversationId: planId,
+          progressState: outcome.progressState,
+          assistantText: outcome.assistantText,
+        });
+        return experiment;
+      }
+      if (!outcome) {
+        const completedResponse = options.completedPlanResponse?.(
+          planId,
+          expectedResponseCount,
+        );
+        if (completedResponse !== undefined) {
+          completedPlans.push({
+            conversationId: planId,
+            assistantText: completedResponse,
+          });
+          return experiment;
+        }
+      }
+      launches.push({
+        prompt: buildOrchestratorPlanPrompt(
+          experiment.prompt,
+          expectedAttempt > 1,
+          experiment.sourceTranscriptExcerpt,
+        ),
+        conversationId: planId,
+        kind: "plan",
+      });
+      return experiment;
+    }
+
     if (experiment.status === "running") {
       let changed = false;
       const subtasks = experiment.subtasks.map((subtask) => {
@@ -508,7 +678,14 @@ export function prepareOrchestratorResume(
     return experiment;
   });
 
-  return { experiments: updated, launches, needsSynthesisConversation };
+  return {
+    experiments: updated,
+    launches,
+    completedPlans,
+    terminalPlans,
+    needsPlanConversation,
+    needsSynthesisConversation,
+  };
 }
 
 export function orchestratorSummaries(

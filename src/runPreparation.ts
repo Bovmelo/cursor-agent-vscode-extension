@@ -19,6 +19,7 @@ export interface RunPreparationOptions<T> {
   timeoutMs: number;
   phase: string;
   onLateResolve?: (value: T) => void | Promise<void>;
+  onOperationSettled?: (completion: Promise<void>) => void;
 }
 
 /**
@@ -69,10 +70,10 @@ export function waitForRunPreparation<T>(
       rejectOnce(error);
       return;
     }
-    operationPromise.then(
-      (value) => {
+    const completion = operationPromise.then(
+      async (value) => {
         if (finished) {
-          Promise.resolve(options.onLateResolve?.(value)).catch(() => {});
+          await options.onLateResolve?.(value);
           return;
         }
         finished = true;
@@ -82,7 +83,11 @@ export function waitForRunPreparation<T>(
       (error: unknown) => {
         rejectOnce(error);
       },
+    ).then(
+      () => {},
+      () => {},
     );
+    options.onOperationSettled?.(completion);
   });
 }
 

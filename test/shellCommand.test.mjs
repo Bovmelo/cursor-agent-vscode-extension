@@ -122,6 +122,47 @@ test("runConfiguredCommand can spawn a platform command without EINVAL", async (
   }
 });
 
+test("runExecutableCommand stops an active child when its signal aborts", async () => {
+  const controller = new AbortController();
+  const command = runExecutableCommand(
+    process.execPath,
+    ["-e", "setInterval(() => {}, 1_000)"],
+    {
+      cwd: tmpdir(),
+      timeout: 60_000,
+      maxBuffer: 1024 * 1024,
+      signal: controller.signal,
+    },
+  );
+  setTimeout(() => controller.abort(), 50);
+
+  await assert.rejects(
+    () => command,
+    (error) => {
+      assert.equal(error?.name, "AbortError");
+      return true;
+    },
+  );
+});
+
+test("runConfiguredCommand forwards a pre-aborted signal", async () => {
+  const controller = new AbortController();
+  controller.abort();
+
+  await assert.rejects(
+    () => runConfiguredCommand(`"${process.execPath}" --version`, {
+      cwd: tmpdir(),
+      timeout: 60_000,
+      maxBuffer: 1024 * 1024,
+      signal: controller.signal,
+    }),
+    (error) => {
+      assert.equal(error?.name, "AbortError");
+      return true;
+    },
+  );
+});
+
 test("GitHub CLI environment forwards auth without unrelated secrets", () => {
   const previousToken = process.env.GH_TOKEN;
   const previousUnrelated = process.env.CURSOR_TEST_UNRELATED_SECRET;

@@ -9,7 +9,10 @@ import {
   buildOrchestratorDetail,
   buildOrchestratorPlanPrompt,
   buildSynthesisPrompt,
+  classifyOrchestratorPlanResponse,
+  completedOrchestratorPlanResponse,
   createOrchestratorExperiment,
+  expectedPlanConversationResponses,
   extractSubagentName,
   formatTranscriptForHandoff,
   launchOrchestratorSubtasks,
@@ -374,6 +377,283 @@ test("orchestrator resume resets running subtasks to pending and re-enqueues", (
     ["c1", "c2"],
   );
   assert.equal(prepared.needsSynthesisConversation.length, 0);
+  assert.equal(prepared.needsPlanConversation.length, 0);
+  assert.equal(prepared.completedPlans.length, 0);
+  assert.equal(prepared.terminalPlans.length, 0);
+});
+
+test("orchestrator resume re-queues persisted planning runs when idle", () => {
+  const planning = {
+    ...createOrchestratorExperiment("split this work", {
+      sourceTranscriptExcerpt: "### User\nPrior context",
+    }),
+    planConversationId: "plan-1",
+  };
+  const retrying = {
+    ...createOrchestratorExperiment("retry this plan"),
+    planAttempts: 2,
+    planConversationId: "plan-2",
+  };
+  const missing = {
+    ...createOrchestratorExperiment("missing conversation"),
+    planConversationId: "missing",
+  };
+  const busy = {
+    ...createOrchestratorExperiment("busy plan"),
+    planConversationId: "busy",
+  };
+  const queued = {
+    ...createOrchestratorExperiment("queued plan"),
+    planConversationId: "queued",
+  };
+  const withoutConversation = createOrchestratorExperiment("no conversation");
+
+  const prepared = prepareOrchestratorResume(
+    [planning, retrying, missing, busy, queued, withoutConversation],
+    {
+      conversationExists: (id) => id !== "missing",
+      isBusy: (id) => id === "busy",
+      isQueued: (id) => id === "queued",
+    },
+  );
+
+  assert.deepEqual(
+    prepared.launches.map((launch) => ({
+      conversationId: launch.conversationId,
+      kind: launch.kind,
+    })),
+    [
+      { conversationId: "plan-1", kind: "plan" },
+      { conversationId: "plan-2", kind: "plan" },
+    ],
+  );
+  assert.match(prepared.launches[0].prompt, /Create a parallel execution plan/);
+  assert.match(prepared.launches[0].prompt, /Prior context/);
+  assert.match(prepared.launches[1].prompt, /previous response omitted/);
+  assert.deepEqual(prepared.needsPlanConversation, [
+    missing.id,
+    withoutConversation.id,
+  ]);
+  assert.equal(prepared.completedPlans.length, 0);
+  assert.equal(prepared.terminalPlans.length, 0);
+});
+
+test("orchestrator resume reconciles an unprocessed persisted planner response", () => {
+  const completed = {
+    ...createOrchestratorExperiment("split completed plan"),
+    planConversationId: "plan-completed",
+  };
+  const processedRetry = {
+    ...createOrchestratorExperiment("retry already processed"),
+    planAttempts: 2,
+    planConversationId: "plan-retry",
+  };
+  const responses = new Map([
+    ["plan-completed", [{
+      role: "assistant",
+      text: "<ORCHESTRATOR_SUBTASKS>[]</ORCHESTRATOR_SUBTASKS>",
+      progressState: "completed",
+    }]],
+    ["plan-retry", [{
+      role: "assistant",
+      text: "first malformed response",
+      progressState: "completed",
+    }]],
+  ]);
+
+  const prepared = prepareOrchestratorResume([completed, processedRetry], {
+    conversationExists: () => true,
+    isBusy: () => false,
+    isQueued: () => false,
+    planResponseOutcome: (conversationId, expectedResponseCount) =>
+      classifyOrchestratorPlanResponse(
+        responses.get(conversationId) ?? [],
+        expectedResponseCount,
+      ),
+  });
+
+  assert.deepEqual(prepared.completedPlans, [{
+    conversationId: "plan-completed",
+    assistantText: "<ORCHESTRATOR_SUBTASKS>[]</ORCHESTRATOR_SUBTASKS>",
+  }]);
+  assert.deepEqual(
+    prepared.launches.map((launch) => launch.conversationId),
+    ["plan-retry"],
+  );
+  assert.match(prepared.launches[0].prompt, /previous response omitted/);
+});
+
+test("orchestrator resume reconciles the first response from a recreated retry conversation", () => {
+  const recreatedRetry = {
+    ...createOrchestratorExperiment("retry in a replacement conversation"),
+    planAttempts: 2,
+    planResponseBaseline: 1,
+    planConversationId: "replacement-plan",
+  };
+  const responses = [{
+    role: "assistant",
+    text: "<ORCHESTRATOR_SUBTASKS>[]</ORCHESTRATOR_SUBTASKS>",
+    progressState: "completed",
+  }];
+  const requestedCounts = [];
+
+  assert.equal(expectedPlanConversationResponses(recreatedRetry), 1);
+  const prepared = prepareOrchestratorResume([recreatedRetry], {
+    conversationExists: () => true,
+    isBusy: () => false,
+    isQueued: () => false,
+    planResponseOutcome: (_conversationId, expectedResponseCount) => {
+      requestedCounts.push(expectedResponseCount);
+      return classifyOrchestratorPlanResponse(responses, expectedResponseCount);
+    },
+  });
+
+  assert.deepEqual(requestedCounts, [1]);
+  assert.deepEqual(prepared.completedPlans, [{
+    conversationId: "replacement-plan",
+    assistantText: "<ORCHESTRATOR_SUBTASKS>[]</ORCHESTRATOR_SUBTASKS>",
+  }]);
+  assert.deepEqual(prepared.launches, []);
+});
+
+test("orchestrator recovery never treats stopped planner placeholders as successful", () => {
+  assert.deepEqual(classifyOrchestratorPlanResponse([{
+    role: "assistant",
+    text: "first attempt",
+    progressState: "completed",
+  }], 2), { kind: "pending" });
+  assert.deepEqual(classifyOrchestratorPlanResponse([{
+    role: "assistant",
+    text: "first attempt",
+    progressState: "completed",
+  }, {
+    role: "assistant",
+    text: "cancelled retry",
+    progressState: "stopped",
+  }], 2), {
+    kind: "terminal",
+    progressState: "stopped",
+    assistantText: "cancelled retry",
+  });
+  assert.deepEqual(classifyOrchestratorPlanResponse([{
+    role: "assistant",
+    text: "planner process failed",
+    progressState: "error",
+  }], 1), {
+    kind: "terminal",
+    progressState: "error",
+    assistantText: "planner process failed",
+  });
+  assert.deepEqual(classifyOrchestratorPlanResponse([{
+    role: "assistant",
+    text: " （停止しました） ",
+  }], 1), {
+    kind: "terminal",
+    progressState: "stopped",
+    assistantText: " （停止しました） ",
+  });
+  assert.deepEqual(classifyOrchestratorPlanResponse([{
+    role: "assistant",
+    text: "legacy failed response",
+    error: true,
+  }], 1), {
+    kind: "terminal",
+    progressState: "error",
+    assistantText: "legacy failed response",
+  });
+  assert.equal(completedOrchestratorPlanResponse([{
+    role: "assistant",
+    text: "(Stopped)",
+    progressState: "stopped",
+  }], 1), undefined);
+  assert.equal(completedOrchestratorPlanResponse([{
+    role: "assistant",
+    text: "(Stopped)",
+  }], 1), undefined);
+  assert.equal(completedOrchestratorPlanResponse([{
+    role: "assistant",
+    text: "valid legacy response",
+  }], 1), "valid legacy response");
+});
+
+test("orchestrator resume reports terminal planner responses instead of re-launching", () => {
+  const stoppedRetry = {
+    ...createOrchestratorExperiment("stopped retry"),
+    planAttempts: 2,
+    planConversationId: "plan-stopped",
+  };
+  const errored = {
+    ...createOrchestratorExperiment("errored plan"),
+    planConversationId: "plan-error",
+  };
+  const legacyStopped = {
+    ...createOrchestratorExperiment("legacy stopped plan"),
+    planConversationId: "plan-legacy-stop",
+  };
+  const pendingRetry = {
+    ...createOrchestratorExperiment("pending retry"),
+    planAttempts: 2,
+    planConversationId: "plan-pending",
+  };
+  const transcripts = new Map([
+    ["plan-stopped", [{
+      role: "assistant",
+      text: "malformed first attempt",
+      progressState: "completed",
+    }, {
+      role: "assistant",
+      text: "(Stopped)",
+      progressState: "stopped",
+    }]],
+    ["plan-error", [{
+      role: "assistant",
+      text: "planner process failed",
+      progressState: "error",
+    }]],
+    ["plan-legacy-stop", [{
+      role: "assistant",
+      text: "（停止しました）",
+    }]],
+    ["plan-pending", [{
+      role: "assistant",
+      text: "malformed first attempt",
+      progressState: "completed",
+    }]],
+  ]);
+
+  const prepared = prepareOrchestratorResume(
+    [stoppedRetry, errored, legacyStopped, pendingRetry],
+    {
+      conversationExists: () => true,
+      isBusy: () => false,
+      isQueued: () => false,
+      planResponseOutcome: (conversationId, expectedResponseCount) =>
+        classifyOrchestratorPlanResponse(
+          transcripts.get(conversationId) ?? [],
+          expectedResponseCount,
+        ),
+    },
+  );
+
+  assert.deepEqual(prepared.terminalPlans, [{
+    conversationId: "plan-stopped",
+    progressState: "stopped",
+    assistantText: "(Stopped)",
+  }, {
+    conversationId: "plan-error",
+    progressState: "error",
+    assistantText: "planner process failed",
+  }, {
+    conversationId: "plan-legacy-stop",
+    progressState: "stopped",
+    assistantText: "（停止しました）",
+  }]);
+  assert.deepEqual(prepared.completedPlans, []);
+  assert.deepEqual(
+    prepared.launches.map((launch) => launch.conversationId),
+    ["plan-pending"],
+  );
+  assert.match(prepared.launches[0].prompt, /previous response omitted/);
 });
 
 test("orchestrator resume re-queues synthesizing runs", () => {

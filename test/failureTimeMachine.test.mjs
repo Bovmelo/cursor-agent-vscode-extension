@@ -157,6 +157,185 @@ test("analysis keeps roots separate and joins matching audit entries oldest firs
   assert.deepEqual(report.auditEntries.map((item) => item.id), ["1", "2"]);
 });
 
+test("an explicit stale target session id does not fall back to another failure", () => {
+  const report = analyzeFailureTimeMachine({
+    sessions: [session({
+      id: "existing",
+      startedAt: 100,
+      verificationHistory: [run(120, { success: false, output: "fail" })],
+    })],
+    auditEntries: [],
+    targetSessionId: "deleted",
+  });
+
+  assert.equal(report, undefined);
+});
+
+test("POSIX roots and files that differ only by case remain distinct", () => {
+  const report = analyzeFailureTimeMachine({
+    sessions: [
+      session({
+        id: "target",
+        root: "/repo/Foo",
+        startedAt: 200,
+        files: ["/repo/Foo/src/Name.ts"],
+        verificationHistory: [run(220, { success: false, output: "fail" })],
+      }),
+      session({
+        id: "same-root-distinct-file",
+        root: "/repo/Foo",
+        startedAt: 150,
+        files: ["/repo/Foo/src/name.ts"],
+        verificationHistory: [run(170, { success: true, skipped: true })],
+      }),
+      session({
+        id: "case-distinct-root",
+        root: "/repo/foo",
+        startedAt: 100,
+        files: ["/repo/foo/src/Name.ts"],
+        verificationHistory: [run(120, { success: true })],
+      }),
+    ],
+    auditEntries: [],
+    targetSessionId: "target",
+  });
+
+  assert.ok(report);
+  assert.equal(report.lastRecordedPass, undefined);
+  assert.deepEqual(
+    report.candidateFiles.map((item) => item.relative).sort(),
+    ["src/Name.ts", "src/name.ts"],
+  );
+});
+
+test("double-slash POSIX roots remain case-sensitive", () => {
+  const report = analyzeFailureTimeMachine({
+    sessions: [
+      session({
+        id: "target",
+        root: "//srv/Repo",
+        startedAt: 200,
+        files: ["//srv/Repo/src/Name.ts"],
+        verificationHistory: [run(220, { success: false, output: "fail" })],
+      }),
+      session({
+        id: "case-distinct-root",
+        root: "//srv/repo",
+        startedAt: 100,
+        files: ["//srv/repo/src/Name.ts"],
+        verificationHistory: [run(120, { success: true })],
+      }),
+    ],
+    auditEntries: [],
+    targetSessionId: "target",
+    pathPlatform: "posix",
+  });
+
+  assert.ok(report);
+  assert.equal(report.lastRecordedPass, undefined);
+  assert.deepEqual(report.candidateFiles.map((item) => item.relative), ["src/Name.ts"]);
+});
+
+test("forward-slash UNC roots and files use Windows case-insensitive semantics", () => {
+  const report = analyzeFailureTimeMachine({
+    sessions: [
+      session({
+        id: "target",
+        root: "//server/Repo",
+        startedAt: 200,
+        files: ["//server/Repo/src/Name.ts"],
+        verificationHistory: [run(220, { success: false, output: "fail" })],
+      }),
+      session({
+        id: "earlier",
+        root: "//SERVER/repo",
+        startedAt: 100,
+        files: ["//SERVER/repo/src/name.ts"],
+        verificationHistory: [run(120, { success: true, skipped: true })],
+      }),
+    ],
+    auditEntries: [],
+    targetSessionId: "target",
+    pathPlatform: "win32",
+  });
+
+  assert.ok(report);
+  assert.equal(report.candidateFiles.length, 1);
+  assert.deepEqual(report.candidateFiles[0].sessionIds, ["earlier", "target"]);
+});
+
+test("Windows roots and files remain case-insensitive", () => {
+  const report = analyzeFailureTimeMachine({
+    sessions: [
+      session({
+        id: "target",
+        root: "C:\\Repo",
+        startedAt: 200,
+        files: ["C:\\Repo\\src\\Name.ts"],
+        verificationHistory: [run(220, { success: false, output: "fail" })],
+      }),
+      session({
+        id: "earlier",
+        root: "c:\\repo",
+        startedAt: 100,
+        files: ["c:\\repo\\src\\name.ts"],
+        verificationHistory: [run(120, { success: true, skipped: true })],
+      }),
+    ],
+    auditEntries: [],
+    targetSessionId: "target",
+  });
+
+  assert.ok(report);
+  assert.equal(report.candidateFiles.length, 1);
+  assert.deepEqual(report.candidateFiles[0].sessionIds, ["earlier", "target"]);
+});
+
+test("backslash UNC roots and files remain case-insensitive", () => {
+  const report = analyzeFailureTimeMachine({
+    sessions: [
+      session({
+        id: "target",
+        root: "\\\\server\\Repo",
+        startedAt: 200,
+        files: ["\\\\server\\Repo\\src\\Name.ts"],
+        verificationHistory: [run(220, { success: false, output: "fail" })],
+      }),
+      session({
+        id: "earlier",
+        root: "\\\\SERVER\\repo",
+        startedAt: 100,
+        files: ["\\\\SERVER\\repo\\src\\name.ts"],
+        verificationHistory: [run(120, { success: true, skipped: true })],
+      }),
+    ],
+    auditEntries: [],
+    targetSessionId: "target",
+  });
+
+  assert.ok(report);
+  assert.equal(report.candidateFiles.length, 1);
+  assert.deepEqual(report.candidateFiles[0].sessionIds, ["earlier", "target"]);
+});
+
+test("files on a different Windows drive fall back to a basename", () => {
+  const report = analyzeFailureTimeMachine({
+    sessions: [session({
+      id: "target",
+      root: "C:\\Repo",
+      startedAt: 200,
+      files: ["D:\\Elsewhere\\src\\Name.ts"],
+      verificationHistory: [run(220, { success: false, output: "fail" })],
+    })],
+    auditEntries: [],
+    targetSessionId: "target",
+  });
+
+  assert.ok(report);
+  assert.deepEqual(report.candidateFiles.map((item) => item.relative), ["Name.ts"]);
+  assert.deepEqual(report.targetFiles, ["Name.ts"]);
+});
+
 test("failure output is redacted, bounded, and markdown avoids root-cause claims", () => {
   const secret = "authorization: super-secret-token";
   const report = analyzeFailureTimeMachine({

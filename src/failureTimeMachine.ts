@@ -63,6 +63,7 @@ export interface FailureTimeMachineInput {
   sessions: readonly ChangeSessionSnapshot[];
   auditEntries: readonly AuditEntry[];
   targetSessionId?: string;
+  pathPlatform?: "win32" | "posix";
 }
 
 interface InternalRun extends FailureRunObservation {
@@ -145,20 +146,49 @@ function normalizedPath(value: string): string {
   return value.replaceAll("\\", "/").replace(/\/+$/u, "");
 }
 
-function relativeSessionFile(root: string, file: string): string {
-  const normalizedRoot = normalizedPath(root);
-  const normalizedFile = normalizedPath(file);
-  if (normalizedFile.toLowerCase().startsWith(`${normalizedRoot.toLowerCase()}/`)) {
-    return normalizedFile.slice(normalizedRoot.length + 1);
-  }
-  const relative = path.relative(root, file).replaceAll("\\", "/");
-  return relative && !relative.startsWith("../") && !path.isAbsolute(relative)
-    ? relative
-    : path.basename(normalizedFile);
+function usesWindowsPathSemantics(
+  value: string,
+  pathPlatform: "win32" | "posix",
+): boolean {
+  return /^[A-Za-z]:[\\/]/u.test(value)
+    || value.startsWith("\\\\")
+    || (pathPlatform === "win32" && value.startsWith("//"));
 }
 
-function sameRoot(left: string, right: string): boolean {
-  return normalizedPath(left).toLowerCase() === normalizedPath(right).toLowerCase();
+function pathIdentity(value: string, windowsSemantics: boolean): string {
+  const normalized = normalizedPath(value);
+  return windowsSemantics ? normalized.toLowerCase() : normalized;
+}
+
+function relativeSessionFile(
+  root: string,
+  file: string,
+  pathPlatform: "win32" | "posix",
+): string {
+  const normalizedRoot = normalizedPath(root);
+  const normalizedFile = normalizedPath(file);
+  const windowsSemantics = usesWindowsPathSemantics(root, pathPlatform);
+  if (
+    pathIdentity(normalizedFile, windowsSemantics)
+      .startsWith(`${pathIdentity(normalizedRoot, windowsSemantics)}/`)
+  ) {
+    return normalizedFile.slice(normalizedRoot.length + 1);
+  }
+  const pathApi = windowsSemantics ? path.win32 : path.posix;
+  const relative = pathApi.relative(root, file).replaceAll("\\", "/");
+  return relative && !relative.startsWith("../") && !pathApi.isAbsolute(relative)
+    ? relative
+    : pathApi.basename(normalizedFile);
+}
+
+function sameRoot(
+  left: string,
+  right: string,
+  pathPlatform: "win32" | "posix",
+): boolean {
+  const windowsSemantics = usesWindowsPathSemantics(left, pathPlatform)
+    && usesWindowsPathSemantics(right, pathPlatform);
+  return pathIdentity(left, windowsSemantics) === pathIdentity(right, windowsSemantics);
 }
 
 function boundaryConfidence(
@@ -203,12 +233,13 @@ export function analyzeFailureTimeMachine(
   input: FailureTimeMachineInput,
 ): FailureTimeMachineReport | undefined {
   const sessions = [...input.sessions];
+  const pathPlatform = input.pathPlatform ?? (process.platform === "win32" ? "win32" : "posix");
   const requested = input.targetSessionId
     ? sessions.find((session) => session.id === input.targetSessionId)
     : undefined;
-  const targetSession = requested ?? sessions.find((session) =>
-    observations(session).some((run) => run.status === "failed")
-  );
+  const targetSession = input.targetSessionId
+    ? requested
+    : sessions.find((session) => observations(session).some((run) => run.status === "failed"));
   if (!targetSession) {
     return undefined;
   }
@@ -218,7 +249,7 @@ export function analyzeFailureTimeMachine(
   }
 
   const rootSessions = sessions
-    .filter((session) => sameRoot(session.root, targetSession.root))
+    .filter((session) => sameRoot(session.root, targetSession.root, pathPlatform))
     .sort((left, right) => left.startedAt - right.startedAt);
   const allRuns = rootSessions
     .flatMap(observations)
@@ -257,8 +288,9 @@ export function analyzeFailureTimeMachine(
   const candidates = new Map<string, FailureFileCandidate>();
   for (const session of candidateSessions) {
     for (const file of session.files) {
-      const relative = relativeSessionFile(session.root, file);
-      const key = `${normalizedPath(session.root).toLowerCase()}\0${relative.toLowerCase()}`;
+      const relative = relativeSessionFile(session.root, file, pathPlatform);
+      const windowsSemantics = usesWindowsPathSemantics(session.root, pathPlatform);
+      const key = `${pathIdentity(session.root, windowsSemantics)}\0${pathIdentity(relative, windowsSemantics)}`;
       const existing = candidates.get(key) ?? {
         root: session.root,
         relative,
@@ -295,7 +327,7 @@ export function analyzeFailureTimeMachine(
     .sort((left, right) => left.at - right.at);
   const targetFileDecisions = Object.fromEntries(
     Object.entries(targetSession.fileDecisions ?? {}).map(([file, decision]) => [
-      relativeSessionFile(targetSession.root, file),
+      relativeSessionFile(targetSession.root, file, pathPlatform),
       decision,
     ]),
   );
@@ -306,7 +338,9 @@ export function analyzeFailureTimeMachine(
     targetStartedAt: targetSession.startedAt,
     targetFinishedAt: targetSession.finishedAt,
     targetPhase: targetSession.phase,
-    targetFiles: targetSession.files.map((file) => relativeSessionFile(targetSession.root, file)),
+    targetFiles: targetSession.files.map((file) =>
+      relativeSessionFile(targetSession.root, file, pathPlatform)
+    ),
     targetFileDecisions,
     checkpointAvailable: targetSession.checkpointReady ?? targetSession.baselineClean,
     repair: targetSession.repair ? { ...targetSession.repair } : undefined,
