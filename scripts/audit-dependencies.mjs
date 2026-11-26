@@ -44,7 +44,6 @@ const advisoryIdsFor = (name, visited = new Set()) => {
 
 const blocked = [];
 for (const [name, vulnerability] of Object.entries(vulnerabilities)) {
-  if (!new Set(["high", "critical"]).has(vulnerability.severity)) continue;
   const ids = advisoryIdsFor(name);
   blocked.push({ ids: [...ids], name, severity: vulnerability.severity });
 }
@@ -56,7 +55,7 @@ if (blocked.length > 0) {
         `- ${name} (${severity}): ${ids.join(", ") || "unknown advisory"}`,
     )
     .join("\n");
-  throw new Error(`Unaccepted high/critical production dependency vulnerabilities:\n${details}`);
+  throw new Error(`Production dependency vulnerabilities:\n${details}`);
 }
 
-console.log("Dependency audit passed with no high/critical production vulnerabilities.");
+console.log("Dependency audit passed with no known production vulnerabilities.");

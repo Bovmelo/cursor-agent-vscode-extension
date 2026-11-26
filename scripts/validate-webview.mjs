@@ -65,12 +65,13 @@ const imgSources = csp
   ?.slice(1);
 if (
   !imgSources ||
-  imgSources.length !== 3 ||
-  !["test-csp-source", "https:", "data:"].every((source) => imgSources.includes(source)) ||
+  imgSources.length !== 2 ||
+  !["test-csp-source", "data:"].every((source) => imgSources.includes(source)) ||
+  imgSources.includes("https:") ||
   imgSources.includes("http:") ||
   imgSources.includes("javascript:")
 ) {
-  throw new Error("img-src must allow only webview, HTTPS, and data image sources");
+  throw new Error("img-src must allow only webview and data images, without remote requests");
 }
 
 const scriptElements = [...html.matchAll(/<script([^>]*)>([\s\S]*?)<\/script>/g)];
@@ -259,7 +260,6 @@ const isAllowedMarkdownImageSource = new Function(
   `${imageSourceValidatorSource}; return isAllowedMarkdownImageSource;`,
 )();
 for (const source of [
-  "https://example.com/image.png",
   "vscode-resource:/extension/image.png",
   "vscode-webview-resource://view/extension/image.png",
   "data:image/png;base64,iVBORw0KGgo=",
@@ -269,7 +269,9 @@ for (const source of [
   }
 }
 for (const source of [
+  "https://example.com/image.png?conversation=private-context",
   "http://example.com/image.png",
+  "//example.com/image.png",
   "javascript:alert(1)",
   "data:text/html;base64,PHNjcmlwdD4=",
   "data:image/svg+xml,<svg onload=alert(1)>",

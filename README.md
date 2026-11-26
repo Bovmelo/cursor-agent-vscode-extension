@@ -6,6 +6,19 @@ Run [Cursor](https://cursor.com) agents from the VS Code sidebar with your Curso
 
 日本語は下の [日本語](#日本語) を参照してください。
 
+## Security hardening fork
+
+This fork maintains security fixes for local use in Cursor. It retains the upstream extension ID (`ark4ez.cursor-subscription-for-vscode`) so existing SecretStorage credentials and conversation state continue to work. It is not an official Cursor or upstream release. Install the fork VSIX manually; an upstream Marketplace update may replace it.
+
+Changes in 0.3.2:
+
+- Upgrade to Cursor SDK 1.5.2 with its supported Zod 4.6.7 peer and DOMPurify 3.5.0; remove the obsolete production transport override.
+- Block remote Markdown image requests, including requests during HTML sanitization. Local and embedded raster images remain available; external links still require confirmation.
+- Honor project integration toggles consistently across URI-scoped workspaces and redact standalone `crsr_` API keys from diagnostics. Background and Supervisor tasks refuse to start when project integrations are disabled; use the main chat, which can enforce the selected integration policy.
+- Fail production dependency validation on any reported severity, without advisory exceptions.
+
+The SDK remains proprietary and includes Cursor usage telemetry. Package advisories and regression tests cannot establish the absence of every issue in the SDK's bundled/native code, including its Zod v3 compatibility imports. The extension runs with editor-host privileges; Auto-review is an automated check, not per-command user approval. On macOS the Safe preset maps to Auto-review with the SDK sandbox, not to a separate worktree for every chat. Start with Plan mode; keep autonomous Supervisor, automatic verification/hooks, and inline completions disabled until you choose to enable them for a trusted project.
+
 ## See it in action
 
 ### Run independent agents in parallel

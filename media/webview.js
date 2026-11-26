@@ -2743,7 +2743,10 @@ function copyTextForButton(btn) {
 }
 
 function isAllowedMarkdownImageSource(value) {
-  return /^(?:https:\/\/|vscode-resource:|vscode-webview-resource:)/i.test(value)
+  // Model output is untrusted: loading an external image can send conversation
+  // data encoded in its URL without the user's external-link confirmation.
+  // CSP also blocks remote requests while DOMPurify parses the source HTML.
+  return /^(?:vscode-resource:|vscode-webview-resource:)/i.test(value)
     || /^data:image\/(?:avif|gif|jpe?g|png|webp);base64,[a-z0-9+\/=]+$/i.test(value);
 }
 
@@ -2751,7 +2754,7 @@ function renderMarkdown(messageNode, raw) {
   const body = messageBody(messageNode);
   const template = document.createElement("template");
   template.innerHTML = DOMPurify.sanitize(marked.parse(raw), {
-    ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|[^a-z]|[a-z+.-]+(?:[^a-z+.\-:]|$))/i,
+    ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto|vscode-resource|vscode-webview-resource):|[^a-z]|[a-z+.-]+(?:[^a-z+.\-:]|$))/i,
     FORBID_ATTR: ["srcset"],
   });
   for (const image of template.content.querySelectorAll("img[src]")) {

@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { expandCommandBody } from "./pureUtils.js";
+import { integrationToggleId } from "./integrationToggles.js";
 
 export interface ProjectCommand {
   id: string;
@@ -10,6 +11,7 @@ export interface ProjectCommand {
   body: string;
   source: "project" | "user";
   workspaceFolderName?: string;
+  integrationId?: string;
 }
 
 const MAX_COMMANDS = 100;
@@ -70,6 +72,7 @@ async function loadCommandsFromDirectory(
   directory: vscode.Uri,
   source: "project" | "user",
   workspaceFolderName?: string,
+  workspaceFolderUri?: string,
 ): Promise<ProjectCommand[]> {
   let entries: [string, vscode.FileType][];
   try {
@@ -87,7 +90,13 @@ async function loadCommandsFromDirectory(
       source,
     );
     if (command) {
-      commands.push({ ...command, workspaceFolderName });
+      commands.push({
+        ...command,
+        workspaceFolderName,
+        integrationId: workspaceFolderUri
+          ? integrationToggleId("command", workspaceFolderUri, vscode.Uri.joinPath(directory, name).fsPath)
+          : undefined,
+      });
     }
     if (commands.length >= MAX_COMMANDS) {
       break;
@@ -111,6 +120,7 @@ export async function loadProjectCommands(
       vscode.Uri.joinPath(workspace.uri, ".cursor", "commands"),
       "project",
       workspace.name,
+      workspace.uri.toString(),
     )) {
       if (!byId.has(command.id)) {
         byId.set(command.id, command);
@@ -135,6 +145,9 @@ export function filterEnabledProjectCommands(
   return commands.filter((command) => {
     if (command.source !== "project" || !command.workspaceFolderName) {
       return true;
+    }
+    if (command.integrationId && disabledIntegrationIds.has(command.integrationId)) {
+      return false;
     }
     return !disabledIntegrationIds.has(
       `command:${command.workspaceFolderName}:${command.id}`,

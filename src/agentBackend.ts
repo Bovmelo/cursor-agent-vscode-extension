@@ -215,8 +215,16 @@ export class CursorSdkBackend implements AgentBackend {
   }
 
   private toSdkLocalOptions(options: AgentBackendLocalOptions): LocalAgentOptions {
+    const roots = typeof options.cwd === "string" ? [options.cwd] : options.cwd;
+    if (roots.length === 0) {
+      throw new Error("At least one working directory is required.");
+    }
     return {
-      cwd: options.cwd,
+      // SDK 1.5 separates the primary shell/store directory from the remaining
+      // workspace roots. Passing an array as cwd no longer initializes a local
+      // agent correctly, and dropping additional roots loses their rules.
+      cwd: roots[0],
+      ...(roots.length > 1 ? { dirs: roots.slice(1) } : {}),
       autoReview: options.autoReview,
       enableAgentRetries: options.enableAgentRetries,
       sandboxOptions: options.sandbox,

@@ -27,6 +27,8 @@ import { runConfiguredHooks } from "./hooks.js";
 import { createExcludedPathMatcher, excludedApplyGlobs, globRegex } from "./sensitivePaths.js";
 import { runGit } from "./worktreeLifecycle.js";
 import { configurationFor, resolveWorkspaceFolder } from "./workspaceFolder.js";
+import { assertAuxiliaryIntegrationsAllowed } from "./auxiliaryIntegrationPolicy.js";
+import { INTEGRATION_TOGGLE_KEY, type IntegrationToggleState } from "./integrationToggles.js";
 
 const TASKS_KEY = "cursorSubscription.supervisorTasks";
 const MAX_TASKS = 50;
@@ -967,6 +969,14 @@ vscode.CodeLensProvider, vscode.Disposable {
     this.refresh();
 
     try {
+      const integrations = this.state.get<IntegrationToggleState>(INTEGRATION_TOGGLE_KEY);
+      assertAuxiliaryIntegrationsAllowed(
+        new Set(integrations?.disabledIds ?? []),
+        (vscode.workspace.workspaceFolders ?? []).map((folder) => ({
+          uri: folder.uri.toString(), name: folder.name, fsPath: folder.uri.fsPath,
+        })),
+        task.root,
+      );
       if (!vscode.workspace.isTrusted) {
         throw new Error(this.text(
           "AI Supervisor stopped because the workspace is no longer trusted.",

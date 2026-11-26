@@ -806,8 +806,9 @@ test("Plan artifacts accept fenced and embedded JSON steps", () => {
   assert.deepEqual(embedded, [{ title: "UI", prompt: "Render [nested] content" }]);
 });
 
-test("monthly token and estimated cost budgets aggregate the current month", () => {
+test("monthly token and estimated cost budgets aggregate the current month", (t) => {
   const at = new Date(2026, 6, 17);
+  t.mock.timers.enable({ apis: ["Date"], now: at });
   let ledger = recordUsage(undefined, "chat", {
     ...emptyUsage(),
     inputTokens: 800_000,

@@ -9,6 +9,8 @@ import {
 import * as vscode from "vscode";
 import { detectBlockedProxyEnvironment } from "./networkEnvironment.js";
 import type { SupervisorExecutionResult, SupervisorTask } from "./supervisor.js";
+import { assertAuxiliaryIntegrationsAllowed } from "./auxiliaryIntegrationPolicy.js";
+import { INTEGRATION_TOGGLE_KEY, type IntegrationToggleState } from "./integrationToggles.js";
 
 const API_KEY_SECRET = "cursorSubscription.apiKey";
 const MODEL_KEY = "cursorSubscription.model";
@@ -108,6 +110,7 @@ export class SupervisorAgentRunner implements vscode.Disposable {
         error: this.workspaceTrustError().message,
       };
     }
+    this.assertIntegrationsAllowed(task.root);
     const apiKey = await this.context.secrets.get(API_KEY_SECRET);
     if (!apiKey) {
       return {
@@ -160,7 +163,7 @@ export class SupervisorAgentRunner implements vscode.Disposable {
       Promise.race([Promise.resolve(operation), interrupt]);
     try {
       this.assertWorkspaceTrusted();
-      const agentPromise = this.createAgent(apiKey, worktreePath, task.title);
+      const agentPromise = this.createAgent(apiKey, worktreePath, task.title, task.root);
       void agentPromise.then((agent) => {
         if (active.cancelRequested && active.agent !== agent) {
           void this.disposeAgentBounded(agent);
@@ -172,6 +175,7 @@ export class SupervisorAgentRunner implements vscode.Disposable {
         // Keep this check synchronous with the SDK call so a trusted agent can
         // never receive another request after the workspace boundary changes.
         this.assertWorkspaceTrusted();
+        this.assertIntegrationsAllowed(task.root);
         return active.agent!.send(prompt, {
           model: this.selectedModelSelection(),
           mode: "agent",
@@ -287,6 +291,7 @@ export class SupervisorAgentRunner implements vscode.Disposable {
     apiKey: string,
     worktreePath: string,
     title: string,
+    root: string,
   ): Promise<CursorAgent> {
     const approvalMode = this.context.globalState.get<string>(
       APPROVAL_MODE_KEY,
@@ -303,6 +308,7 @@ export class SupervisorAgentRunner implements vscode.Disposable {
     const connect = (options: LocalAgentOptions) => {
       // Agent.create begins loading settingSources synchronously with this
       // call, so the trust check must be in the same turn.
+      this.assertIntegrationsAllowed(root);
       this.assertWorkspaceTrusted();
       return Agent.create({
         apiKey,
@@ -335,6 +341,17 @@ export class SupervisorAgentRunner implements vscode.Disposable {
       }
       return connect({ ...local, sandboxOptions: { enabled: false } });
     }
+  }
+
+  private assertIntegrationsAllowed(root: string): void {
+    const state = this.context.workspaceState.get<IntegrationToggleState>(INTEGRATION_TOGGLE_KEY);
+    assertAuxiliaryIntegrationsAllowed(
+      new Set(state?.disabledIds ?? []),
+      (vscode.workspace.workspaceFolders ?? []).map((folder) => ({
+        uri: folder.uri.toString(), name: folder.name, fsPath: folder.uri.fsPath,
+      })),
+      root,
+    );
   }
 
   private workspaceTrustError(): SupervisorWorkspaceTrustError {

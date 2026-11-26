@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2 — Security hardening fork
+
+- Upgrade the supported Cursor SDK/Zod peer and DOMPurify dependencies, retain multi-root SDK compatibility, and reject known production dependency advisories at every severity.
+- Prevent remote Markdown image beacons while preserving local/embedded attachments and confirmed external links.
+- Repair project integration disable/reuse boundaries and redact standalone Cursor user API keys from diagnostics.
+- Document the SDK telemetry, host privilege, sandbox, and local-build update boundaries.
+
+
 ## Unreleased
 
 ## 0.3.1 - 2026-07-26

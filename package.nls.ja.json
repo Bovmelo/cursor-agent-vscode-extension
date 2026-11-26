@@ -1,5 +1,5 @@
 {
-  "extension.displayName": "VS Code用Cursorサブスクリプション",
+  "extension.displayName": "Cursor Agent — Hardened Fork",
   "extension.description": "非公式: CursorのAPIキーとプランで、VS CodeからCursor Agentを実行します。Anysphere非提携です。",
   "command.openChat": "Cursor: チャットを開く",
   "command.openSettings": "Cursor: AI機能の設定を開く",

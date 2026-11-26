@@ -130,6 +130,7 @@ import {
   WORKSPACE_TREE_VIEW_ID,
 } from "./workspaceSidebar.js";
 import { INTEGRATION_TOGGLE_KEY, type IntegrationToggleState } from "./integrationCatalog.js";
+import { integrationToggleId, isWorkspaceIntegrationEnabled, legacyIntegrationToggleId } from "./integrationToggles.js";
 import {
   agentSendBoundaryMatches,
   filterRequestedSkillsForWorkspaceTrust,
@@ -140,6 +141,7 @@ import {
   shouldUseWorkspacePromptIntegrations,
   workspaceTrustSnapshotMatches,
   workspaceTrustIntegrationKey,
+  workspaceIntegrationSelection,
 } from "./integrationPolicy.js";
 import {
   buildOrchestratorDetail,
@@ -799,6 +801,7 @@ export function activate(context: vscode.ExtensionContext): void {
       "cursorSubscription.disableIntegration",
       async (target?: unknown) => {
         await integrations.toggle(unwrapWorkspaceNode(target), false);
+        await Promise.all([backgroundJobs.cancelAllRunning(), supervisorRunner.cancel()]);
         await provider.refreshIntegrationIndex();
       },
     ),
@@ -901,7 +904,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   private auditWriteQueue: Promise<void> = Promise.resolve();
   private readonly previewContents = new Map<string, string>();
   private projectCommands: ProjectCommand[] = [];
-  private readonly skillIntegrationIdsByName = new Map<string, string[]>();
+  private readonly skillIntegrationIdsByName = new Map<string, {
+    id: string;
+    legacyId: string;
+    folderUri: string;
+  }[]>();
   private readonly planArtifactRetries = new Map<string, number>();
   private bestOfNExperiments: BestOfNExperiment[];
   private readonly bestOfNArtifacts = new Map<
@@ -3869,7 +3876,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
                 cwd: workspace.uri.fsPath,
                 settingSources: projectSettingSourcesForWorkspaceTrust(
                   vscode.workspace.isTrusted,
-                  configuration.get<boolean>("inlineCompletionIncludeProjectRules", true),
+                  configuration.get<boolean>("inlineCompletionIncludeProjectRules", true)
+                    && workspaceIntegrationSelection({
+                      disabledIds: this.disabledIntegrationIds(),
+                      folderUri: workspace.uri.toString(),
+                      folderName: workspace.name,
+                      mcpPath: vscode.Uri.joinPath(workspace.uri, ".cursor", "mcp.json").fsPath,
+                    }).disabledIds.length === 0,
                 ),
               },
             },
@@ -8086,29 +8099,33 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return undefined;
     }
     const disabled = this.disabledIntegrationIds();
-    const rulesId = `rules:${workspace.name}:.cursor/rules.md`;
-    const memoryId = `memory:${workspace.name}:.cursor/project-memory.md`;
+    const integrationEnabled = (kind: string, relative: string): boolean =>
+      isWorkspaceIntegrationEnabled(
+        disabled, kind, workspace.uri.toString(),
+        vscode.Uri.joinPath(workspace.uri, ...relative.split("/")).fsPath,
+        workspace.name, relative,
+      );
     const allowMemory =
       includeProjectMemory &&
       this.featureEnabled("enableProjectMemory") &&
       this.alertConfiguration().get<boolean>("includeProjectMemory", true);
     const allowed: string[] = [];
     const blocked: string[] = [];
-    if (disabled.has(rulesId)) {
+    if (!integrationEnabled("rules", ".cursor/rules.md")) {
       blocked.push(".cursor/rules.md");
     } else {
       allowed.push(".cursor/rules.md");
     }
-    if (disabled.has(memoryId)) {
+    if (!integrationEnabled("memory", ".cursor/project-memory.md")) {
       blocked.push(".cursor/project-memory.md");
     } else if (allowMemory) {
       allowed.push(".cursor/project-memory.md");
     }
-    const skillPrefix = `skill:${workspace.name}:`;
     const disabledSkills = [...this.skillIntegrationIdsByName.entries()]
       .filter(([, ids]) => {
-        const workspaceSkillIds = ids.filter((id) => id.startsWith(skillPrefix));
-        return workspaceSkillIds.length > 0 && workspaceSkillIds.every((id) => disabled.has(id));
+        const workspaceSkillIds = ids.filter((item) => item.folderUri === workspace.uri.toString());
+        return workspaceSkillIds.length > 0
+          && workspaceSkillIds.every((item) => disabled.has(item.id) || disabled.has(item.legacyId));
       })
       .map(([name]) => name)
       .sort();
@@ -8494,11 +8511,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     if (!workspace) {
       return `integrations:${trustKey}:none`;
     }
-    const folderMarker = `:${workspace.name}:`;
-    const disabled = [...this.disabledIntegrationIds()]
-      .filter((id) => id.includes(folderMarker))
-      .sort();
-    return `integrations:${trustKey}:${disabled.join(",")}`;
+    const selection = workspaceIntegrationSelection({
+      disabledIds: this.disabledIntegrationIds(),
+      folderUri: workspace.uri.toString(),
+      folderName: workspace.name,
+      mcpPath: vscode.Uri.joinPath(workspace.uri, ".cursor", "mcp.json").fsPath,
+    });
+    return `integrations:${trustKey}:${selection.key}`;
   }
 
   private async agentIntegrationOptions(conversation: Conversation): Promise<{
@@ -8515,8 +8534,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       });
     }
     const disabled = this.disabledIntegrationIds();
-    const folderMarker = `:${workspace.name}:`;
-    const hasDisabledWorkspaceIntegrations = [...disabled].some((id) => id.includes(folderMarker));
+    const selection = workspaceIntegrationSelection({
+      disabledIds: disabled,
+      folderUri: workspace.uri.toString(),
+      folderName: workspace.name,
+      mcpPath: vscode.Uri.joinPath(workspace.uri, ".cursor", "mcp.json").fsPath,
+    });
+    const hasDisabledWorkspaceIntegrations = selection.disabledIds.length > 0;
     if (!hasDisabledWorkspaceIntegrations) {
       return resolveAgentIntegrationPolicy({
         isWorkspaceTrusted,
@@ -8524,9 +8548,8 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
         hasDisabledWorkspaceIntegrations,
       });
     }
-    const mcpIntegrationId = `mcp:${workspace.name}:mcp.json`;
     let mcpServers: Record<string, McpServerConfig> | undefined;
-    if (!disabled.has(mcpIntegrationId)) {
+    if (selection.mcpEnabled) {
       try {
         const mcpUri = vscode.Uri.joinPath(workspace.uri, ".cursor", "mcp.json");
         const parsed = JSON.parse(
@@ -9379,6 +9402,10 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
   }
 
   public async refreshIntegrationIndex(): Promise<void> {
+    // Existing SDK agents may already have launched the now-disabled MCPs.
+    // A changed policy must not wait for the next user message to take effect.
+    await this.cancelAllChats();
+    await this.disposeAgent();
     const generation = ++this.workspaceIndexGeneration;
     await this.publishIntegrationIndex(generation);
   }
@@ -9394,9 +9421,11 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
       return true;
     }
     const scopedIds = workspace
-      ? ids.filter((id) => id.startsWith(`skill:${workspace.name}:`))
+      ? ids.filter((item) => item.folderUri === workspace.uri.toString())
       : ids;
-    return scopedIds.length === 0 || scopedIds.some((id) => !this.disabledIntegrationIds().has(id));
+    const disabled = this.disabledIntegrationIds();
+    return scopedIds.length === 0
+      || scopedIds.some((item) => !disabled.has(item.id) && !disabled.has(item.legacyId));
   }
 
   private async publishUserPromptIntegrations(generation: number): Promise<void> {
@@ -9434,7 +9463,7 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
     const disabledIntegrationIds = this.disabledIntegrationIds();
 
     const skillsByName = new Map<string, { name: string; description?: string }>();
-    const skillIdsByName = new Map<string, string[]>();
+    const skillIdsByName = new Map<string, { id: string; legacyId: string; folderUri: string }[]>();
     for (const workspace of folders) {
       try {
         const skillUris = await vscode.workspace.findFiles(
@@ -9457,11 +9486,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
           const description = /^description:\s*["']?([^"'\r\n]+)["']?\s*$/m
             .exec(source)?.[1]
             ?.trim();
-          const integrationId = `skill:${workspace.name}:${fallbackName}`;
+          const integrationId = integrationToggleId("skill", workspace.uri.toString(), uri.fsPath);
+          const legacyId = legacyIntegrationToggleId("skill", workspace.name, fallbackName);
           const ids = skillIdsByName.get(name) ?? [];
-          ids.push(integrationId);
+          ids.push({ id: integrationId, legacyId, folderUri: workspace.uri.toString() });
           skillIdsByName.set(name, ids);
-          if (!disabledIntegrationIds.has(integrationId) && !skillsByName.has(name)) {
+          if (!disabledIntegrationIds.has(integrationId)
+            && !disabledIntegrationIds.has(legacyId) && !skillsByName.has(name)) {
             skillsByName.set(name, { name, description });
           }
         }
@@ -9472,10 +9503,13 @@ class CursorChatProvider implements vscode.WebviewViewProvider, vscode.Disposabl
 
     const mcpServers = new Set<string>();
     for (const workspace of folders) {
-      if (disabledIntegrationIds.has(`mcp:${workspace.name}:mcp.json`)) {
+      const mcpUri = vscode.Uri.joinPath(workspace.uri, ".cursor", "mcp.json");
+      if (!isWorkspaceIntegrationEnabled(
+        disabledIntegrationIds, "mcp", workspace.uri.toString(), mcpUri.fsPath,
+        workspace.name, "mcp.json",
+      )) {
         continue;
       }
-      const mcpUri = vscode.Uri.joinPath(workspace.uri, ".cursor", "mcp.json");
       try {
         const bytes = await vscode.workspace.fs.readFile(mcpUri);
         if (generation !== this.workspaceIndexGeneration) {

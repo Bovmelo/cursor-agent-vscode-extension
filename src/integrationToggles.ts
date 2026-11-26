@@ -71,6 +71,31 @@ export function isIntegrationEnabled(
   return !disabled.includes(id) && !legacyIds.some((legacyId) => disabled.includes(legacyId));
 }
 
+/** Match current URI-scoped IDs and older persisted folder-name IDs. */
+export function disabledIntegrationIdsForWorkspace(
+  disabledIds: Iterable<string>,
+  folderUri: string,
+  folderName: string,
+): string[] {
+  const uriScope = encodeURIComponent(folderUri);
+  return [...disabledIds].filter((id) => {
+    const scope = id.split(":")[1];
+    return scope === uriScope || scope === folderName;
+  }).sort();
+}
+
+export function isWorkspaceIntegrationEnabled(
+  disabledIds: ReadonlySet<string>,
+  kind: string,
+  folderUri: string,
+  absolutePath: string,
+  folderName: string,
+  legacySuffix: string,
+): boolean {
+  return !disabledIds.has(integrationToggleId(kind, folderUri, absolutePath))
+    && !disabledIds.has(legacyIntegrationToggleId(kind, folderName, legacySuffix));
+}
+
 export function toggleIntegration(
   state: IntegrationToggleState | undefined,
   id: string,

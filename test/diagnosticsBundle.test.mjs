@@ -193,6 +193,19 @@ test("diagnostic redaction avoids ordinary API key labels and short identifiers"
   );
 });
 
+test("diagnostic exports redact bare current Cursor crsr_ credentials", () => {
+  const fakeKey = "crsr_0123456789abcdef0123456789abcdef";
+  assert.equal(redactDiagnosticText(`request rejected for ${fakeKey}.`), "request rejected for <redacted>.");
+  const diagnostic = {
+    ...bundle,
+    recentRuns: [{ state: "error", title: `Failure ${fakeKey}`, detail: `Rejected ${fakeKey}`, runId: "run-1" }],
+  };
+  const markdown = formatDiagnosticsMarkdown(diagnostic);
+  assert.equal(markdown.includes(fakeKey), false);
+  assert.match(markdown, /Failure <redacted>/u);
+  assert.equal(redactDiagnosticText("crsr_name is an identifier"), "crsr_name is an identifier");
+});
+
 test("diagnostic bundles are sanitized before Markdown export", () => {
   const sanitized = sanitizeDiagnosticsBundle(bundle);
   assert.equal(sanitized.checks[0].detail, "api_key=<redacted>");

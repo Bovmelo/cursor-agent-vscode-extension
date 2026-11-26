@@ -48,6 +48,8 @@ import { createExcludedPathMatcher } from "./sensitivePaths.js";
 import { minimalShellEnv } from "./shellEnv.js";
 import { managedWorktreesRoot } from "./worktreeLifecycle.js";
 import { pickWorkspaceFolder } from "./workspaceFolder.js";
+import { assertAuxiliaryIntegrationsAllowed } from "./auxiliaryIntegrationPolicy.js";
+import { INTEGRATION_TOGGLE_KEY, type IntegrationToggleState } from "./integrationToggles.js";
 
 export type { BackgroundChangeTarget } from "./backgroundJobChanges.js";
 
@@ -414,6 +416,7 @@ export class BackgroundJobsController
     if (!workspace) {
       return;
     }
+    this.assertIntegrationsAllowed(workspace.uri.fsPath);
     const prompt = await vscode.window.showInputBox({
       title: this.text("Start background agent", "バックグラウンドAgentを開始"),
       prompt: this.text(
@@ -445,6 +448,8 @@ export class BackgroundJobsController
       throw new Error(WORKSPACE_TRUST_ERROR);
     }
 
+    this.assertIntegrationsAllowed(workspace.uri.fsPath);
+
     await mkdir(this.jobsRoot, { recursive: true });
     const id = randomUUID();
     const session = await prepareIsolatedWorktree({
@@ -459,6 +464,7 @@ export class BackgroundJobsController
         if (!vscode.workspace.isTrusted) {
           throw new Error(WORKSPACE_TRUST_ERROR);
         }
+        this.assertIntegrationsAllowed(workspace.uri.fsPath);
         return runConfiguredHooks("preEdit", worktreePath, this.output);
       },
       onLog: (message) => this.output.appendLine(message),
@@ -1031,6 +1037,7 @@ export class BackgroundJobsController
     if (!input.workspaceTrustedAtLaunch || !vscode.workspace.isTrusted) {
       throw new Error(WORKSPACE_TRUST_ERROR);
     }
+    this.assertIntegrationsAllowed(job.workspaceRoot);
     const worker = this.workerFile();
     const child = spawn(process.execPath, [worker, job.jobFile, job.workerToken ?? ""], {
       detached: true,
@@ -1059,6 +1066,17 @@ export class BackgroundJobsController
     job.pid = child.pid;
     child.stdin.end(JSON.stringify(input));
     child.unref();
+  }
+
+  private assertIntegrationsAllowed(root: string): void {
+    const state = this.context.workspaceState.get<IntegrationToggleState>(INTEGRATION_TOGGLE_KEY);
+    assertAuxiliaryIntegrationsAllowed(
+      new Set(state?.disabledIds ?? []),
+      (vscode.workspace.workspaceFolders ?? []).map((folder) => ({
+        uri: folder.uri.toString(), name: folder.name, fsPath: folder.uri.fsPath,
+      })),
+      root,
+    );
   }
 
   private workerFile(): string {

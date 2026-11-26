@@ -1,4 +1,5 @@
 import type { McpServerConfig, SettingSource } from "@cursor/sdk";
+import { disabledIntegrationIdsForWorkspace, isWorkspaceIntegrationEnabled } from "./integrationToggles.js";
 
 const NON_PROJECT_SETTING_SOURCES: readonly SettingSource[] = [
   "user",
@@ -17,6 +18,27 @@ export interface AgentIntegrationPolicyInput {
 export interface AgentIntegrationPolicy {
   settingSources: SettingSource[];
   mcpServers?: Record<string, McpServerConfig>;
+}
+
+/** The same persisted identity used by the integration catalog, not display names. */
+export function workspaceIntegrationSelection(input: {
+  disabledIds: ReadonlySet<string>;
+  folderUri: string;
+  folderName: string;
+  mcpPath: string;
+}): { disabledIds: string[]; mcpEnabled: boolean; key: string } {
+  const disabledIds = disabledIntegrationIdsForWorkspace(
+    input.disabledIds,
+    input.folderUri,
+    input.folderName,
+  );
+  return {
+    disabledIds,
+    mcpEnabled: isWorkspaceIntegrationEnabled(
+      input.disabledIds, "mcp", input.folderUri, input.mcpPath, input.folderName, "mcp.json",
+    ),
+    key: JSON.stringify([input.folderUri, disabledIds]),
+  };
 }
 
 export interface AgentSendBoundaryState {

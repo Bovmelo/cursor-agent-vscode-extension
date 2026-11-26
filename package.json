@@ -2,7 +2,7 @@
   "name": "cursor-subscription-for-vscode",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "publisher": "ark4ez",
   "license": "MIT",
   "type": "module",
@@ -13,12 +13,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/ark4ez/cursor-agent-vscode-extension.git"
+    "url": "https://github.com/Bovmelo/cursor-agent-vscode-extension.git"
   },
   "bugs": {
-    "url": "https://github.com/ark4ez/cursor-agent-vscode-extension/issues"
+    "url": "https://github.com/Bovmelo/cursor-agent-vscode-extension/issues"
   },
-  "homepage": "https://github.com/ark4ez/cursor-agent-vscode-extension#readme",
+  "homepage": "https://github.com/Bovmelo/cursor-agent-vscode-extension#readme",
   "engines": {
     "vscode": "^1.101.0"
   },
@@ -1020,14 +1020,10 @@
     }
   },
   "dependencies": {
-    "@cursor/sdk": "^1.0.23",
-    "dompurify": "^3.4.12",
-    "marked": "^18.0.6"
-  },
-  "overrides": {
-    "@connectrpc/connect-node": {
-      "undici": "7.28.0"
-    }
+    "@cursor/sdk": "1.5.2",
+    "dompurify": "3.5.0",
+    "marked": "18.0.6",
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

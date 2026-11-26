@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 import { backendSupports, CursorSdkBackend } from "../out/agentBackend.js";
-import { AgentNotFoundError } from "@cursor/sdk";
+import { Agent, AgentNotFoundError } from "@cursor/sdk";
 
 const execFileAsync = promisify(execFile);
 
@@ -32,6 +32,79 @@ test("Cursor SDK backend owns immutable built-in subagent definitions", () => {
   assert.equal(definitions.researcher.model, "inherit");
   assert.equal(Object.isFrozen(definitions), true);
   assert.equal(Object.isFrozen(definitions.researcher), true);
+});
+
+test("SDK connections retain every workspace root and the local safety options", async (t) => {
+  const requests = [];
+  const fakeAgent = { agentId: "local-test-agent" };
+  t.mock.method(Agent, "create", async (options) => {
+    requests.push(options);
+    return fakeAgent;
+  });
+  t.mock.method(Agent, "resume", async (agentId, options) => {
+    assert.equal(agentId, fakeAgent.agentId);
+    requests.push(options);
+    return fakeAgent;
+  });
+  const roots = ["/workspace/main", "/workspace/secondary", "/workspace/third"];
+  const local = {
+    cwd: roots,
+    autoReview: true,
+    enableAgentRetries: true,
+    sandbox: { enabled: true },
+    settingSources: ["project"],
+  };
+  const backend = new CursorSdkBackend();
+
+  assert.equal(await backend.create({
+    apiKey: "test-key-not-a-credential",
+    model: { id: "auto" },
+    name: "workspace mapping regression",
+    local,
+  }), fakeAgent);
+  assert.equal(await backend.resume(fakeAgent.agentId, {
+    apiKey: "test-key-not-a-credential",
+    local,
+  }), fakeAgent);
+
+  for (const request of requests) {
+    assert.deepEqual(request.local, {
+      cwd: "/workspace/main",
+      dirs: ["/workspace/secondary", "/workspace/third"],
+      autoReview: true,
+      enableAgentRetries: true,
+      sandboxOptions: { enabled: true },
+      settingSources: ["project"],
+    });
+  }
+  assert.deepEqual(roots, ["/workspace/main", "/workspace/secondary", "/workspace/third"]);
+});
+
+test("SDK connections use a scalar cwd for single-root workspaces and reject no roots", async (t) => {
+  const requests = [];
+  t.mock.method(Agent, "create", async (options) => {
+    requests.push(options);
+    return { agentId: "local-test-agent" };
+  });
+  const backend = new CursorSdkBackend();
+  const options = {
+    apiKey: "test-key-not-a-credential",
+    model: { id: "auto" },
+    name: "single workspace",
+  };
+
+  for (const cwd of ["/workspace/main", ["/workspace/main"]]) {
+    await backend.create({ ...options, local: { cwd, autoReview: true } });
+  }
+  for (const request of requests) {
+    assert.equal(request.local.cwd, "/workspace/main");
+    assert.equal(Object.hasOwn(request.local, "dirs"), false);
+  }
+  await assert.rejects(
+    backend.create({ ...options, local: { cwd: [], autoReview: true } }),
+    /At least one working directory is required/u,
+  );
+  assert.equal(requests.length, 2);
 });
 
 test("Cursor SDK backend narrowly classifies recoverable resume failures", () => {

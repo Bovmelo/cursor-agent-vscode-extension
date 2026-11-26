@@ -1,5 +1,5 @@
 {
-  "extension.displayName": "Cursor Subscription for VS Code",
+  "extension.displayName": "Cursor Agent — Hardened Fork",
   "extension.description": "Unofficial: run Cursor agents in VS Code with your Cursor plan and API key. Not affiliated with Anysphere.",
   "command.openChat": "Cursor: Open Chat",
   "command.openSettings": "Cursor: Open AI Feature Settings",
